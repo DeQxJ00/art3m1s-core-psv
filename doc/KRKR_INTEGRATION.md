@@ -26,6 +26,10 @@ const Art3m1sKrkrApiV1 *art3m1s_krkr_get_api_v1(size_t *out_size);
 宿主必须同时校验 `struct_size`、`abi_version` 和 `magic`。native shim 自己的
 入口名是私有的 `art3m1s_krkr_native_get_api_v1`，core 不会把该符号暴露给宿主。
 
+`runtime_create` 的 game root 可以是 XP3 文件，也可以是游戏目录。目录中存在
+`data.xp3` 时优先以其为入口；没有 `data.xp3` 时接受带 `startup.tjs` 的目录或仅含一个
+根级 XP3 的目录。
+
 `krkr-engine` 会请求 `native-upstream`。当 `KRKRSDL3_SOURCE_DIR` 和
 `KRKRSDL3_BUILD_DIR` 都已配置时，构建真实的 Kirikiri runtime；未配置时暂时回退到
 `native-bootstrap` 并输出 Cargo warning。bootstrap 只用于 CI 和 ABI 布局测试，
