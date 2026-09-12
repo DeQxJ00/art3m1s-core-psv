@@ -10,8 +10,22 @@
 //   处理，里面的对象文件不会被拉入，导致 __cxa_pure_virtual 仍然未定义。
 // - c++_shared 没有顺序问题，且 NDK 自带 libc++_shared.so，打包进 APK 即可。
 
+use std::path::PathBuf;
+
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if std::env::var_os("CARGO_FEATURE_KRKR_ENGINE").is_some() {
+        if let Some(native_dir) =
+            std::env::var_os("DEP_ART3M1S_KRKR_NATIVE_NATIVE_DIR").map(PathBuf::from)
+        {
+            if matches!(target_os.as_str(), "macos" | "ios" | "linux" | "android") {
+                println!(
+                    "cargo:rustc-link-arg=-Wl,-rpath,{}",
+                    native_dir.display()
+                );
+            }
+        }
+    }
     if (target_os == "macos" || target_os == "ios")
         && std::env::var_os("CARGO_FEATURE_METAL_BACKEND").is_some()
     {

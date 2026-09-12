@@ -154,6 +154,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=dylib=art3m1s_krkr_host");
+    println!("cargo::metadata=native_dir={}", out_dir.display());
 
     if matches!(target_os.as_str(), "macos" | "ios" | "linux" | "android") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out_dir.display());
