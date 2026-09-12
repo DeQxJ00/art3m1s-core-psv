@@ -73,27 +73,38 @@ std::string ResolveRuntimeEntry(const std::string& game_root)
     if (!std::filesystem::is_directory(root, error) || error)
         return {};
 
-    const std::filesystem::path data_xp3 = root / "data.xp3";
-    if (std::filesystem::is_regular_file(data_xp3, error) && !error)
-        return data_xp3.string();
-
-    const std::filesystem::path startup_tjs = root / "startup.tjs";
-    if (std::filesystem::is_regular_file(startup_tjs, error) && !error)
-        return NormalizeRuntimePath(game_root);
-
+    std::filesystem::path data_xp3;
+    bool has_startup_tjs = false;
     std::filesystem::path sole_xp3;
     uint32_t xp3_count = 0;
     for (const auto& entry : std::filesystem::directory_iterator(root, error))
     {
         if (error)
             return {};
-        if (!entry.is_regular_file(error) || error || !HasExtension(entry.path(), "xp3"))
+        if (!entry.is_regular_file(error) || error)
             continue;
-        sole_xp3 = entry.path();
+        const auto& path = entry.path();
+        if (FileNameEquals(path, "data.xp3"))
+        {
+            data_xp3 = path;
+            continue;
+        }
+        if (FileNameEquals(path, "startup.tjs"))
+        {
+            has_startup_tjs = true;
+            continue;
+        }
+        if (!HasExtension(path, "xp3"))
+            continue;
+        sole_xp3 = path;
         ++xp3_count;
     }
     if (error)
         return {};
+    if (!data_xp3.empty())
+        return data_xp3.string();
+    if (has_startup_tjs)
+        return NormalizeRuntimePath(game_root);
     if (xp3_count == 1)
         return sole_xp3.string();
 
