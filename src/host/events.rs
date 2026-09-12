@@ -388,12 +388,14 @@ pub unsafe extern "C" fn art3m1s_poll_events_v1(
         }
         let event = queue.events.pop_front().unwrap();
         let payload_len = event.payload.len() as u32;
+        // Fixed little-endian wire format; the event stream must parse
+        // identically on any host regardless of native byte order.
         let mut header = [0u8; EVENT_HEADER_SIZE];
-        header[0..4].copy_from_slice(&EVENT_VERSION.to_ne_bytes());
-        header[4..8].copy_from_slice(&event.kind.to_ne_bytes());
-        header[8..16].copy_from_slice(&event.sequence.to_ne_bytes());
-        header[16..20].copy_from_slice(&payload_len.to_ne_bytes());
-        header[20..24].copy_from_slice(&event.aux.to_ne_bytes());
+        header[0..4].copy_from_slice(&EVENT_VERSION.to_le_bytes());
+        header[4..8].copy_from_slice(&event.kind.to_le_bytes());
+        header[8..16].copy_from_slice(&event.sequence.to_le_bytes());
+        header[16..20].copy_from_slice(&payload_len.to_le_bytes());
+        header[20..24].copy_from_slice(&event.aux.to_le_bytes());
         unsafe {
             std::ptr::copy_nonoverlapping(header.as_ptr(), output.add(written), header.len());
         }
@@ -521,15 +523,15 @@ mod tests {
         assert_eq!(count, 3);
 
         let mut offset = 0usize;
-        let first_sequence = u64::from_ne_bytes(output[8..16].try_into().unwrap());
+        let first_sequence = u64::from_le_bytes(output[8..16].try_into().unwrap());
         for (index, kind) in [EVENT_KIND_LOG, EVENT_KIND_MEDIA, EVENT_KIND_UI]
             .into_iter()
             .enumerate()
         {
-            let event_kind = u32::from_ne_bytes(output[offset + 4..offset + 8].try_into().unwrap());
-            let sequence = u64::from_ne_bytes(output[offset + 8..offset + 16].try_into().unwrap());
+            let event_kind = u32::from_le_bytes(output[offset + 4..offset + 8].try_into().unwrap());
+            let sequence = u64::from_le_bytes(output[offset + 8..offset + 16].try_into().unwrap());
             let payload_len =
-                u32::from_ne_bytes(output[offset + 16..offset + 20].try_into().unwrap()) as usize;
+                u32::from_le_bytes(output[offset + 16..offset + 20].try_into().unwrap()) as usize;
             assert_eq!(event_kind, kind);
             assert_eq!(sequence, first_sequence + index as u64);
             offset += EVENT_HEADER_SIZE + payload_len;

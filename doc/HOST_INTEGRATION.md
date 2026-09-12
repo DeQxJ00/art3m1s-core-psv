@@ -1,9 +1,10 @@
 # Host 接入指南
 
-本文面向 Flutter、原生应用及其他嵌入式 Host，以 [`src/ffi_api.rs`](src/ffi_api.rs)
- 的版本化 C ABI 为准。
-它不是 Artemis 脚本 API 文档，也不要求 Host 使用 Dart 或 libmpv。
-完整签名、返回值和命令字段见 [FFI_REFERENCE.md](FFI_REFERENCE.md)。
+本文面向 Flutter、原生应用及其他嵌入式 Host，以 [`src/ffi/api.rs`](../src/ffi/api.rs)
+的 Artemis 版本化 C ABI、[`src/ffi/rfvp_api.rs`](../src/ffi/rfvp_api.rs) 的 RFVP ABI 和
+[`src/ffi/krkr_api.rs`](../src/ffi/krkr_api.rs) 的 KRKR ABI 为准。它不是 Artemis 脚本
+API 文档，也不要求 Host 使用 Dart 或 libmpv。完整签名、返回值和命令字段见
+[FFI_REFERENCE.md](FFI_REFERENCE.md)。
 
 ## 1. 职责与能力边界
 
@@ -15,19 +16,34 @@
 | 发送媒体命令、等待播放完成 | 解码、播放、混音、全屏视频、完成通知 |
 | 发出对话框、网络、翻译等请求 | 原生 UI、网络权限、翻译服务与异步任务 |
 
-生产入口是 `CoreRuntime` 的版本化 C ABI，不是旧窗口示例。新宿主应只调用
-`art3m1s_get_api_v1`，不再逐个解析平铺符号。媒体解码可由 runtime 的 FFmpeg session
-承担；真实音频输出和最终 present 仍由 Host 所有。游戏自己的
-save/load/config/backlog 通常由脚本绘制，不需要 Host 重写。
+Host 只依赖引擎总抽象，不应直接依赖某个 adapter 的内部类型。当前有三个独立入口：
+
+| 引擎 | 查询入口 | 当前状态 |
+|---|---|---|
+| Artemis / Art3m1s | `art3m1s_get_api_v1` | 完整生产路径；`Art3m1sApiV1` |
+| RFVP | `art3m1s_rfvp_get_api_v1` | 独立 adapter；默认 feature `rfvp-engine` |
+| KRKR / Kirikiri | `art3m1s_krkr_get_api_v1` | 早期 adapter；仅在使用 `krkr-engine` 且 native shim 可用时存在 |
+
+三个函数表不共享 runtime、资源、事件或 surface 对象。Artemis 的新宿主应只查询
+`Art3m1sApiV1`，不再逐个解析迁移期的平铺符号；RFVP 和 KRKR 必须走各自入口。媒体解码
+可由 runtime 的 FFmpeg session 承担；真实音频输出和最终 present 仍由 Host 所有。
+游戏自己的 save/load/config/backlog 通常由脚本绘制，不需要 Host 重写。
 
 跨边界规则：
 
 - 对象与生命周期走不透明句柄，例如 `CoreRuntime*`。句柄内容、Rust trait、C++ vtable
-  或平台对象布局都不能直接暴露。
+  或平台对象布局都不能直接暴露。RFVP/KRKR 的 `u64` runtime 是代际句柄：失效、伪造
+  或二次销毁返回 `INVALID_HANDLE`，core 不解引用未知数值；facade 调用在句柄表上
+  串行化，但这不替代下文 owner 线程约定。
 - 数据走裸指针和显式长度，例如像素、INI、字体、替换表、HTTP body 和 uniform block。
-  零拷贝数据仍由调用方保证调用期间有效，不由 core 猜测容器布局。
-- 只有 `Art3m1sApiV1` 这种定长、版本化、全函数指针的 POD 结构可以按地址跨边界；
-  不要新增按值传递的复杂对象结构。
+  零拷贝数据仍由调用方保证调用期间有效，不由 core 猜测容器布局。跨边界的字节流
+  （host-events 事件头、RFVP 日志记录头）一律固定小端。
+- 只有 `Art3m1sApiV1`、`Art3m1sRfvpApiV1`、`Art3m1sKrkrApiV1` 这种定长、版本化、
+  全函数指针的 POD 结构可以按地址跨边界；不要新增按值传递的复杂对象结构。
+- 通信方向是 Host 调 core、core 排队、Host 拉取。不要新增 native→Host 回调入口；
+  RFVP 的 `runtime_set_log_callback` 是仅存的迁移期例外，不能安全暴露回调蹦床的
+  宿主（如修改过的 iOS 设备上的 Dart `NativeCallable`）必须改用
+  `log_next_bytes`/`poll_log`。
 
 ### 构建与加载
 
@@ -36,7 +52,7 @@ save/load/config/backlog 通常由脚本绘制，不需要 Host 重写。
 - `experimental-eluna` 默认编入，仍可通过关闭默认 features 排除；运行时默认使用内置
   E-Mote 后端，Host 显式选择后才启用 Eluna。
 - 动态库、ANGLE 和可选媒体库由 Host 打包/加载。媒体库应只加载一份实例，避免重复
-  全局状态或 Objective-C 类。构建方式见 [README](README.md#构建)。
+  全局状态或 Objective-C 类。构建方式见 [README](../README.md#构建)。
 - `art3m1s_get_api_v1` 必须返回匹配的 `struct_size`、`abi_version` 和 `magic`；否则
   拒绝读取函数表。可选能力通过函数指针是否为空判断，不再用散装符号探测。
 - JSON 的未知字段应忽略；未知命令记录一次诊断。必须回应的已知请求不能静默丢弃。
@@ -97,7 +113,7 @@ PFS 多卷和补丁覆盖在 core 内按统一索引解析；目录挂载只暴�
 - `platform` 是 INI 节名，例如 `WINDOWS`、`ANDROID`、`IOS`，不是图形后端，也不必与
   当前 Host OS 一致。没有对应节会失败；舞台尺寸与 BOOT 以该节为准。
 - Host 打开 PFS 时也要选择文件名编码。独立 API 见
-  [`crates/pfs-upk-rust/src/ffi.rs`](crates/pfs-upk-rust/src/ffi.rs)；不应假定 core 动态库
+  [`crates/pfs-upk-rust/src/lib.rs`](../crates/pfs-upk-rust/src/lib.rs)；不应假定 core 动态库
   一定导出依赖库的 `pfs_*` 符号。
 - C 字符串、JSON 和回调路径始终为 UTF-8；文件内容是原始字节，不要统一转码再交给 core。
 - 解包模式只访问选中目录，不暗中寻找同名 PFS。PFS 模式绑定具体归档，不只绑定父目录。
@@ -177,6 +193,85 @@ on_each_engine_tick:
   auto/skip 和媒体完成处理，不要因暂停渲染而停止音频。
 - 恢复前台时重置帧时钟基准，别把后台时长作为单帧 delta，也别忙循环补数千帧。
   后台媒体策略由 Host 决定。
+
+### 4.1 KRKR/Kirikiri 适配边界
+
+KRKR 使用独立的 `Art3m1sKrkrApiV1`，不是在 `Art3m1sApiV1` 上追加一组字段。Host
+只传游戏根目录、输入事件、显示尺寸和可选配置；TJS2/KAG/XP3、补丁覆盖、内部图层和
+软合成由 KRKR C++ runtime 自己管理。不要把 KRKR 项目伪装成 Artemis `system.ini`
+项目，也不要向它传 `HostResources`、`CoreRuntime` 或 Artemis 的 PFS/存档句柄。
+
+典型顺序如下。实际接入仍应逐项检查每个函数的返回状态：
+
+```text
+krkr = art3m1s_krkr_get_api_v1(&api_size)
+validate krkr.struct_size, krkr.abi_version == 1,
+         krkr.magic == 0x31564B524D334152 ("RA3MKRV1")
+
+probe = zeroed Art3m1sKrkrProbeV1
+probe.struct_size = sizeof(probe)
+if krkr.probe_project(game_root_utf8, &probe) != OK or probe.preferred_kind == 0:
+    reject_or_use_another_engine()
+
+config = zeroed Art3m1sKrkrRuntimeConfigV1
+config.struct_size = sizeof(config)
+config.width/config.height = initial_display_size
+config.audio_sample_rate = 48000
+config.audio_channels = 2
+
+rt = NULL
+if krkr.runtime_create(game_root_utf8, NULL, &config, &rt) != OK:
+    report_error_and_stop()
+width = krkr.runtime_stage_width(rt)
+height = krkr.runtime_stage_height(rt)
+host_allocate_or_resize_presentation(width, height)
+
+on_owner_thread_each_tick:
+    krkr.runtime_push_input(rt, events, event_count)   // 可为 0 条事件
+    krkr.runtime_tick(rt)                              // 一次 application iteration
+    host_drain_krkr_audio(rt)                           // 取到 NO_COMMAND 为止
+    frame.struct_size = sizeof(Art3m1sKrkrFrameV1)
+    status = krkr.runtime_acquire_frame(rt, &frame)
+    if status == OK:
+        host_present_or_copy_before_release(frame)
+        krkr.runtime_release_frame(rt, frame.frame_id)
+    else if status != NO_FRAME:
+        report_engine_error()
+    if krkr.runtime_is_exit_requested(rt):
+        begin_shutdown()
+
+krkr.runtime_destroy(rt)
+```
+
+- 全部 KRKR 调用应在同一个 owner 线程串行执行。创建、输入、tick、帧获取/释放、音频
+  提交和销毁都不能与另一线程并发调用同一个 runtime。
+- `runtime_tick` 没有 delta 参数，它推进一次 KRKR application iteration；Host 负责
+  调度频率和暂停策略。不要拿 Artemis 的 `advance_*` delta 语义套用。
+- `runtime_stage_width` / `runtime_stage_height` 应以创建后的实际结果为准，
+  `Art3m1sKrkrRuntimeConfigV1` 只提供初始窗口尺寸。
+- `runtime_acquire_frame` 成功时返回 RGBA8、显式 `stride` 和 `frame_id`。Core facade
+  已把原生像素复制到 core 管理的缓冲，但 `pixels` 只在对应
+  `runtime_release_frame(frame_id)` 调用前有效；Host 必须先展示或复制，不能跨 tick
+  保存指针。`NO_FRAME` 不是退出或错误。
+- `runtime_poll_audio_command` 每次取出一个宿主音频命令；`NO_COMMAND` 表示队列已空。
+  `payload` 只在下次 poll 前有效，收到后应立即复制或交给音频线程。真实播放和混音固定
+  在 Host 侧，KRKR adapter 不创建 Dart 回调，也不直接写扬声器。
+- `runtime_submit_audio_consumed` 回传的是自 stream 创建或最近 stop/reset 以来的
+  **绝对**已消费 sample frame 数，不是本次增量。每个结构体的 `struct_size` 都必须按
+  对应版本填写。
+- KRKR 输入是宿主无关事件结构。鼠标、键盘、文本、wheel、focus 和 quit 的 `kind`
+  不能与 Artemis 的 VK 事件混用；Host 负责把平台事件转换成 KRKR adapter 定义的
+  `code/phase/x/y/value`，并在失焦或窗口取消时补齐 release。
+- 当前上游 smoke 的 `runtime_set_external_surface` 返回 unsupported。Host 应优先
+  使用 RGBA frame 回读路径，不要假定 KRKR 已支持 Artemis 的 IOSurface、Metal texture
+  或 Android `ANativeWindow`。最终显示仍在 Host。
+- 当前上游 smoke 对非空的 `save_root_utf8` 返回 unsupported；在 adapter 完成存档
+  重定向前，请传 `NULL` 或空字符串并让 KRKR 使用其自身的路径语义。不要静默把它映射到
+  Artemis 的 `resources_set_save_dir`。
+
+KRKR 的 `probe_project` 是目录/XP3/TJS 入口探针，不是完整的游戏身份识别，也不替代
+Host 的权限和路径校验。`Art3m1sKrkrRuntimeConfigV1.flags` 和预留字段当前没有 Host
+语义，必须清零；`Art3m1sKrkrProbeV1` 的其他字段只作为诊断信息，不能据此执行插件。
 
 ## 5. 输出路径
 
@@ -336,11 +431,13 @@ Profiler 在线程内异步聚合，约每 500 ms 发布快照，按低频读取
 
 | 主题 | 源码 |
 |---|---|
-| C ABI/全局回调 | [`src/ffi.rs`](src/ffi.rs) |
-| 创建/帧推进/共享提交 | [`src/runtime.rs`](src/runtime.rs) |
-| 项目/存档 | [`src/runtime/project.rs`](src/runtime/project.rs)、[`src/runtime/save_io.rs`](src/runtime/save_io.rs) |
-| 媒体协议/完成 | [`src/host_media.rs`](src/host_media.rs)、[`src/runtime/media.rs`](src/runtime/media.rs) |
-| UI/HTTP/对话框 | [`src/runtime/events.rs`](src/runtime/events.rs)、[`src/runtime/dialog.rs`](src/runtime/dialog.rs) |
-| 翻译 | [`src/runtime/text.rs`](src/runtime/text.rs) |
-| 表面导入 | [`src/backend/gl/platform.rs`](src/backend/gl/platform.rs) |
-| Profiler | [`src/profiler.rs`](src/profiler.rs) |
+| C ABI/事件/全局配置 | [`src/ffi/mod.rs`](../src/ffi/mod.rs)、[`src/ffi/api.rs`](../src/ffi/api.rs) |
+| 创建/帧推进/共享提交 | [`src/runtime/mod.rs`](../src/runtime/mod.rs) |
+| 项目/存档 | [`src/runtime/project.rs`](../src/runtime/project.rs)、[`src/runtime/save_io.rs`](../src/runtime/save_io.rs) |
+| 媒体协议/完成 | [`src/host/media.rs`](../src/host/media.rs)、[`src/runtime/media.rs`](../src/runtime/media.rs) |
+| UI/HTTP/对话框 | [`src/runtime/events.rs`](../src/runtime/events.rs)、[`src/runtime/dialog.rs`](../src/runtime/dialog.rs) |
+| 翻译 | [`src/runtime/text.rs`](../src/runtime/text.rs) |
+| RFVP ABI | [`src/ffi/rfvp_api.rs`](../src/ffi/rfvp_api.rs) |
+| KRKR ABI | [`src/ffi/krkr_api.rs`](../src/ffi/krkr_api.rs)、[`crates/art3m1s-krkr/README.md`](../crates/art3m1s-krkr/README.md) |
+| 表面导入 | [`crates/art3m1s-render/src/backend/gl/platform.rs`](../crates/art3m1s-render/src/backend/gl/platform.rs) |
+| Profiler | [`src/profiler/mod.rs`](../src/profiler/mod.rs) |

@@ -1,7 +1,18 @@
 # C FFI 参考
 
-本文件对应当前 [`src/ffi_api.rs`](src/ffi_api.rs) 的版本化 ABI。core 动态库只导出
-`art3m1s_get_api_v1`；其余入口都通过返回的 `Art3m1sApiV1` 函数表访问。依赖库
+本文件对应当前 [`src/ffi/api.rs`](../src/ffi/api.rs)、
+[`src/ffi/rfvp_api.rs`](../src/ffi/rfvp_api.rs) 和
+[`src/ffi/krkr_api.rs`](../src/ffi/krkr_api.rs) 的三张版本化 ABI。
+
+core 的主要入口是：
+
+| ABI | 查询函数 | 用途 |
+|---|---|---|
+| `Art3m1sApiV1` | `art3m1s_get_api_v1` | Artemis/Art3m1s runtime、Host 状态、资源、媒体和 UI |
+| `Art3m1sRfvpApiV1` | `art3m1s_rfvp_get_api_v1` | RFVP runtime、输入、帧和宿主音频命令 |
+| `Art3m1sKrkrApiV1` | `art3m1s_krkr_get_api_v1` | KRKR/Kirikiri C++ runtime 的隔离 facade |
+
+三张表不共享 runtime、资源、事件或 surface 语义，新增能力不能塞进错误的表。依赖库
 `pfs_upk` 的 `pfs_*` API 独立存在。先阅读 [Host 接入指南](HOST_INTEGRATION.md)
 的线程、生命周期和所有权约定。
 
@@ -188,13 +199,418 @@ typedef struct Art3m1sApiV1 {
     ArtRuntimeUploadVideoLayerFrameFn runtime_upload_video_layer_frame;
 } Art3m1sApiV1;
 
-/* The only exported symbol of the core dynamic library. */
+/* Primary Artemis facade symbol. Flat migration symbols, if present, are not
+ * part of the stable host ABI. */
 const Art3m1sApiV1 *art3m1s_get_api_v1(size_t *out_size);
 
 #ifdef __cplusplus
 }
 #endif
 ```
+
+## RFVP ABI（v1）
+
+RFVP 有自己的 runtime 句柄、输入事件、音频命令和 surface 调用。它不接收
+`CoreRuntime`、`HostResources` 或 `HostEvents`，也不能把字段追加到
+`Art3m1sApiV1`。查询入口是：
+
+```c
+const Art3m1sRfvpApiV1 *art3m1s_rfvp_get_api_v1(size_t *out_size);
+```
+
+核心常量如下：
+
+```c
+enum Art3m1sRfvpStatus {
+    ART3M1S_RFVP_STATUS_OK = 0,
+    ART3M1S_RFVP_STATUS_NO_FRAME = 1,
+    ART3M1S_RFVP_STATUS_NO_COMMAND = 2,
+    ART3M1S_RFVP_STATUS_INVALID_ARGUMENT = -1,
+    ART3M1S_RFVP_STATUS_INVALID_HANDLE = -2,
+    ART3M1S_RFVP_STATUS_ENGINE = -3,
+    ART3M1S_RFVP_STATUS_UNSUPPORTED = -4,
+    ART3M1S_RFVP_STATUS_OUT_OF_MEMORY = -5,
+};
+
+#define ART3M1S_RFVP_NLS_SHIFT_JIS 1u
+#define ART3M1S_RFVP_NLS_GBK       2u
+#define ART3M1S_RFVP_NLS_UTF8      3u
+
+#define ART3M1S_RFVP_INPUT_KEY             1u
+#define ART3M1S_RFVP_INPUT_TEXT            2u
+#define ART3M1S_RFVP_INPUT_POINTER_MOVE    3u
+#define ART3M1S_RFVP_INPUT_POINTER_BUTTON  4u
+#define ART3M1S_RFVP_INPUT_WHEEL           5u
+#define ART3M1S_RFVP_INPUT_TOUCH           6u
+#define ART3M1S_RFVP_INPUT_FOCUS           7u
+#define ART3M1S_RFVP_INPUT_QUIT            8u
+
+#define ART3M1S_RFVP_INPUT_PHASE_DOWN   0u
+#define ART3M1S_RFVP_INPUT_PHASE_UP     1u
+#define ART3M1S_RFVP_INPUT_PHASE_REPEAT 2u
+#define ART3M1S_RFVP_INPUT_PHASE_MOVE   3u
+
+#define ART3M1S_RFVP_POINTER_LEFT   (1u << 0)
+#define ART3M1S_RFVP_POINTER_RIGHT  (1u << 1)
+#define ART3M1S_RFVP_POINTER_MIDDLE (1u << 2)
+
+#define ART3M1S_RFVP_AUDIO_LOAD_ENCODED     1u
+#define ART3M1S_RFVP_AUDIO_CREATE_STREAM    2u
+#define ART3M1S_RFVP_AUDIO_SUBMIT_I16       3u
+#define ART3M1S_RFVP_AUDIO_SUBMIT_F32       4u
+#define ART3M1S_RFVP_AUDIO_PLAY             5u
+#define ART3M1S_RFVP_AUDIO_STOP             6u
+#define ART3M1S_RFVP_AUDIO_PAUSE            7u
+#define ART3M1S_RFVP_AUDIO_RESUME           8u
+#define ART3M1S_RFVP_AUDIO_SET_PARAMS       9u
+#define ART3M1S_RFVP_AUDIO_DESTROY_STREAM  10u
+#define ART3M1S_RFVP_AUDIO_MASTER_VOLUME   11u
+
+#define ART3M1S_RFVP_AUDIO_SAMPLE_I16 1u
+#define ART3M1S_RFVP_AUDIO_SAMPLE_F32 2u
+
+#define ART3M1S_RFVP_AUDIO_ENCODED_UNKNOWN 0u
+#define ART3M1S_RFVP_AUDIO_ENCODED_WAV     1u
+#define ART3M1S_RFVP_AUDIO_ENCODED_OGG     2u
+#define ART3M1S_RFVP_AUDIO_ENCODED_MP3     3u
+#define ART3M1S_RFVP_AUDIO_ENCODED_FLAC    4u
+```
+
+输入、音频和函数表布局如下。`runtime_create` 的路径是 UTF-8 pointer + length，
+不是 NUL 结尾字符串；`save_root_utf8=NULL, save_root_len=0` 表示没有单独存档根。
+
+```c
+typedef struct Art3m1sRfvpInputEventV1 {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t code;
+    uint32_t phase;
+    int32_t x;
+    int32_t y;
+    int32_t value;
+    uint32_t modifiers;
+    uint64_t id;
+} Art3m1sRfvpInputEventV1;
+
+typedef struct Art3m1sRfvpAudioCommandV1 {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t stream_id;
+    uint32_t sample_format;
+    uint32_t encoded_kind;
+    uint32_t sample_rate;
+    uint32_t channels;
+    uint32_t repeat;
+    uint32_t fade_ms;
+    float volume;
+    float pan;
+    size_t sample_count;
+    const uint8_t *payload;
+    size_t payload_size;
+    uint64_t reserved[2];
+} Art3m1sRfvpAudioCommandV1;
+
+typedef void (*Art3m1sRfvpLogCallbackFn)(uint32_t level, const uint8_t *message,
+                                         size_t message_len, void *user_data);
+
+typedef int32_t (*ArtRfvpRuntimeCreateFn)(
+    const uint8_t *game_root_utf8, size_t game_root_len,
+    const uint8_t *save_root_utf8, size_t save_root_len,
+    uint32_t width, uint32_t height, int32_t backend, uint32_t nls,
+    uint64_t *out_runtime);
+typedef void (*ArtRfvpRuntimeDestroyFn)(uint64_t runtime);
+typedef int32_t (*ArtRfvpRuntimeStepFn)(uint64_t runtime, uint32_t delta_ms);
+typedef int32_t (*ArtRfvpRuntimeIsExitRequestedFn)(uint64_t runtime);
+typedef uint32_t (*ArtRfvpRuntimeStageFn)(uint64_t runtime);
+typedef uint64_t (*ArtRfvpRuntimeCapabilitiesFn)(uint64_t runtime);
+typedef uint32_t (*ArtRfvpRuntimePixelBufferSizeFn)(uint64_t runtime);
+typedef int32_t (*ArtRfvpRuntimeFeedInputFn)(
+    uint64_t runtime, const Art3m1sRfvpInputEventV1 *events, size_t event_count);
+typedef int32_t (*ArtRfvpRuntimePollAudioCommandFn)(
+    uint64_t runtime, Art3m1sRfvpAudioCommandV1 *out_command);
+typedef int32_t (*ArtRfvpRuntimeSetExternalSurfaceFn)(
+    uint64_t runtime, int32_t kind, void *handle, uint32_t width, uint32_t height);
+typedef void (*ArtRfvpRuntimeClearExternalSurfaceFn)(uint64_t runtime);
+typedef int32_t (*ArtRfvpRuntimeAdvancePresentFn)(uint64_t runtime, uint32_t delta_ms);
+typedef uint32_t (*ArtRfvpRuntimeAdvanceRenderFn)(
+    uint64_t runtime, uint32_t delta_ms, uint8_t *out_pixels, uint32_t capacity);
+typedef void (*ArtRfvpRuntimeSetLogCallbackFn)(
+    Art3m1sRfvpLogCallbackFn callback, void *user_data);
+typedef size_t (*ArtRfvpLogNextBytesFn)(void);
+typedef size_t (*ArtRfvpPollLogFn)(uint8_t *output, size_t capacity);
+
+typedef struct Art3m1sRfvpApiV1 {
+    uint32_t struct_size;
+    uint32_t abi_version; /* 1 */
+    uint64_t magic;       /* 0x315646524D334152, "RA3MRFV1" */
+
+    ArtRfvpRuntimeCreateFn runtime_create;
+    ArtRfvpRuntimeDestroyFn runtime_destroy;
+    ArtRfvpRuntimeStepFn runtime_step;
+    ArtRfvpRuntimeIsExitRequestedFn runtime_is_exit_requested;
+    ArtRfvpRuntimeStageFn runtime_stage_width;
+    ArtRfvpRuntimeStageFn runtime_stage_height;
+    ArtRfvpRuntimeCapabilitiesFn runtime_capabilities;
+    ArtRfvpRuntimePixelBufferSizeFn runtime_pixel_buffer_size;
+    ArtRfvpRuntimeFeedInputFn runtime_feed_input;
+    ArtRfvpRuntimePollAudioCommandFn runtime_poll_audio_command;
+    ArtRfvpRuntimeSetExternalSurfaceFn runtime_set_external_surface;
+    ArtRfvpRuntimeClearExternalSurfaceFn runtime_clear_external_surface;
+    ArtRfvpRuntimeAdvancePresentFn runtime_advance_and_present;
+    ArtRfvpRuntimeAdvanceRenderFn runtime_advance_and_render;
+    ArtRfvpRuntimeSetLogCallbackFn runtime_set_log_callback;
+    ArtRfvpLogNextBytesFn log_next_bytes;
+    ArtRfvpPollLogFn poll_log;
+} Art3m1sRfvpApiV1;
+```
+
+RFVP 的 `runtime_feed_input` 最多接受 4096 条事件，输入结构体的 `struct_size` 必须
+精确匹配。`runtime_poll_audio_command` 返回 `OK` 时 `payload` 和
+`Art3m1sRfvpAudioCommandV1` 只在下次 poll 前有效；返回 `NO_COMMAND` 表示队列为空。
+
+RFVP runtime 句柄是代际句柄，不是指针数值。失效、伪造或二次销毁的句柄一律返回
+`INVALID_HANDLE`（或返回型函数的 0），core 不会解引用未知数值；facade 调用在句柄
+表上串行化，但不替代 Host 的单 owner 线程约定。
+
+日志走拉取式队列，不再依赖反向回调：
+
+- `log_next_bytes()` 返回队首完整记录的字节数（8 字节头 + 消息），队列为空时为 0。
+- `poll_log(output, capacity)` 按队首顺序写完整记录并返回实际字节数；缓冲不足时
+  保留下一条完整记录。记录头固定小端：`level: u32` + `message_len: u32`，随后是
+  UTF-8 消息。队列上限 1024 条、单条消息 16 KiB，溢出丢弃最旧记录。
+
+`runtime_set_log_callback` 是已弃用的直接回调例外，仅为迁移保留；不能安全暴露
+native 回调蹦床的宿主（如修改过的 iOS 设备上的 Dart `NativeCallable`）必须保持
+未设置状态，改用上面的拉取队列。
+
+## KRKR ABI（v1）
+
+`Art3m1sKrkrApiV1` 由 core 的 public facade 暴露，Host 只能调用
+`art3m1s_krkr_get_api_v1`。native shim 内部的
+`art3m1s_krkr_native_get_api_v1` 使用整数 runtime handle，仅供 core 加载，不是 Host
+接口。公开 facade 的 `uint64_t` runtime 同样是代际句柄，不是指针数值：失效、伪造或
+二次销毁的句柄一律返回 `INVALID_HANDLE`（或返回型函数的 0），core 不会解引用未知
+数值；Host 不应依赖 handle 数值或 C++ 类型。
+
+```c
+typedef struct Art3m1sKrkrRuntime Art3m1sKrkrRuntime;
+
+enum Art3m1sKrkrStatus {
+    ART3M1S_KRKR_STATUS_OK = 0,
+    ART3M1S_KRKR_STATUS_NO_FRAME = 1,
+    ART3M1S_KRKR_STATUS_NO_COMMAND = 2,
+    ART3M1S_KRKR_STATUS_INVALID_ARGUMENT = -1,
+    ART3M1S_KRKR_STATUS_INVALID_HANDLE = -2,
+    ART3M1S_KRKR_STATUS_ENGINE = -3,
+    ART3M1S_KRKR_STATUS_UNSUPPORTED = -4,
+    ART3M1S_KRKR_STATUS_OUT_OF_MEMORY = -5,
+};
+
+#define ART3M1S_KRKR_PROBE_DATA_XP3             1u
+#define ART3M1S_KRKR_PROBE_ROOT_XP3             2u
+#define ART3M1S_KRKR_PROBE_STARTUP_TJS          3u
+#define ART3M1S_KRKR_PROBE_SYSTEM_INITIALIZE_TJS 4u
+
+#define ART3M1S_KRKR_INPUT_KEY            1u
+#define ART3M1S_KRKR_INPUT_TEXT           2u
+#define ART3M1S_KRKR_INPUT_POINTER_MOVE   3u
+#define ART3M1S_KRKR_INPUT_POINTER_BUTTON 4u
+#define ART3M1S_KRKR_INPUT_WHEEL          5u
+#define ART3M1S_KRKR_INPUT_FOCUS          6u
+#define ART3M1S_KRKR_INPUT_QUIT           7u
+
+#define ART3M1S_KRKR_INPUT_PHASE_DOWN   0u
+#define ART3M1S_KRKR_INPUT_PHASE_UP     1u
+#define ART3M1S_KRKR_INPUT_PHASE_REPEAT 2u
+#define ART3M1S_KRKR_INPUT_PHASE_MOVE   3u
+
+#define ART3M1S_KRKR_POINTER_LEFT   (1u << 0)
+#define ART3M1S_KRKR_POINTER_RIGHT  (1u << 1)
+#define ART3M1S_KRKR_POINTER_MIDDLE (1u << 2)
+#define ART3M1S_KRKR_POINTER_X1     (1u << 3)
+#define ART3M1S_KRKR_POINTER_X2     (1u << 4)
+
+#define ART3M1S_KRKR_FRAME_FORMAT_RGBA8 1u
+
+#define ART3M1S_KRKR_AUDIO_CREATE_STREAM  1u
+#define ART3M1S_KRKR_AUDIO_SUBMIT_PCM     2u
+#define ART3M1S_KRKR_AUDIO_PLAY           3u
+#define ART3M1S_KRKR_AUDIO_PAUSE          4u
+#define ART3M1S_KRKR_AUDIO_STOP           5u
+#define ART3M1S_KRKR_AUDIO_SET_PARAMS     6u
+#define ART3M1S_KRKR_AUDIO_DESTROY_STREAM 7u
+#define ART3M1S_KRKR_AUDIO_MASTER_VOLUME  8u
+
+#define ART3M1S_KRKR_AUDIO_FORMAT_I16 1u
+#define ART3M1S_KRKR_AUDIO_FORMAT_F32 2u
+#define ART3M1S_KRKR_AUDIO_FORMAT_I8  3u
+#define ART3M1S_KRKR_AUDIO_FORMAT_I24 4u
+#define ART3M1S_KRKR_AUDIO_FORMAT_I32 5u
+
+typedef struct Art3m1sKrkrProbeV1 {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t preferred_kind;
+    uint32_t has_data_xp3;
+    uint32_t root_xp3_count;
+    uint32_t has_startup_tjs;
+    uint32_t has_patch_tjs;
+    uint32_t has_system_initialize_tjs;
+    uint64_t reserved[4];
+} Art3m1sKrkrProbeV1;
+
+typedef struct Art3m1sKrkrRuntimeConfigV1 {
+    uint32_t struct_size;
+    uint32_t flags;
+    uint32_t width;
+    uint32_t height;
+    uint32_t audio_sample_rate;
+    uint32_t audio_channels;
+    uint64_t reserved[4];
+} Art3m1sKrkrRuntimeConfigV1;
+
+typedef struct Art3m1sKrkrInputEventV1 {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t code;
+    uint32_t phase;
+    int32_t x;
+    int32_t y;
+    int32_t value;
+    uint32_t modifiers;
+    uint64_t id;
+} Art3m1sKrkrInputEventV1;
+
+typedef struct Art3m1sKrkrFrameV1 {
+    uint32_t struct_size;
+    uint32_t format;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t flags;
+    uint64_t frame_id;
+    uint64_t generation;
+    const uint8_t *pixels;
+    size_t pixels_len;
+    uint64_t reserved[2];
+} Art3m1sKrkrFrameV1;
+
+typedef struct Art3m1sKrkrAudioCommandV1 {
+    uint32_t struct_size;
+    uint32_t kind;
+    uint32_t stream_id;
+    uint32_t sample_format;
+    uint32_t sample_rate;
+    uint32_t channels;
+    uint64_t sample_count;
+    float volume;
+    float pan;
+    const uint8_t *payload;
+    size_t payload_size;
+    uint64_t reserved[2];
+} Art3m1sKrkrAudioCommandV1;
+
+typedef struct Art3m1sKrkrAudioConsumedV1 {
+    uint32_t struct_size;
+    uint32_t stream_id;
+    uint64_t consumed_samples;
+    uint64_t generation;
+    uint64_t reserved[2];
+} Art3m1sKrkrAudioConsumedV1;
+
+typedef int32_t (*ArtKrkrProbeProjectFn)(
+    const char *game_root_utf8, Art3m1sKrkrProbeV1 *out_probe);
+typedef int32_t (*ArtKrkrRuntimeCreateFn)(
+    const char *game_root_utf8, const char *save_root_utf8,
+    const Art3m1sKrkrRuntimeConfigV1 *config,
+    Art3m1sKrkrRuntime **out_runtime);
+typedef void (*ArtKrkrRuntimeDestroyFn)(Art3m1sKrkrRuntime *runtime);
+typedef uint32_t (*ArtKrkrRuntimeStageFn)(Art3m1sKrkrRuntime *runtime);
+typedef uint32_t (*ArtKrkrRuntimePixelBufferSizeFn)(Art3m1sKrkrRuntime *runtime);
+typedef int32_t (*ArtKrkrRuntimePushInputFn)(
+    Art3m1sKrkrRuntime *runtime, const Art3m1sKrkrInputEventV1 *events,
+    size_t event_count);
+typedef int32_t (*ArtKrkrRuntimeTickFn)(Art3m1sKrkrRuntime *runtime);
+typedef int32_t (*ArtKrkrRuntimeAcquireFrameFn)(
+    Art3m1sKrkrRuntime *runtime, Art3m1sKrkrFrameV1 *out_frame);
+typedef int32_t (*ArtKrkrRuntimeReleaseFrameFn)(
+    Art3m1sKrkrRuntime *runtime, uint64_t frame_id);
+typedef int32_t (*ArtKrkrRuntimePollAudioCommandFn)(
+    Art3m1sKrkrRuntime *runtime, Art3m1sKrkrAudioCommandV1 *out_command);
+typedef int32_t (*ArtKrkrRuntimeSubmitAudioConsumedFn)(
+    Art3m1sKrkrRuntime *runtime, const Art3m1sKrkrAudioConsumedV1 *consumed);
+typedef int32_t (*ArtKrkrRuntimeIsExitRequestedFn)(Art3m1sKrkrRuntime *runtime);
+typedef int32_t (*ArtKrkrRuntimeSetExternalSurfaceFn)(
+    Art3m1sKrkrRuntime *runtime, int32_t kind, void *handle,
+    uint32_t width, uint32_t height);
+
+typedef struct Art3m1sKrkrApiV1 {
+    uint32_t struct_size;
+    uint32_t abi_version; /* 1 */
+    uint64_t magic;       /* 0x31564B524D334152, "RA3MKRV1" */
+
+    ArtKrkrProbeProjectFn probe_project;
+    ArtKrkrRuntimeCreateFn runtime_create;
+    ArtKrkrRuntimeDestroyFn runtime_destroy;
+    ArtKrkrRuntimeStageFn runtime_stage_width;
+    ArtKrkrRuntimeStageFn runtime_stage_height;
+    ArtKrkrRuntimePixelBufferSizeFn runtime_pixel_buffer_size;
+    ArtKrkrRuntimePushInputFn runtime_push_input;
+    ArtKrkrRuntimeTickFn runtime_tick;
+    ArtKrkrRuntimeAcquireFrameFn runtime_acquire_frame;
+    ArtKrkrRuntimeReleaseFrameFn runtime_release_frame;
+    ArtKrkrRuntimePollAudioCommandFn runtime_poll_audio_command;
+    ArtKrkrRuntimeSubmitAudioConsumedFn runtime_submit_audio_consumed;
+    ArtKrkrRuntimeIsExitRequestedFn runtime_is_exit_requested;
+    ArtKrkrRuntimeSetExternalSurfaceFn runtime_set_external_surface;
+} Art3m1sKrkrApiV1;
+
+const Art3m1sKrkrApiV1 *art3m1s_krkr_get_api_v1(size_t *out_size);
+```
+
+KRKR 的 Host 侧语义和生命周期如下：
+
+- `Art3m1sKrkrProbeV1`、`Art3m1sKrkrRuntimeConfigV1`、每个
+  `Art3m1sKrkrInputEventV1`、`Art3m1sKrkrFrameV1`、`Art3m1sKrkrAudioCommandV1` 和
+  `Art3m1sKrkrAudioConsumedV1` 都必须在调用前设置精确的 `struct_size`；版本不匹配
+  返回 `INVALID_ARGUMENT`。
+- `art3m1s_krkr_get_api_v1` 返回的 `struct_size` 必须等于当前版本结构体大小，
+  `abi_version` 必须为 `1`，`magic` 必须为 `0x31564B524D334152`。native shim 还会
+  校验所有必需函数指针；`runtime_set_external_surface` 是可选能力，当前 upstream
+  smoke 会返回 `ART3M1S_KRKR_STATUS_UNSUPPORTED`。
+- `probe_project` 接收 UTF-8 NUL 结尾的游戏根路径。`preferred_kind` 为
+  `DATA_XP3`、`ROOT_XP3`、`STARTUP_TJS` 或 `SYSTEM_INITIALIZE_TJS`；`0` 表示未识别。
+  探针只用于发现入口，不执行脚本。
+- `runtime_create` 接收 UTF-8 NUL 结尾的 game/save root、精确 `struct_size` 的
+  `Art3m1sKrkrRuntimeConfigV1` 和不透明 runtime 输出。当前 upstream smoke 对非空的
+  `save_root_utf8` 返回 `UNSUPPORTED`；Host 在 adapter 明确实现存档重定向前应传 `NULL`。
+- `runtime_push_input` 的每一个事件的 `struct_size` 必须精确匹配，`events=NULL` 只允许
+  在 `event_count=0` 时使用，单次最多 4096 条。
+- `runtime_tick` 推进一次 KRKR application iteration，没有 delta 参数。Host 负责
+  定时和暂停，不能并发调用同一 runtime。
+- `runtime_acquire_frame` 成功时 `format=RGBA8`，`stride` 按字节计，`frame_id` 用于
+  配对释放。Core facade 会把原生帧复制到 core 缓冲，但 `pixels` 仍只在本次
+  `runtime_release_frame(frame_id)` 前有效；Host 不能保留指针或跨 tick 使用。
+- `runtime_poll_audio_command` 每次返回一条命令；`NO_COMMAND` 表示暂时没有新命令。
+  `payload` 只在下次 poll 前有效。`sample_count` 是每声道 sample frame 数，
+  `SUBMIT_PCM` 的 payload 长度必须为
+  `sample_count * channels * bytes_per_sample`。
+- 当前 KRKR audio command 的字段语义为：
+
+  | kind | 字段 |
+  |---|---|
+  | `CREATE_STREAM` | `stream_id,sample_format,sample_rate,channels` |
+  | `SUBMIT_PCM` | `stream_id,sample_format,sample_rate,channels,sample_count,payload*` |
+  | `PLAY` / `PAUSE` / `STOP` / `DESTROY_STREAM` | `stream_id` |
+  | `SET_PARAMS` | `stream_id,volume,pan` |
+
+  `I8/I16/I24/I32/F32` 的每样本字节数分别是 `1/2/3/4/4`。
+- `runtime_submit_audio_consumed` 的 `consumed_samples` 是自 stream 创建或最近
+  stop/reset 后的绝对 sample frame 数，不是增量；`stream_id` 和 `generation` 必须与
+  当前 stream 对应。真实播放、混音和设备输出都在 Host。
+- KRKR ABI 没有 Dart 反向回调，也没有把 `CoreRuntime`、`HostResources`、PFS 或
+  Artemis media event 复用给 KRKR。宿主必须每次检查 `struct_size`，并对可选函数指针
+  做 NULL 检查。
 
 ## Host 状态、文件与全局配置
 
@@ -228,6 +644,8 @@ Host 先调用 `host_events_create()`，再调用
 - `poll_events_v1(events, ...)` 只写完整事件，返回实际字节数并通过 `out_count` 返回
   事件数；调用后已写事件从队列移除。缓冲区不足时保留下一个完整事件，不会写半条记录。
 - 事件按 `sequence` 单调递增。当前版本定义 `1=log`、`2=media`、`3=UI`。
+- 24 字节事件头（`version`/`kind`/`sequence`/`payload_len`/`aux`）全部固定小端，
+  与 Host 原生字节序无关。
 - log 的 `aux` 是 ASCII 级别首字符（`D/I/W/E`），payload 是 UTF-8 消息。
 - media/UI 的 payload 是 `{"kind":"...","payload":{...}}` JSON，语义与原回调相同。
 
@@ -331,7 +749,7 @@ UI/媒体事件没有 runtime 标识。HTTP/对话框/媒体完成没有统一 r
 
 ## 媒体命令协议
 
-权威字段定义位于 [`src/host_media.rs`](src/host_media.rs)，以下列出当前全部 kind。
+权威字段定义位于 [`src/host/media.rs`](../src/host/media.rs)，以下列出当前全部 kind。
 `?` 表示字段可能为 JSON null；`loop` 为布尔；`*_ms` 为毫秒。普通路径/ID 均为字符串。
 
 | kind | payload 字段 |
@@ -363,7 +781,8 @@ master * channel * gain 并限制在 [0,1]；移植时别重复乘通道音量�
 
 ## Profiler JSON
 
-完整结构见 [`src/profiler.rs`](src/profiler.rs) 的 `ProfilerSnapshot` / `ProfileTimings`。
+完整结构见 [`src/profiler/mod.rs`](../src/profiler/mod.rs) 的 `ProfilerSnapshot` /
+`ProfileTimings`。
 聚合 worker 大约每 500 ms 发布，保留最近 10 秒（最多 4096 样本）。
 
 | 字段 | 含义 |

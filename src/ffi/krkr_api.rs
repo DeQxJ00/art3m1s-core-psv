@@ -5,6 +5,12 @@
 //! and exposes the public `art3m1s_krkr_get_api_v1` facade. Runtime, frame,
 //! and audio stream ownership use opaque integer handles or raw pointer and
 //! length payloads.
+//!
+//! Public runtime handles are generational handles resolved through
+//! [`crate::ffi::handles::LockedHandleTable`]: stale, foreign, or
+//! double-destroyed handles fail with `ART3M1S_KRKR_STATUS_INVALID_HANDLE`
+//! instead of dereferencing raw pointer bits, and facade calls serialize on
+//! the table lock rather than aliasing runtime state across threads.
 
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -25,6 +31,8 @@ use art3m1s_krkr::protocol::{
     Art3m1sKrkrRuntimeConfigV1 as CoreRuntimeConfigV1,
 };
 
+use crate::ffi::handles::LockedHandleTable;
+
 static NATIVE_API: OnceLock<Result<&'static Art3M1sKrkrApiV1, KrkrAbiError>> = OnceLock::new();
 
 struct ApiRuntime {
@@ -34,6 +42,8 @@ struct ApiRuntime {
     pending_frame_id: Option<u64>,
     pending_audio_payload: Vec<u8>,
 }
+
+static RUNTIMES: LockedHandleTable<ApiRuntime> = LockedHandleTable::new();
 
 /// Returns the process-lifetime KRKR API table.
 ///
@@ -125,14 +135,20 @@ unsafe extern "C" fn runtime_create(
             return STATUS_ENGINE;
         }
 
-        let runtime = Box::new(ApiRuntime {
+        let handle = RUNTIMES.insert(ApiRuntime {
             api,
             handle: native_runtime,
             pending_frame_pixels: Vec::new(),
             pending_frame_id: None,
             pending_audio_payload: Vec::new(),
         });
-        unsafe { *out_runtime = Box::into_raw(runtime) as u64 };
+        if handle == 0 {
+            unsafe {
+                (api.runtime_destroy.expect("runtime_destroy is required"))(native_runtime);
+            }
+            return STATUS_ENGINE;
+        }
+        unsafe { *out_runtime = handle };
         STATUS_OK
     })
 }
@@ -142,7 +158,9 @@ unsafe extern "C" fn runtime_destroy(runtime: u64) {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let runtime = unsafe { Box::from_raw(runtime as *mut ApiRuntime) };
+        let Some(runtime) = RUNTIMES.take(runtime) else {
+            return;
+        };
         unsafe {
             (runtime
                 .api
@@ -154,43 +172,34 @@ unsafe extern "C" fn runtime_destroy(runtime: u64) {
 
 unsafe extern "C" fn runtime_stage_width(runtime: u64) -> u32 {
     guard_u32(|| {
-        let Ok(runtime) = (unsafe { runtime_ref(runtime) }) else {
-            return 0;
-        };
-        unsafe {
+        RUNTIMES.with(runtime, 0, |runtime| unsafe {
             (runtime
                 .api
                 .runtime_stage_width
                 .expect("runtime_stage_width is required"))(runtime.handle)
-        }
+        })
     })
 }
 
 unsafe extern "C" fn runtime_stage_height(runtime: u64) -> u32 {
     guard_u32(|| {
-        let Ok(runtime) = (unsafe { runtime_ref(runtime) }) else {
-            return 0;
-        };
-        unsafe {
+        RUNTIMES.with(runtime, 0, |runtime| unsafe {
             (runtime
                 .api
                 .runtime_stage_height
                 .expect("runtime_stage_height is required"))(runtime.handle)
-        }
+        })
     })
 }
 
 unsafe extern "C" fn runtime_pixel_buffer_size(runtime: u64) -> u32 {
     guard_u32(|| {
-        let Ok(runtime) = (unsafe { runtime_ref(runtime) }) else {
-            return 0;
-        };
-        unsafe {
+        RUNTIMES.with(runtime, 0, |runtime| unsafe {
             (runtime
                 .api
                 .runtime_pixel_buffer_size
                 .expect("runtime_pixel_buffer_size is required"))(runtime.handle)
-        }
+        })
     })
 }
 
@@ -206,26 +215,22 @@ unsafe extern "C" fn runtime_push_input(
         if event_count > 4096 {
             return STATUS_INVALID_ARGUMENT;
         }
-        let Ok(runtime) = (unsafe { runtime_ref(runtime) }) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        unsafe {
+        RUNTIMES.with(runtime, STATUS_INVALID_HANDLE, |runtime| unsafe {
             (runtime
                 .api
                 .runtime_push_input
                 .expect("runtime_push_input is required"))(
                 runtime.handle, events, event_count
             )
-        }
+        })
     })
 }
 
 unsafe extern "C" fn runtime_tick(runtime: u64) -> i32 {
     guard_status(|| {
-        let Ok(runtime) = (unsafe { runtime_ref(runtime) }) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        unsafe { (runtime.api.runtime_tick.expect("runtime_tick is required"))(runtime.handle) }
+        RUNTIMES.with(runtime, STATUS_INVALID_HANDLE, |runtime| unsafe {
+            (runtime.api.runtime_tick.expect("runtime_tick is required"))(runtime.handle)
+        })
     })
 }
 
@@ -236,59 +241,56 @@ unsafe extern "C" fn runtime_acquire_frame(runtime: u64, out_frame: *mut CoreFra
         {
             return STATUS_INVALID_ARGUMENT;
         }
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return STATUS_INVALID_HANDLE;
-        };
+        RUNTIMES.with_mut(runtime, STATUS_INVALID_HANDLE, |runtime| {
+            let mut native_frame = CoreFrameV1::default();
+            let status = unsafe {
+                (runtime
+                    .api
+                    .runtime_acquire_frame
+                    .expect("runtime_acquire_frame is required"))(
+                    runtime.handle, &mut native_frame
+                )
+            };
+            if status != STATUS_OK {
+                return status;
+            }
 
-        let mut native_frame = CoreFrameV1::default();
-        let status = unsafe {
-            (runtime
-                .api
-                .runtime_acquire_frame
-                .expect("runtime_acquire_frame is required"))(
-                runtime.handle, &mut native_frame
-            )
-        };
-        if status != STATUS_OK {
-            return status;
-        }
+            let copied = copy_native_frame(&native_frame, &mut runtime.pending_frame_pixels);
+            unsafe {
+                (runtime
+                    .api
+                    .runtime_release_frame
+                    .expect("runtime_release_frame is required"))(
+                    runtime.handle,
+                    native_frame.frame_id,
+                );
+            }
+            if !copied {
+                return STATUS_ENGINE;
+            }
 
-        let copied = copy_native_frame(&native_frame, &mut runtime.pending_frame_pixels);
-        unsafe {
-            (runtime
-                .api
-                .runtime_release_frame
-                .expect("runtime_release_frame is required"))(
-                runtime.handle,
-                native_frame.frame_id,
-            );
-        }
-        if !copied {
-            return STATUS_ENGINE;
-        }
-
-        runtime.pending_frame_id = Some(native_frame.frame_id);
-        let frame = CoreFrameV1 {
-            pixels: runtime.pending_frame_pixels.as_ptr(),
-            pixels_len: runtime.pending_frame_pixels.len(),
-            ..native_frame
-        };
-        unsafe { *out_frame = frame };
-        STATUS_OK
+            runtime.pending_frame_id = Some(native_frame.frame_id);
+            let frame = CoreFrameV1 {
+                pixels: runtime.pending_frame_pixels.as_ptr(),
+                pixels_len: runtime.pending_frame_pixels.len(),
+                ..native_frame
+            };
+            unsafe { *out_frame = frame };
+            STATUS_OK
+        })
     })
 }
 
 unsafe extern "C" fn runtime_release_frame(runtime: u64, frame_id: u64) -> i32 {
     guard_status(|| {
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        if runtime.pending_frame_id != Some(frame_id) {
-            return STATUS_INVALID_ARGUMENT;
-        }
-        runtime.pending_frame_id = None;
-        runtime.pending_frame_pixels.clear();
-        STATUS_OK
+        RUNTIMES.with_mut(runtime, STATUS_INVALID_HANDLE, |runtime| {
+            if runtime.pending_frame_id != Some(frame_id) {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            runtime.pending_frame_id = None;
+            runtime.pending_frame_pixels.clear();
+            STATUS_OK
+        })
     })
 }
 
@@ -304,41 +306,39 @@ unsafe extern "C" fn runtime_poll_audio_command(
         {
             return STATUS_INVALID_ARGUMENT;
         }
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return STATUS_INVALID_HANDLE;
-        };
+        RUNTIMES.with_mut(runtime, STATUS_INVALID_HANDLE, |runtime| {
+            let mut command = CoreAudioCommandV1::default();
+            let status = unsafe {
+                (runtime
+                    .api
+                    .runtime_poll_audio_command
+                    .expect("runtime_poll_audio_command is required"))(
+                    runtime.handle, &mut command
+                )
+            };
+            if status != STATUS_OK {
+                return status;
+            }
+            if command.payload_size != 0 && command.payload.is_null() {
+                return STATUS_ENGINE;
+            }
 
-        let mut command = CoreAudioCommandV1::default();
-        let status = unsafe {
-            (runtime
-                .api
-                .runtime_poll_audio_command
-                .expect("runtime_poll_audio_command is required"))(
-                runtime.handle, &mut command
-            )
-        };
-        if status != STATUS_OK {
-            return status;
-        }
-        if command.payload_size != 0 && command.payload.is_null() {
-            return STATUS_ENGINE;
-        }
-
-        runtime.pending_audio_payload.clear();
-        if command.payload_size != 0 {
-            runtime.pending_audio_payload.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(command.payload, command.payload_size)
-            });
-        }
-        command.payload = if runtime.pending_audio_payload.is_empty() {
-            ptr::null()
-        } else {
-            runtime.pending_audio_payload.as_ptr()
-        };
-        command.payload_size = runtime.pending_audio_payload.len();
-        command.struct_size = std::mem::size_of::<CoreAudioCommandV1>() as u32;
-        unsafe { *out_command = command };
-        STATUS_OK
+            runtime.pending_audio_payload.clear();
+            if command.payload_size != 0 {
+                runtime.pending_audio_payload.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(command.payload, command.payload_size)
+                });
+            }
+            command.payload = if runtime.pending_audio_payload.is_empty() {
+                ptr::null()
+            } else {
+                runtime.pending_audio_payload.as_ptr()
+            };
+            command.payload_size = runtime.pending_audio_payload.len();
+            command.struct_size = std::mem::size_of::<CoreAudioCommandV1>() as u32;
+            unsafe { *out_command = command };
+            STATUS_OK
+        })
     })
 }
 
@@ -354,31 +354,25 @@ unsafe extern "C" fn runtime_submit_audio_consumed(
         {
             return STATUS_INVALID_ARGUMENT;
         }
-        let Ok(runtime) = (unsafe { runtime_ref(runtime) }) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        unsafe {
+        RUNTIMES.with(runtime, STATUS_INVALID_HANDLE, |runtime| unsafe {
             (runtime
                 .api
                 .runtime_submit_audio_consumed
                 .expect("runtime_submit_audio_consumed is required"))(
                 runtime.handle, consumed
             )
-        }
+        })
     })
 }
 
 unsafe extern "C" fn runtime_is_exit_requested(runtime: u64) -> i32 {
     guard_i32(|| {
-        let Ok(runtime) = (unsafe { runtime_ref(runtime) }) else {
-            return 0;
-        };
-        unsafe {
+        RUNTIMES.with(runtime, 0, |runtime| unsafe {
             (runtime
                 .api
                 .runtime_is_exit_requested
                 .expect("runtime_is_exit_requested is required"))(runtime.handle)
-        }
+        })
     })
 }
 
@@ -390,10 +384,7 @@ unsafe extern "C" fn runtime_set_external_surface(
     height: u32,
 ) -> i32 {
     guard_status(|| {
-        let Ok(runtime) = (unsafe { runtime_ref(runtime) }) else {
-            return STATUS_INVALID_HANDLE;
-        };
-        unsafe {
+        RUNTIMES.with(runtime, STATUS_INVALID_HANDLE, |runtime| unsafe {
             (runtime
                 .api
                 .runtime_set_external_surface
@@ -404,7 +395,7 @@ unsafe extern "C" fn runtime_set_external_surface(
                 width,
                 height,
             )
-        }
+        })
     })
 }
 
@@ -438,20 +429,6 @@ fn copy_native_frame(frame: &CoreFrameV1, destination: &mut Vec<u8>) -> bool {
     true
 }
 
-unsafe fn runtime_ref(runtime: u64) -> Result<&'static ApiRuntime, i32> {
-    if runtime == 0 {
-        return Err(STATUS_INVALID_HANDLE);
-    }
-    Ok(unsafe { &*(runtime as *const ApiRuntime) })
-}
-
-unsafe fn runtime_mut(runtime: u64) -> Result<&'static mut ApiRuntime, i32> {
-    if runtime == 0 {
-        return Err(STATUS_INVALID_HANDLE);
-    }
-    Ok(unsafe { &mut *(runtime as *mut ApiRuntime) })
-}
-
 fn guard_status(callback: impl FnOnce() -> i32) -> i32 {
     catch_unwind(AssertUnwindSafe(callback)).unwrap_or(STATUS_ENGINE)
 }
@@ -478,6 +455,28 @@ mod tests {
         let table = unsafe { &*table };
         assert_eq!(table.struct_size as usize, size);
         assert_eq!(validate_api_v1(table), Ok(()));
+    }
+
+    #[test]
+    fn invalid_handles_are_rejected_without_dereferencing() {
+        for garbage in [u64::MAX, 1 << 32, 0xDEAD_BEEF_CAFE] {
+            assert_eq!(unsafe { runtime_tick(garbage) }, STATUS_INVALID_HANDLE);
+            assert_eq!(unsafe { runtime_stage_width(garbage) }, 0);
+            assert_eq!(unsafe { runtime_stage_height(garbage) }, 0);
+            assert_eq!(unsafe { runtime_pixel_buffer_size(garbage) }, 0);
+            assert_eq!(unsafe { runtime_is_exit_requested(garbage) }, 0);
+            assert_eq!(
+                unsafe { runtime_push_input(garbage, ptr::null(), 0) },
+                STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_release_frame(garbage, 1) },
+                STATUS_INVALID_HANDLE
+            );
+            // Double destroy and garbage destroy are safe no-ops.
+            unsafe { runtime_destroy(garbage) };
+            unsafe { runtime_destroy(garbage) };
+        }
     }
 
     #[test]

@@ -11,6 +11,9 @@
 ))]
 pub mod api;
 
+#[cfg(any(feature = "rfvp-engine", feature = "krkr-engine"))]
+pub(crate) mod handles;
+
 #[cfg(feature = "rfvp-engine")]
 pub mod rfvp_api;
 

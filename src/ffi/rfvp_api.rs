@@ -3,7 +3,20 @@
 //! This table is separate from [`super::api::Art3m1sApiV1`]. RFVP keeps its
 //! own runtime/resources/frame handles, but rendering and presentation stay
 //! inside `art3m1s-rfvp` and the shared `art3m1s-render` backend.
+//!
+//! Runtime handles are generational handles resolved through
+//! [`super::handles::LockedHandleTable`]: stale, foreign, or double-destroyed
+//! handles fail with `ART3M1S_RFVP_STATUS_INVALID_HANDLE` instead of
+//! dereferencing raw pointer bits, and facade calls serialize on the table
+//! lock rather than aliasing runtime state across threads.
+//!
+//! Logs are available through the pull-based `log_next_bytes`/`poll_log`
+//! pair. `runtime_set_log_callback` remains for migration only: hosts running
+//! in environments where native-to-host callbacks are unsafe (for example
+//! Dart `NativeCallable` trampolines on modified iOS devices) must not
+//! register it and should poll the log queue instead.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -15,6 +28,7 @@ use art3m1s_rfvp::{
 };
 
 use crate::backend::BackendSelection;
+use crate::ffi::handles::LockedHandleTable;
 
 pub const ART3M1S_RFVP_API_ABI_VERSION: u32 = 1;
 pub const ART3M1S_RFVP_API_ABI_MAGIC: u64 = 0x3156_4652_4d33_4152; // "RA3MRFV1"
@@ -71,8 +85,15 @@ pub const ART3M1S_RFVP_AUDIO_ENCODED_OGG: u32 = 2;
 pub const ART3M1S_RFVP_AUDIO_ENCODED_MP3: u32 = 3;
 pub const ART3M1S_RFVP_AUDIO_ENCODED_FLAC: u32 = 4;
 
-pub type Art3m1sRfvpLogCallbackFn =
-    unsafe extern "C" fn(level: u32, message: *const u8, message_len: usize, user_data: *mut c_void);
+/// Deprecated direct log callback. Prefer the pull-based log queue
+/// (`log_next_bytes`/`poll_log`); hosts that cannot safely expose native-callable
+/// trampolines must leave this unset.
+pub type Art3m1sRfvpLogCallbackFn = unsafe extern "C" fn(
+    level: u32,
+    message: *const u8,
+    message_len: usize,
+    user_data: *mut c_void,
+);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -107,6 +128,10 @@ pub struct Art3m1sRfvpAudioCommandV1 {
     pub payload_size: usize,
     pub reserved: [u64; 2],
 }
+
+/// Wire size of one pulled log record header: level u32 + length u32, both
+/// little-endian, followed by the UTF-8 message bytes.
+pub const ART3M1S_RFVP_LOG_HEADER_SIZE: usize = 8;
 
 type RuntimeCreateFn = unsafe extern "C" fn(
     game_root_utf8: *const u8,
@@ -143,10 +168,10 @@ type RuntimeClearExternalSurfaceFn = unsafe extern "C" fn(runtime: u64);
 type RuntimeAdvanceAndPresentFn = unsafe extern "C" fn(runtime: u64, delta_ms: u32) -> i32;
 type RuntimeAdvanceAndRenderFn =
     unsafe extern "C" fn(runtime: u64, delta_ms: u32, out_pixels: *mut u8, capacity: u32) -> u32;
-type RuntimeSetLogCallbackFn = unsafe extern "C" fn(
-    callback: Option<Art3m1sRfvpLogCallbackFn>,
-    user_data: *mut c_void,
-);
+type RuntimeSetLogCallbackFn =
+    unsafe extern "C" fn(callback: Option<Art3m1sRfvpLogCallbackFn>, user_data: *mut c_void);
+type LogNextBytesFn = unsafe extern "C" fn() -> usize;
+type PollLogFn = unsafe extern "C" fn(output: *mut u8, capacity: usize) -> usize;
 
 #[repr(C)]
 pub struct Art3m1sRfvpApiV1 {
@@ -169,14 +194,32 @@ pub struct Art3m1sRfvpApiV1 {
     pub runtime_advance_and_present: Option<RuntimeAdvanceAndPresentFn>,
     pub runtime_advance_and_render: Option<RuntimeAdvanceAndRenderFn>,
     pub runtime_set_log_callback: Option<RuntimeSetLogCallbackFn>,
+    pub log_next_bytes: Option<LogNextBytesFn>,
+    pub poll_log: Option<PollLogFn>,
 }
 
 static RFVP_LOG_CALLBACK: Mutex<Option<(Art3m1sRfvpLogCallbackFn, usize)>> = Mutex::new(None);
+
+const MAX_LOG_RECORDS: usize = 1024;
+const MAX_LOG_MESSAGE: usize = 16 * 1024;
+
+struct LogRecord {
+    level: u32,
+    message: Vec<u8>,
+}
 
 struct ApiRuntime {
     runtime: RfvpHostRuntime,
     pending_audio_payload: Vec<u8>,
 }
+
+// Safety: `RfvpHostRuntime` holds raw engine pointers. All access goes through
+// `RUNTIMES`, whose table lock serializes every facade call, and the ABI
+// contract still requires a single host owner thread.
+unsafe impl Send for ApiRuntime {}
+
+static RUNTIMES: LockedHandleTable<ApiRuntime> = LockedHandleTable::new();
+static LOG_QUEUE: Mutex<VecDeque<LogRecord>> = Mutex::new(VecDeque::new());
 
 static API_V1: Art3m1sRfvpApiV1 = Art3m1sRfvpApiV1 {
     struct_size: std::mem::size_of::<Art3m1sRfvpApiV1>() as u32,
@@ -197,6 +240,8 @@ static API_V1: Art3m1sRfvpApiV1 = Art3m1sRfvpApiV1 {
     runtime_advance_and_present: Some(runtime_advance_and_present),
     runtime_advance_and_render: Some(runtime_advance_and_render),
     runtime_set_log_callback: Some(runtime_set_log_callback),
+    log_next_bytes: Some(log_next_bytes),
+    poll_log: Some(poll_log),
 };
 
 #[unsafe(no_mangle)]
@@ -270,11 +315,14 @@ unsafe extern "C" fn runtime_create(
             Ok(runtime) => runtime,
             Err(_) => return ART3M1S_RFVP_STATUS_ENGINE,
         };
-        let runtime = Box::new(ApiRuntime {
+        let handle = RUNTIMES.insert(ApiRuntime {
             runtime,
             pending_audio_payload: Vec::new(),
         });
-        unsafe { *out_runtime = Box::into_raw(runtime) as u64 };
+        if handle == 0 {
+            return ART3M1S_RFVP_STATUS_ENGINE;
+        }
+        unsafe { *out_runtime = handle };
         ART3M1S_RFVP_STATUS_OK
     })
 }
@@ -284,67 +332,53 @@ unsafe extern "C" fn runtime_destroy(runtime: u64) {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        drop(unsafe { Box::from_raw(runtime as *mut ApiRuntime) });
+        RUNTIMES.destroy(runtime);
     }));
 }
 
 unsafe extern "C" fn runtime_step(runtime: u64, delta_ms: u32) -> i32 {
     guard_status(|| {
-        let runtime = match unsafe { runtime_mut(runtime) } {
-            Ok(runtime) => runtime,
-            Err(status) => return status,
-        };
-        runtime
-            .runtime
-            .step(delta_ms)
-            .map_or(ART3M1S_RFVP_STATUS_ENGINE, |_| ART3M1S_RFVP_STATUS_OK)
+        RUNTIMES.with_mut(runtime, ART3M1S_RFVP_STATUS_INVALID_HANDLE, |runtime| {
+            runtime
+                .runtime
+                .step(delta_ms)
+                .map_or(ART3M1S_RFVP_STATUS_ENGINE, |_| ART3M1S_RFVP_STATUS_OK)
+        })
     })
 }
 
 unsafe extern "C" fn runtime_is_exit_requested(runtime: u64) -> i32 {
     guard_i32(|| {
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return 0;
-        };
-        i32::from(runtime.runtime.is_exit_requested())
+        RUNTIMES.with_mut(runtime, 0, |runtime| {
+            i32::from(runtime.runtime.is_exit_requested())
+        })
     })
 }
 
 unsafe extern "C" fn runtime_stage_width(runtime: u64) -> u32 {
-    guard_u32(|| {
-        unsafe { runtime_mut(runtime) }
-            .map(|runtime| runtime.runtime.width())
-            .unwrap_or(0)
-    })
+    guard_u32(|| RUNTIMES.with(runtime, 0, |runtime| runtime.runtime.width()))
 }
 
 unsafe extern "C" fn runtime_stage_height(runtime: u64) -> u32 {
-    guard_u32(|| {
-        unsafe { runtime_mut(runtime) }
-            .map(|runtime| runtime.runtime.height())
-            .unwrap_or(0)
-    })
+    guard_u32(|| RUNTIMES.with(runtime, 0, |runtime| runtime.runtime.height()))
 }
 
 unsafe extern "C" fn runtime_capabilities(runtime: u64) -> u64 {
     catch_unwind(AssertUnwindSafe(|| {
-        unsafe { runtime_mut(runtime) }
-            .map(|runtime| runtime.runtime.capabilities())
-            .unwrap_or(0)
+        RUNTIMES.with_mut(runtime, 0, |runtime| runtime.runtime.capabilities())
     }))
     .unwrap_or(0)
 }
 
 unsafe extern "C" fn runtime_pixel_buffer_size(runtime: u64) -> u32 {
     guard_u32(|| {
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return 0;
-        };
-        runtime
-            .runtime
-            .width()
-            .saturating_mul(runtime.runtime.height())
-            .saturating_mul(4)
+        RUNTIMES.with(runtime, 0, |runtime| {
+            runtime
+                .runtime
+                .width()
+                .saturating_mul(runtime.runtime.height())
+                .saturating_mul(4)
+        })
     })
 }
 
@@ -357,13 +391,14 @@ unsafe extern "C" fn runtime_feed_input(
         if events.is_null() && event_count != 0 {
             return ART3M1S_RFVP_STATUS_INVALID_ARGUMENT;
         }
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return ART3M1S_RFVP_STATUS_INVALID_HANDLE;
-        };
         if event_count > 4096 {
             return ART3M1S_RFVP_STATUS_INVALID_ARGUMENT;
         }
-        let native_events = unsafe { std::slice::from_raw_parts(events, event_count) };
+        let native_events: &[Art3m1sRfvpInputEventV1] = if event_count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(events, event_count) }
+        };
         let mut host_events = Vec::with_capacity(native_events.len());
         for event in native_events {
             let Ok(event) = convert_input_event(event) else {
@@ -371,10 +406,14 @@ unsafe extern "C" fn runtime_feed_input(
             };
             host_events.push(event);
         }
-        match runtime.runtime.push_input(&host_events) {
-            Ok(()) => ART3M1S_RFVP_STATUS_OK,
-            Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
-        }
+        RUNTIMES.with_mut(
+            runtime,
+            ART3M1S_RFVP_STATUS_INVALID_HANDLE,
+            |runtime| match runtime.runtime.push_input(&host_events) {
+                Ok(()) => ART3M1S_RFVP_STATUS_OK,
+                Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
+            },
+        )
     })
 }
 
@@ -386,19 +425,18 @@ unsafe extern "C" fn runtime_poll_audio_command(
         if out_command.is_null() {
             return ART3M1S_RFVP_STATUS_INVALID_ARGUMENT;
         }
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return ART3M1S_RFVP_STATUS_INVALID_HANDLE;
-        };
-        let command = match runtime.runtime.poll_audio_command() {
-            Ok(Some(command)) => command,
-            Ok(None) => return ART3M1S_RFVP_STATUS_NO_COMMAND,
-            Err(_) => return ART3M1S_RFVP_STATUS_ENGINE,
-        };
-        runtime.pending_audio_payload = command.payload.clone();
-        unsafe {
-            *out_command = audio_command_v1(&command, &runtime.pending_audio_payload);
-        }
-        ART3M1S_RFVP_STATUS_OK
+        RUNTIMES.with_mut(runtime, ART3M1S_RFVP_STATUS_INVALID_HANDLE, |runtime| {
+            let command = match runtime.runtime.poll_audio_command() {
+                Ok(Some(command)) => command,
+                Ok(None) => return ART3M1S_RFVP_STATUS_NO_COMMAND,
+                Err(_) => return ART3M1S_RFVP_STATUS_ENGINE,
+            };
+            runtime.pending_audio_payload = command.payload.clone();
+            unsafe {
+                *out_command = audio_command_v1(&command, &runtime.pending_audio_payload);
+            }
+            ART3M1S_RFVP_STATUS_OK
+        })
     })
 }
 
@@ -413,31 +451,33 @@ unsafe extern "C" fn runtime_set_external_surface(
         if handle.is_null() || width == 0 || height == 0 {
             return ART3M1S_RFVP_STATUS_INVALID_ARGUMENT;
         }
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return ART3M1S_RFVP_STATUS_INVALID_HANDLE;
-        };
-        runtime
-            .runtime
-            .set_native_surface(kind, handle, width, height)
-            .map_or(ART3M1S_RFVP_STATUS_UNSUPPORTED, |_| ART3M1S_RFVP_STATUS_OK)
+        RUNTIMES.with_mut(runtime, ART3M1S_RFVP_STATUS_INVALID_HANDLE, |runtime| {
+            runtime
+                .runtime
+                .set_native_surface(kind, handle, width, height)
+                .map_or(ART3M1S_RFVP_STATUS_UNSUPPORTED, |_| ART3M1S_RFVP_STATUS_OK)
+        })
     })
 }
 
 unsafe extern "C" fn runtime_clear_external_surface(runtime: u64) {
-    if let Ok(runtime) = unsafe { runtime_mut(runtime) } {
-        runtime.runtime.clear_native_surface();
-    }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        RUNTIMES.with_mut(runtime, (), |runtime| {
+            runtime.runtime.clear_native_surface();
+        });
+    }));
 }
 
 unsafe extern "C" fn runtime_advance_and_present(runtime: u64, delta_ms: u32) -> i32 {
     guard_status(|| {
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return ART3M1S_RFVP_STATUS_INVALID_HANDLE;
-        };
-        match runtime.runtime.advance_and_present(delta_ms) {
-            Ok(changed) => i32::from(changed),
-            Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
-        }
+        RUNTIMES.with_mut(
+            runtime,
+            ART3M1S_RFVP_STATUS_INVALID_HANDLE,
+            |runtime| match runtime.runtime.advance_and_present(delta_ms) {
+                Ok(changed) => i32::from(changed),
+                Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
+            },
+        )
     })
 }
 
@@ -451,37 +491,36 @@ unsafe extern "C" fn runtime_advance_and_render(
         if out_pixels.is_null() {
             return 0;
         }
-        let Ok(runtime) = (unsafe { runtime_mut(runtime) }) else {
-            return 0;
-        };
-        let required = runtime
-            .runtime
-            .width()
-            .saturating_mul(runtime.runtime.height())
-            .saturating_mul(4) as usize;
-        if (capacity as usize) < required {
-            return 0;
-        }
-        if runtime.runtime.step(delta_ms).is_err()
-            || runtime
+        RUNTIMES.with_mut(runtime, 0, |runtime| {
+            let required = runtime
                 .runtime
-                .render_pending_frame()
-                .ok()
-                .flatten()
-                .is_none()
-        {
-            return 0;
-        }
-        let Ok(pixels) = runtime.runtime.readback_rgba() else {
-            return 0;
-        };
-        if pixels.len() < required {
-            return 0;
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(pixels.as_ptr(), out_pixels, required);
-        }
-        required as u32
+                .width()
+                .saturating_mul(runtime.runtime.height())
+                .saturating_mul(4) as usize;
+            if (capacity as usize) < required {
+                return 0;
+            }
+            if runtime.runtime.step(delta_ms).is_err()
+                || runtime
+                    .runtime
+                    .render_pending_frame()
+                    .ok()
+                    .flatten()
+                    .is_none()
+            {
+                return 0;
+            }
+            let Ok(pixels) = runtime.runtime.readback_rgba() else {
+                return 0;
+            };
+            if pixels.len() < required {
+                return 0;
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(pixels.as_ptr(), out_pixels, required);
+            }
+            required as u32
+        })
     }))
     .unwrap_or(0)
 }
@@ -496,12 +535,83 @@ unsafe extern "C" fn runtime_set_log_callback(
     }
 }
 
+/// Bytes required to pull the oldest queued log record (header + message),
+/// or 0 when the queue is empty.
+unsafe extern "C" fn log_next_bytes() -> usize {
+    catch_unwind(AssertUnwindSafe(|| {
+        LOG_QUEUE
+            .lock()
+            .ok()
+            .and_then(|queue| {
+                queue
+                    .front()
+                    .map(|record| ART3M1S_RFVP_LOG_HEADER_SIZE.saturating_add(record.message.len()))
+            })
+            .unwrap_or(0)
+    }))
+    .unwrap_or(0)
+}
+
+/// Drains complete log records into `output`, oldest first, for as long as
+/// whole records fit in `capacity`. Record layout is fixed little-endian:
+/// `level: u32`, `message_len: u32`, then `message_len` bytes of UTF-8.
+/// Returns the number of bytes written.
+unsafe extern "C" fn poll_log(output: *mut u8, capacity: usize) -> usize {
+    catch_unwind(AssertUnwindSafe(|| {
+        if output.is_null() || capacity == 0 {
+            return 0;
+        }
+        let Ok(mut queue) = LOG_QUEUE.lock() else {
+            return 0;
+        };
+        let mut written = 0usize;
+        while let Some(record) = queue.front() {
+            let required = ART3M1S_RFVP_LOG_HEADER_SIZE.saturating_add(record.message.len());
+            if written.saturating_add(required) > capacity {
+                break;
+            }
+            let record = queue.pop_front().expect("front record exists");
+            let mut header = [0u8; ART3M1S_RFVP_LOG_HEADER_SIZE];
+            header[0..4].copy_from_slice(&record.level.to_le_bytes());
+            header[4..8].copy_from_slice(&(record.message.len() as u32).to_le_bytes());
+            unsafe {
+                ptr::copy_nonoverlapping(header.as_ptr(), output.add(written), header.len());
+            }
+            written += ART3M1S_RFVP_LOG_HEADER_SIZE;
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    record.message.as_ptr(),
+                    output.add(written),
+                    record.message.len(),
+                );
+            }
+            written += record.message.len();
+        }
+        written
+    }))
+    .unwrap_or(0)
+}
+
 pub(crate) fn dispatch_log(level: &str, message: &str) {
+    let level = level.as_bytes().first().copied().unwrap_or(b'I') as u32;
+    if let Ok(mut queue) = LOG_QUEUE.lock() {
+        while queue.len() >= MAX_LOG_RECORDS {
+            queue.pop_front();
+        }
+        let message = if message.len() > MAX_LOG_MESSAGE {
+            &message[..MAX_LOG_MESSAGE]
+        } else {
+            message
+        };
+        queue.push_back(LogRecord {
+            level,
+            message: message.as_bytes().to_vec(),
+        });
+    }
     let callback = RFVP_LOG_CALLBACK.lock().ok().and_then(|slot| *slot);
     let Some((callback, user_data)) = callback else {
         return;
     };
-    let level = level.as_bytes().first().copied().unwrap_or(b'I') as u32;
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         callback(
             level,
@@ -510,13 +620,6 @@ pub(crate) fn dispatch_log(level: &str, message: &str) {
             user_data as *mut c_void,
         );
     }));
-}
-
-unsafe fn runtime_mut(runtime: u64) -> Result<&'static mut ApiRuntime, i32> {
-    if runtime == 0 {
-        return Err(ART3M1S_RFVP_STATUS_INVALID_HANDLE);
-    }
-    Ok(unsafe { &mut *(runtime as *mut ApiRuntime) })
 }
 
 fn convert_input_event(event: &Art3m1sRfvpInputEventV1) -> Result<RfvpHostInputEvent, i32> {
@@ -651,6 +754,95 @@ mod tests {
         assert!(api.runtime_advance_and_render.is_some());
         assert!(api.runtime_poll_audio_command.is_some());
         assert!(api.runtime_set_log_callback.is_some());
+        assert!(api.log_next_bytes.is_some());
+        assert!(api.poll_log.is_some());
+    }
+
+    #[test]
+    fn invalid_handles_are_rejected_without_dereferencing() {
+        for garbage in [u64::MAX, 1 << 32, 0xDEAD_BEEF_CAFE] {
+            assert_eq!(
+                unsafe { runtime_step(garbage, 16) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(unsafe { runtime_stage_width(garbage) }, 0);
+            assert_eq!(unsafe { runtime_is_exit_requested(garbage) }, 0);
+            assert_eq!(unsafe { runtime_capabilities(garbage) }, 0);
+            assert_eq!(unsafe { runtime_pixel_buffer_size(garbage) }, 0);
+            assert_eq!(
+                unsafe { runtime_feed_input(garbage, ptr::null(), 0) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            let mut command = std::mem::MaybeUninit::<Art3m1sRfvpAudioCommandV1>::uninit();
+            assert_eq!(
+                unsafe { runtime_poll_audio_command(garbage, command.as_mut_ptr()) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_advance_and_present(garbage, 16) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_advance_and_render(garbage, 16, ptr::null_mut(), 0) },
+                0
+            );
+            // Double destroy and garbage destroy are safe no-ops.
+            unsafe { runtime_destroy(garbage) };
+            unsafe { runtime_destroy(garbage) };
+        }
+    }
+
+    static LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn logs_are_pulled_in_order_with_little_endian_headers() {
+        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        {
+            let mut queue = LOG_QUEUE.lock().unwrap();
+            queue.clear();
+        }
+        dispatch_log("W", "warning");
+        dispatch_log("E", "error");
+
+        let first = unsafe { log_next_bytes() };
+        assert_eq!(first, ART3M1S_RFVP_LOG_HEADER_SIZE + "warning".len());
+
+        let mut output = vec![0u8; first + ART3M1S_RFVP_LOG_HEADER_SIZE + "error".len()];
+        let written = unsafe { poll_log(output.as_mut_ptr(), output.len()) };
+        assert_eq!(written, output.len());
+
+        let level = u32::from_le_bytes(output[0..4].try_into().unwrap());
+        let len = u32::from_le_bytes(output[4..8].try_into().unwrap()) as usize;
+        assert_eq!(level, b'W' as u32);
+        assert_eq!(&output[8..8 + len], b"warning");
+        let offset = 8 + len;
+        let level = u32::from_le_bytes(output[offset..offset + 4].try_into().unwrap());
+        assert_eq!(level, b'E' as u32);
+        assert_eq!(unsafe { log_next_bytes() }, 0);
+    }
+
+    #[test]
+    fn poll_log_keeps_records_that_do_not_fit() {
+        let _guard = LOG_TEST_LOCK.lock().unwrap();
+        {
+            let mut queue = LOG_QUEUE.lock().unwrap();
+            queue.clear();
+        }
+        dispatch_log("I", "first");
+        dispatch_log("I", "second");
+
+        let one_record = ART3M1S_RFVP_LOG_HEADER_SIZE + "first".len();
+        let mut output = vec![0u8; one_record];
+        let written = unsafe { poll_log(output.as_mut_ptr(), output.len()) };
+        assert_eq!(written, one_record);
+        assert_eq!(
+            unsafe { log_next_bytes() },
+            ART3M1S_RFVP_LOG_HEADER_SIZE + "second".len()
+        );
+        {
+            let mut queue = LOG_QUEUE.lock().unwrap();
+            queue.clear();
+        }
     }
 
     #[test]
