@@ -18,6 +18,9 @@ Current mapping:
   cropping remains `ClipRect`.
 - `Normal`, `Add`, `Sub`, and `Mul` map to `Alpha`, `Add`,
   `NativeReverseSubtract`, and `Multiply`.
+- RFVP's per-draw `Nearest` / `Linear` filter is preserved. The adapter marks
+  nearest sprites with the built-in `sprite-nearest` identity, and each shared
+  backend selects the matching sampler without treating it as a runtime shader.
 - `DrawGlyph` converts its destination rectangle and optional source rectangle.
 - `DrawSolid` uses a pre-bound 1x1 white texture.
 - `HitProxyTable` is returned unchanged to the host.
@@ -27,7 +30,6 @@ Explicit first-version limits:
 - per-vertex colors must be uniform;
 - `effect_id != 0` is rejected;
 - negative clip or draw extents are rejected;
-- nearest filtering remains outside the conversion layer.
 
 The `host-runtime` path consumes ordered texture create/update/destroy records,
 validates their bounds and formats, and uploads them through `GpuBackend`.

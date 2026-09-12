@@ -330,6 +330,7 @@ pub struct MetalBackend {
     queue: CommandQueue,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
+    nearest_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     quad_vertex: MetalBuffer,
     quad_index: MetalBuffer,
     white_texture: Texture,
@@ -407,14 +408,8 @@ impl MetalBackend {
             .newLibraryWithSource_options_error(&source, None)
             .map_err(|error| format!("failed to compile built-in MSL: {error}"))?;
 
-        let sampler_desc = MTLSamplerDescriptor::new();
-        sampler_desc.setMinFilter(MTLSamplerMinMagFilter::Linear);
-        sampler_desc.setMagFilter(MTLSamplerMinMagFilter::Linear);
-        sampler_desc.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
-        sampler_desc.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
-        let sampler = device
-            .newSamplerStateWithDescriptor(&sampler_desc)
-            .ok_or_else(|| "failed to create Metal sampler".to_string())?;
+        let sampler = create_sampler(&device, MTLSamplerMinMagFilter::Linear)?;
+        let nearest_sampler = create_sampler(&device, MTLSamplerMinMagFilter::Nearest)?;
 
         let quad = [
             Vertex {
@@ -450,6 +445,7 @@ impl MetalBackend {
             queue,
             library,
             sampler,
+            nearest_sampler,
             quad_vertex,
             quad_index,
             white_texture,
@@ -1327,6 +1323,20 @@ fn create_solid_texture(
     let texture = create_texture(device, desc)?;
     upload_texture(&texture, desc, [0, 0], desc.extent, &rgba)?;
     Ok(texture)
+}
+
+fn create_sampler(
+    device: &ProtocolObject<dyn MTLDevice>,
+    filter: MTLSamplerMinMagFilter,
+) -> Result<Retained<ProtocolObject<dyn MTLSamplerState>>, String> {
+    let desc = MTLSamplerDescriptor::new();
+    desc.setMinFilter(filter);
+    desc.setMagFilter(filter);
+    desc.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
+    desc.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
+    device
+        .newSamplerStateWithDescriptor(&desc)
+        .ok_or_else(|| "failed to create Metal sampler".to_string())
 }
 
 fn texture_data_bytes<'a>(data: &'a TextureData<'a>) -> Option<&'a [u8]> {
@@ -2790,6 +2800,11 @@ impl MetalBackend {
             color_format: target.format,
         };
         let pipeline = self.pipeline(pipeline_key)?;
+        let sampler = if crate::shader::uses_nearest_sampler(command.shader.as_ref()) {
+            &self.nearest_sampler
+        } else {
+            &self.sampler
+        };
         let source = source_override
             .cloned()
             .or_else(|| {
@@ -2819,6 +2834,9 @@ impl MetalBackend {
 
         encoder.setRenderPipelineState(&pipeline);
         encoder.setScissorRect(scissor);
+        unsafe {
+            encoder.setFragmentSamplerState_atIndex(Some(sampler), 0);
+        }
 
         let vertex_uniforms = vertex_uniforms(command, stage);
         unsafe {
@@ -2874,11 +2892,9 @@ impl MetalBackend {
                             .setFragmentTexture_atIndex(
                                 Some(&self.transparent_texture),
                                 resource.binding as usize,
-                            ),
-                        ShaderResourceKind::Sampler => encoder.setFragmentSamplerState_atIndex(
-                            Some(&self.sampler),
-                            resource.binding as usize,
                         ),
+                        ShaderResourceKind::Sampler => encoder
+                            .setFragmentSamplerState_atIndex(Some(sampler), resource.binding as usize),
                         ShaderResourceKind::UniformBuffer => {}
                     }
                 }
@@ -3055,6 +3071,7 @@ impl MetalBackend {
 
     fn shader_kind(&self, effect: Option<&ShaderEffect>) -> ShaderKind {
         match effect.map(|effect| effect.name.as_str()) {
+            Some(crate::shader::SPRITE_NEAREST_SHADER) => ShaderKind::Sprite,
             Some(crate::shader::ALPHA_MASK_SHADER) => ShaderKind::AlphaMask,
             Some(crate::shader::GROUP_COMPOSITE_SHADER) => ShaderKind::GroupComposite,
             Some(crate::shader::RULE_TRANS_SHADER) => ShaderKind::RuleTransition,

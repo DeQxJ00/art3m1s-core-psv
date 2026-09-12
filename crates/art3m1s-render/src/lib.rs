@@ -29,7 +29,10 @@ pub use post_process::{
     PostProcessContext, PostProcessPass, PostProcessPipeline, RenderDimensions,
     RenderQualityPreset, SceneTarget, UpscaleConfig, UpscaleMode,
 };
-pub use shader::{ALPHA_MASK_SHADER, GROUP_COMPOSITE_SHADER, RULE_TRANS_SHADER, SPRITE_SHADER};
+pub use shader::{
+    ALPHA_MASK_SHADER, GROUP_COMPOSITE_SHADER, RULE_TRANS_SHADER, SPRITE_NEAREST_SHADER,
+    SPRITE_SHADER,
+};
 pub use types::{
     BackendCapabilities, BackendInfo, BackendKind, BackendStability, Extent2D, FrameTarget,
     NativeSurface, NativeSurfaceKind, PipelineId, RenderTarget, RenderTargetDesc, RenderTargetId,

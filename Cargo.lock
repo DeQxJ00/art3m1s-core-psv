@@ -143,6 +143,7 @@ version = "0.1.0"
 dependencies = [
  "art3m1s-render",
  "glam 0.30.10",
+ "log",
  "rfvp",
 ]
 

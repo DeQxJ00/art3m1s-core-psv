@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use art3m1s_render::backend::metal::MetalBackend;
-use art3m1s_rfvp::{RfvpHostRuntime, RfvpNls};
+use art3m1s_rfvp::{RfvpHostRuntime, RfvpNls, RfvpPointerButton};
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -24,6 +24,38 @@ fn main() -> Result<()> {
         })
         .transpose()?
         .unwrap_or(180);
+    let clicks = std::env::var("RFVP_SMOKE_CLICK")
+        .ok()
+        .map(|value| {
+            value
+                .split(';')
+                .map(|click| {
+                    let mut parts = click.split(',');
+                    let frame = parts
+                        .next()
+                        .context("RFVP_SMOKE_CLICK needs frame")?
+                        .parse::<u32>()
+                        .context("RFVP_SMOKE_CLICK frame must be an integer")?;
+                    let x = parts
+                        .next()
+                        .context("RFVP_SMOKE_CLICK needs x")?
+                        .parse::<i32>()
+                        .context("RFVP_SMOKE_CLICK x must be an integer")?;
+                    let y = parts
+                        .next()
+                        .context("RFVP_SMOKE_CLICK needs y")?
+                        .parse::<i32>()
+                        .context("RFVP_SMOKE_CLICK y must be an integer")?;
+                    if parts.next().is_some() {
+                        bail!("RFVP_SMOKE_CLICK entry has trailing fields: {click}");
+                    }
+                    Ok::<_, anyhow::Error>((frame, x, y))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let dump_hit_proxies = std::env::var_os("RFVP_SMOKE_HIT_PROXIES").is_some();
 
     let size = (1024u32, 640u32);
     let backend = MetalBackend::new(size.0, size.1).map_err(anyhow::Error::msg)?;
@@ -36,18 +68,63 @@ fn main() -> Result<()> {
         Box::new(backend),
         [0.05, 0.06, 0.08, 1.0],
     )?;
+    let stage_size = (runtime.width(), runtime.height());
 
     let mut rendered_frames = 0u32;
     for frame in 0..frame_count {
+        if frame == 1 {
+            runtime
+                .push_input(&[art3m1s_rfvp::RfvpHostInputEvent::Focus { focused: true }])
+                .context("focus smoke runtime")?;
+        }
         runtime
             .step(16)
             .with_context(|| format!("step frame {frame}"))?;
-        if runtime
+        for (click_frame, x, y) in &clicks {
+            if frame == *click_frame {
+                runtime
+                    .push_input(&[
+                        art3m1s_rfvp::RfvpHostInputEvent::PointerMove { x: *x, y: *y },
+                        art3m1s_rfvp::RfvpHostInputEvent::PointerButton {
+                            button: RfvpPointerButton::Left,
+                            pressed: true,
+                            x: *x,
+                            y: *y,
+                        },
+                    ])
+                    .with_context(|| format!("click down frame {frame} at {x},{y}"))?;
+            }
+            if frame == click_frame.saturating_add(2) {
+                runtime
+                    .push_input(&[art3m1s_rfvp::RfvpHostInputEvent::PointerButton {
+                        button: RfvpPointerButton::Left,
+                        pressed: false,
+                        x: *x,
+                        y: *y,
+                    }])
+                    .with_context(|| format!("click up frame {frame} at {x},{y}"))?;
+            }
+        }
+        if let Some(result) = runtime
             .render_pending_frame()
             .with_context(|| format!("render frame {frame}"))?
-            .is_some()
         {
             rendered_frames += 1;
+            if dump_hit_proxies {
+                for proxy in &result.hit_proxies.proxies {
+                    println!(
+                        "hit frame={frame} prim={} rect=({}, {}, {}, {}) enabled={} visible={} order={}",
+                        proxy.prim_id.0,
+                        proxy.rect.x,
+                        proxy.rect.y,
+                        proxy.rect.w,
+                        proxy.rect.h,
+                        proxy.enabled,
+                        proxy.visible,
+                        proxy.order,
+                    );
+                }
+            }
         }
         if frame % 30 == 0 {
             println!(
@@ -69,11 +146,19 @@ fn main() -> Result<()> {
     if non_black == 0 {
         bail!("RFVP host runtime produced only a black frame");
     }
-    image::save_buffer(&output, &pixels, size.0, size.1, image::ColorType::Rgba8)
+    image::save_buffer(
+        &output,
+        &pixels,
+        stage_size.0,
+        stage_size.1,
+        image::ColorType::Rgba8,
+    )
         .with_context(|| format!("save screenshot {}", output.display()))?;
     println!(
-        "rendered_frames={rendered_frames} non_black={non_black} saved={}",
-        output.display()
+        "rendered_frames={rendered_frames} non_black={non_black} stage={}x{} saved={}",
+        stage_size.0,
+        stage_size.1,
+        output.display(),
     );
     Ok(())
 }

@@ -2,8 +2,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use art3m1s_render::{
-    BlendMode, ClipRect, ColorFilter, DrawCommand, DrawList, DrawMesh, TextureInfo,
+    BlendMode, ClipRect, ColorFilter, DrawCommand, DrawList, DrawMesh, ShaderEffect, TextureInfo,
 };
+use art3m1s_render::shader::SPRITE_NEAREST_SHADER;
 use glam::{Affine2, Vec2};
 
 use crate::protocol::{
@@ -136,6 +137,15 @@ fn convert_image(
     let color = uniform_vertex_color(&command.vertices)?;
     let clip_bounds = clip_bounds(clip)?;
     let (transform, clip_rect, mesh) = sprite_geometry(&command.vertices, binding.info);
+    let shader = match command.filter {
+        crate::protocol::TextureFilter::Nearest => Some(ShaderEffect {
+            name: SPRITE_NEAREST_SHADER.to_owned(),
+            uniforms: Default::default(),
+            mask_texture: None,
+            user_texture: None,
+        }),
+        crate::protocol::TextureFilter::Linear => None,
+    };
 
     Ok(DrawCommand {
         texture: binding.texture,
@@ -149,7 +159,7 @@ fn convert_image(
         },
         clip: clip_rect,
         clip_bounds,
-        shader: None,
+        shader,
         mesh,
         stencil: None,
         native_emote: None,
@@ -367,7 +377,7 @@ mod tests {
     use art3m1s_render::{BlendMode, TextureId, TextureInfo};
 
     use super::*;
-    use crate::protocol::{HitProxy, PrimId, RectU16, Rgba8, TextureHandle};
+    use crate::protocol::{HitProxy, PrimId, RectU16, Rgba8, TextureFilter, TextureHandle};
 
     fn color(r: f32, g: f32, b: f32, a: f32) -> ColorRgba {
         ColorRgba { r, g, b, a }
@@ -411,6 +421,7 @@ mod tests {
             },
             color,
             blend,
+            filter: TextureFilter::Linear,
             effect_id: 0,
             clip: None,
             vertices,
@@ -469,7 +480,77 @@ mod tests {
         assert_eq!(command.clip.uv_offset, [0.0, 0.0]);
         assert_eq!(command.clip.uv_scale, [1.0, 1.0]);
         assert_eq!(command.clip.quad_size, [40.0, 40.0]);
+        assert!(command.shader.is_none());
         assert!(command.mesh.is_none());
+    }
+
+    #[test]
+    fn nearest_image_uses_nearest_sprite_shader() {
+        let tint = color(1.0, 1.0, 1.0, 1.0);
+        let mut draw = match image(
+            7,
+            axis_vertices(tint),
+            rgba(255, 255, 255, 255),
+            CommandBlendMode::Normal,
+        ) {
+            RenderCommand::DrawImage(command) => command,
+            _ => unreachable!(),
+        };
+        draw.filter = TextureFilter::Nearest;
+        let adapter = DrawListAdapter::with_bindings(bindings());
+
+        let adapted = adapter
+            .convert_commands(&[RenderCommand::DrawImage(draw)])
+            .unwrap();
+
+        assert_eq!(
+            adapted.commands[0]
+                .shader
+                .as_ref()
+                .map(|effect| effect.name.as_str()),
+            Some(SPRITE_NEAREST_SHADER)
+        );
+    }
+
+    #[test]
+    fn axis_aligned_fast_path_reconstructs_rfvp_vertices_with_flipped_uvs() {
+        let tint = color(1.0, 1.0, 1.0, 1.0);
+        let vertices = [
+            vertex(10.0, 50.0, 0.75, 0.25, tint),
+            vertex(10.0, 10.0, 0.75, 0.875, tint),
+            vertex(50.0, 50.0, 0.125, 0.25, tint),
+            vertex(50.0, 10.0, 0.125, 0.875, tint),
+        ];
+        let adapter = DrawListAdapter::with_bindings(bindings());
+
+        let adapted = adapter
+            .convert_commands(&[image(
+                7,
+                vertices,
+                rgba(255, 255, 255, 255),
+                CommandBlendMode::Normal,
+            )])
+            .unwrap();
+        let command = &adapted.commands[0];
+        let [width, height] = command.clip.quad_size;
+        let corners = [
+            ([0.0, height], [0.0, 1.0]),
+            ([0.0, 0.0], [0.0, 0.0]),
+            ([width, height], [1.0, 1.0]),
+            ([width, 0.0], [1.0, 0.0]),
+        ];
+
+        for (source, (position, uv)) in vertices.iter().zip(corners) {
+            let position = command
+                .transform
+                .transform_point2(Vec2::from_array(position));
+            let uv = [
+                command.clip.uv_offset[0] + uv[0] * command.clip.uv_scale[0],
+                command.clip.uv_offset[1] + uv[1] * command.clip.uv_scale[1],
+            ];
+            assert_eq!(position.to_array(), source.position);
+            assert_eq!(uv, source.tex_coord);
+        }
     }
 
     #[test]

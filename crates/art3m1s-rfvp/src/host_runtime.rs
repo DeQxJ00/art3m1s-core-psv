@@ -9,14 +9,17 @@ use std::fmt;
 use std::path::Path;
 use std::ptr;
 
-use art3m1s_render::{Extent2D, GpuBackend, NativeSurface};
+use art3m1s_render::{
+    Extent2D, GpuBackend, NativeSurface, PostProcessPass, PostProcessPipeline, UpscaleConfig,
+    UpscaleMode,
+};
 use rfvp::host_abi::runtime::{
     rfvp_frame_get_commands, rfvp_frame_get_hit_proxies, rfvp_frame_get_size,
     rfvp_frame_get_textures, rfvp_frame_release, rfvp_resources_create, rfvp_resources_destroy,
     rfvp_resources_mount_directory, rfvp_resources_set_save_root, rfvp_runtime_acquire_frame,
     rfvp_runtime_capabilities, rfvp_runtime_create, rfvp_runtime_destroy,
     rfvp_runtime_is_exit_requested, rfvp_runtime_poll_audio_command, rfvp_runtime_push_input,
-    rfvp_runtime_step,
+    rfvp_runtime_stage_height, rfvp_runtime_stage_width, rfvp_runtime_step,
 };
 use rfvp::host_abi::v1::{
     RFVP_AUDIO_CREATE_STREAM, RFVP_AUDIO_DESTROY_STREAM, RFVP_AUDIO_ENCODED_FLAC,
@@ -30,11 +33,12 @@ use rfvp::host_abi::v1::{
     RFVP_INPUT_PHASE_DOWN, RFVP_INPUT_PHASE_MOVE, RFVP_INPUT_PHASE_REPEAT, RFVP_INPUT_PHASE_UP,
     RFVP_INPUT_POINTER_BUTTON, RFVP_INPUT_POINTER_MOVE, RFVP_INPUT_QUIT, RFVP_INPUT_TEXT,
     RFVP_INPUT_TOUCH, RFVP_INPUT_WHEEL, RFVP_NLS_GBK, RFVP_NLS_SHIFT_JIS, RFVP_NLS_UTF8,
-    RFVP_POINTER_LEFT, RFVP_POINTER_MIDDLE, RFVP_POINTER_RIGHT, RFVP_STATUS_NO_COMMAND,
-    RFVP_STATUS_NO_FRAME, RFVP_STATUS_OK, RFVP_TEXTURE_CREATE, RFVP_TEXTURE_DESTROY,
-    RFVP_TEXTURE_FORMAT_LUMA_A8, RFVP_TEXTURE_FORMAT_RGBA8, RFVP_TEXTURE_UPDATE,
-    RfvpAudioCommandV1, RfvpDrawCommandV1, RfvpHitProxyV1, RfvpInputEventV1, RfvpResourcesConfigV1,
-    RfvpRuntimeConfigV1, RfvpTextureCommandV1,
+    RFVP_POINTER_LEFT, RFVP_POINTER_MIDDLE, RFVP_POINTER_RIGHT, RFVP_STATUS_ENGINE,
+    RFVP_STATUS_NO_COMMAND, RFVP_STATUS_NO_FRAME, RFVP_STATUS_OK, RFVP_TEXTURE_CREATE,
+    RFVP_TEXTURE_DESTROY, RFVP_TEXTURE_FORMAT_LUMA_A8, RFVP_TEXTURE_FORMAT_RGBA8,
+    RFVP_TEXTURE_FILTER_LINEAR, RFVP_TEXTURE_FILTER_NEAREST, RFVP_TEXTURE_UPDATE,
+    RfvpAudioCommandV1, RfvpDrawCommandV1, RfvpHitProxyV1, RfvpInputEventV1,
+    RfvpResourcesConfigV1, RfvpRuntimeConfigV1, RfvpTextureCommandV1,
 };
 use rfvp::host_api::{
     CommandBlendMode, DrawGlyphCmd, DrawImageCmd, HitProxy, HitProxyTable, PortableTextureDesc,
@@ -46,6 +50,8 @@ use rfvp::rendering::external::{
 };
 
 use crate::{ExternalRenderer, ExternalRendererError, RfvpRenderResult};
+
+const RFVP_HOST_CAPABILITY_SPATIAL_UPSCALING: u64 = 1 << 11;
 
 /// Native NLS used while mounting an RFVP project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +202,7 @@ pub enum RfvpHostRuntimeError {
     UnsupportedBlend(u32),
     UnsupportedTextureKind(u32),
     UnsupportedTextureFormat(u32),
+    UnsupportedTextureFilter(u32),
     UnsupportedEffect(u32),
     UnsupportedMesh,
     RectOverflow,
@@ -237,6 +244,9 @@ impl fmt::Display for RfvpHostRuntimeError {
             }
             Self::UnsupportedTextureFormat(format) => {
                 write!(f, "unsupported RFVP texture format {format}")
+            }
+            Self::UnsupportedTextureFilter(filter) => {
+                write!(f, "unsupported RFVP texture filter {filter}")
             }
             Self::UnsupportedEffect(effect) => {
                 write!(f, "unsupported RFVP effect id {effect}")
@@ -304,6 +314,9 @@ impl RfvpHostRuntime {
             .map(|path| path.to_str().ok_or(RfvpHostRuntimeError::InvalidPath))
             .transpose()?;
         let save_root_bytes = save_root.map(str::as_bytes);
+        let requested_width = width;
+        let requested_height = height;
+        let mut backend = backend;
 
         let resources_config = RfvpResourcesConfigV1 {
             struct_size: std::mem::size_of::<RfvpResourcesConfigV1>() as u32,
@@ -350,7 +363,13 @@ impl RfvpHostRuntime {
             if status != RFVP_STATUS_OK {
                 return Err(RfvpHostRuntimeError::RuntimeCreate(status));
             }
-            Ok((runtime, width, height))
+            let actual_width = unsafe { rfvp_runtime_stage_width(runtime) };
+            let actual_height = unsafe { rfvp_runtime_stage_height(runtime) };
+            if actual_width == 0 || actual_height == 0 {
+                unsafe { rfvp_runtime_destroy(runtime) };
+                return Err(RfvpHostRuntimeError::RuntimeCreate(RFVP_STATUS_ENGINE));
+            }
+            Ok((runtime, actual_width, actual_height))
         })();
 
         let (runtime, width, height) = match result {
@@ -360,6 +379,16 @@ impl RfvpHostRuntime {
                 return Err(error);
             }
         };
+
+        if width != requested_width || height != requested_height {
+            if let Err(error) = backend.resize(Extent2D::new(width, height)) {
+                unsafe { rfvp_runtime_destroy(runtime) };
+                unsafe { rfvp_resources_destroy(resources) };
+                return Err(RfvpHostRuntimeError::Render(
+                    ExternalRendererError::Backend(error),
+                ));
+            }
+        }
 
         Ok(Self {
             resources,
@@ -390,7 +419,18 @@ impl RfvpHostRuntime {
     }
 
     pub fn capabilities(&mut self) -> u64 {
-        unsafe { rfvp_runtime_capabilities(self.runtime) }
+        let rfvp = unsafe { rfvp_runtime_capabilities(self.runtime) };
+        let spatial = self
+            .renderer
+            .backend()
+            .backend_info()
+            .capabilities
+            .spatial_upscaling;
+        rfvp | if spatial {
+            RFVP_HOST_CAPABILITY_SPATIAL_UPSCALING
+        } else {
+            0
+        }
     }
 
     pub fn is_exit_requested(&mut self) -> bool {
@@ -453,7 +493,7 @@ impl RfvpHostRuntime {
         if status != RFVP_STATUS_OK {
             return Err(RfvpHostRuntimeError::AudioCommandRead(status));
         }
-        Ok(Some(convert_audio_command(&command)?))
+        convert_audio_command(&command).map(Some)
     }
 
     pub fn drain_audio_commands(
@@ -482,7 +522,30 @@ impl RfvpHostRuntime {
         self.renderer
             .backend_mut()
             .set_native_surface(surface)
-            .map_err(RfvpHostRuntimeError::Surface)
+            .map_err(RfvpHostRuntimeError::Surface)?;
+        self.configure_surface_post_process(width, height);
+        Ok(())
+    }
+
+    fn configure_surface_post_process(&mut self, width: u32, height: u32) {
+        let stage_width = self.width;
+        let stage_height = self.height;
+        let backend = self.renderer.backend_mut();
+        let spatial_supported = backend.backend_info().capabilities.spatial_upscaling;
+        let use_spatial = spatial_supported && width > stage_width && height > stage_height;
+        let mut pipeline = PostProcessPipeline::default();
+        if use_spatial {
+            pipeline.render_scale = (stage_width as f32 / width as f32)
+                .min(stage_height as f32 / height as f32)
+                .clamp(0.1, 1.0);
+            pipeline.passes[0] = PostProcessPass::Upscale(UpscaleConfig {
+                mode: UpscaleMode::Spatial,
+                sharpness: 0.0,
+            });
+        }
+        if let Err(error) = backend.configure_post_process(pipeline) {
+            log::warn!("[RFVP][MetalFX] surface upscale configuration failed: {error}");
+        }
     }
 
     pub fn clear_native_surface(&mut self) {
@@ -783,6 +846,7 @@ fn convert_command(command: &RfvpDrawCommandV1) -> Result<RenderCommand, RfvpHos
             dst: convert_rect_i16(command.dst_rect)?,
             color: convert_rgba8(command.color),
             blend: convert_blend(command.blend)?,
+            filter: convert_texture_filter(command.filter)?,
             effect_id: 0,
             clip: if command.flags & 1 != 0 {
                 Some(convert_rect_i16(command.clip_rect)?)
@@ -941,5 +1005,15 @@ fn convert_blend(blend: u32) -> Result<CommandBlendMode, RfvpHostRuntimeError> {
         RFVP_BLEND_REVERSE_SUBTRACT => Ok(CommandBlendMode::Sub),
         RFVP_BLEND_MULTIPLY => Ok(CommandBlendMode::Mul),
         blend => Err(RfvpHostRuntimeError::UnsupportedBlend(blend)),
+    }
+}
+
+fn convert_texture_filter(
+    filter: u32,
+) -> Result<rfvp::host_api::TextureFilter, RfvpHostRuntimeError> {
+    match filter {
+        RFVP_TEXTURE_FILTER_NEAREST => Ok(rfvp::host_api::TextureFilter::Nearest),
+        RFVP_TEXTURE_FILTER_LINEAR => Ok(rfvp::host_api::TextureFilter::Linear),
+        _ => Err(RfvpHostRuntimeError::UnsupportedTextureFilter(filter)),
     }
 }

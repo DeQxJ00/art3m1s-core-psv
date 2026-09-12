@@ -68,6 +68,12 @@ pub enum CommandBlendMode {
     Mul,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureFilter {
+    Nearest,
+    Linear,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DrawImageCmd {
     pub texture: TextureHandle,
@@ -75,6 +81,7 @@ pub struct DrawImageCmd {
     pub dst: RectI16,
     pub color: Rgba8,
     pub blend: CommandBlendMode,
+    pub filter: TextureFilter,
     pub effect_id: u16,
     pub clip: Option<RectI16>,
     pub vertices: [Vertex2D; 4],

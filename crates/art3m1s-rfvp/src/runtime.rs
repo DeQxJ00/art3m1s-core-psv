@@ -202,12 +202,16 @@ impl ExternalRenderer {
         upload: &RecordedTextureCreate,
     ) -> Result<(), ExternalRendererError> {
         let cached = self.textures.get(&upload.handle).copied();
-        if cached.is_some_and(|cached| {
-            cached.format == upload.desc.format
-                && cached.info.width == u32::from(upload.desc.width)
-                && cached.info.height == u32::from(upload.desc.height)
-                && cached.generation == upload.generation
-        }) {
+        // Generation 0 means the producer does not track generations; such
+        // creates always carry fresh pixels and must not be deduplicated.
+        if upload.generation != 0
+            && cached.is_some_and(|cached| {
+                cached.format == upload.desc.format
+                    && cached.info.width == u32::from(upload.desc.width)
+                    && cached.info.height == u32::from(upload.desc.height)
+                    && cached.generation == upload.generation
+            })
+        {
             return Ok(());
         }
 

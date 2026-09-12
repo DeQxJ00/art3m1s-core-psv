@@ -48,6 +48,37 @@ fn main() -> Result<()> {
         })
         .transpose()?
         .unwrap_or(16);
+    let clicks = std::env::var("RFVP_SMOKE_CLICK")
+        .ok()
+        .map(|value| {
+            value
+                .split(';')
+                .map(|click| {
+                    let mut parts = click.split(',');
+                    let frame = parts
+                        .next()
+                        .context("RFVP_SMOKE_CLICK needs frame")?
+                        .parse::<u32>()
+                        .context("RFVP_SMOKE_CLICK frame must be an integer")?;
+                    let x = parts
+                        .next()
+                        .context("RFVP_SMOKE_CLICK needs x")?
+                        .parse::<i32>()
+                        .context("RFVP_SMOKE_CLICK x must be an integer")?;
+                    let y = parts
+                        .next()
+                        .context("RFVP_SMOKE_CLICK needs y")?
+                        .parse::<i32>()
+                        .context("RFVP_SMOKE_CLICK y must be an integer")?;
+                    if parts.next().is_some() {
+                        bail!("RFVP_SMOKE_CLICK entry has trailing fields: {click}");
+                    }
+                    Ok::<_, anyhow::Error>((frame, x, y))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     rfvp::utils::file::set_base_path(&game_root);
     let parser = rfvp::boot::load_script(Nls::ShiftJIS)?;
@@ -73,6 +104,14 @@ fn main() -> Result<()> {
 
     for frame in 0..frame_count {
         let _status = pump.host_step_without_render(frame_delay_ms as u32);
+        for (click_frame, x, y) in &clicks {
+            if frame == *click_frame {
+                pump.host_virtual_pointer(0, *x, *y);
+            }
+            if frame == click_frame.saturating_add(2) {
+                pump.host_virtual_pointer(2, *x, *y);
+            }
+        }
         let external = pump.capture_external_frame();
         let signature = frame_signature(&external);
         let changed = signature != last_signature;
@@ -131,6 +170,14 @@ fn frame_signature(external: &rfvp::rendering::external::ExternalFrame) -> u64 {
         .hash(hasher);
     }
 
+    fn hash_filter(hasher: &mut DefaultHasher, filter: rfvp::host_api::TextureFilter) {
+        match filter {
+            rfvp::host_api::TextureFilter::Nearest => 0u8,
+            rfvp::host_api::TextureFilter::Linear => 1,
+        }
+        .hash(hasher);
+    }
+
     let mut hasher = DefaultHasher::new();
     let frame = &external.frame;
     frame.commands.len().hash(&mut hasher);
@@ -148,6 +195,7 @@ fn frame_signature(external: &rfvp::rendering::external::ExternalFrame) -> u64 {
                 ]
                 .hash(&mut hasher);
                 hash_blend(&mut hasher, command.blend);
+                hash_filter(&mut hasher, command.filter);
                 command.effect_id.hash(&mut hasher);
                 command.clip.is_some().hash(&mut hasher);
                 if let Some(clip) = command.clip {

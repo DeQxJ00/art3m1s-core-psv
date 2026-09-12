@@ -34,6 +34,7 @@ fn translate_command(command: &upstream::RenderCommand) -> local::RenderCommand 
                 dst: translate_rect_i16(command.dst),
                 color: translate_rgba8(command.color),
                 blend: translate_blend(command.blend),
+                filter: translate_texture_filter(command.filter),
                 effect_id: command.effect_id,
                 clip: command.clip.map(translate_rect_i16),
                 vertices: command.vertices.map(translate_vertex),
@@ -124,6 +125,13 @@ fn translate_blend(blend: upstream::CommandBlendMode) -> local::CommandBlendMode
     }
 }
 
+fn translate_texture_filter(filter: upstream::TextureFilter) -> local::TextureFilter {
+    match filter {
+        upstream::TextureFilter::Nearest => local::TextureFilter::Nearest,
+        upstream::TextureFilter::Linear => local::TextureFilter::Linear,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use art3m1s_render::{BlendMode, TextureId, TextureInfo};
@@ -170,6 +178,7 @@ mod tests {
                         a: 255,
                     },
                     blend: upstream::CommandBlendMode::Sub,
+                    filter: upstream::TextureFilter::Linear,
                     effect_id: 0,
                     clip: None,
                     vertices: [

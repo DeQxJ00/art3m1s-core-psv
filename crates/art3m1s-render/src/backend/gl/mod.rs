@@ -774,7 +774,25 @@ impl GlRenderer {
             }
 
             gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, texture_from_id(cmd.texture));
+            let texture = texture_from_id(cmd.texture);
+            gl.bind_texture(glow::TEXTURE_2D, texture);
+            if texture.is_some() {
+                let filter = if crate::shader::uses_nearest_sampler(cmd.shader.as_ref()) {
+                    glow::NEAREST
+                } else {
+                    glow::LINEAR
+                };
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    filter as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    filter as i32,
+                );
+            }
 
             if custom_program.is_some() {
                 gl.uniform_1_i32(bindings.texture_fore.as_ref(), 0);
@@ -1096,6 +1114,16 @@ impl GlRenderer {
             gl.uniform_1_i32(self.program_bindings.sampler.as_ref(), 0);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
             self.record_draw(6, 1);
             gl.draw_arrays(glow::TRIANGLES, 0, 6);
             gl.flush();

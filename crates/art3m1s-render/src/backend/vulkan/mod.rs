@@ -241,6 +241,7 @@ pub struct VulkanBackend {
     custom_descriptor_layout: vk::DescriptorSetLayout,
     custom_pipeline_layout: vk::PipelineLayout,
     sampler: vk::Sampler,
+    nearest_sampler: vk::Sampler,
     shaders: ShaderModules,
     render_passes: HashMap<vk::Format, vk::RenderPass>,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
@@ -391,18 +392,8 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| format!("create Vulkan custom pipeline layout: {e}"))?;
-        let sampler = unsafe {
-            device.create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
-                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                None,
-            )
-        }
-        .map_err(|e| format!("create Vulkan sampler: {e}"))?;
+        let sampler = create_sampler(&device, vk::Filter::LINEAR)?;
+        let nearest_sampler = create_sampler(&device, vk::Filter::NEAREST)?;
         let shaders = create_shaders(&device)?;
         let render_pass = create_render_pass(&device, vk::Format::R8G8B8A8_UNORM)?;
         let mut render_passes = HashMap::new();
@@ -480,6 +471,7 @@ impl VulkanBackend {
             custom_descriptor_layout,
             custom_pipeline_layout,
             sampler,
+            nearest_sampler,
             shaders,
             render_passes,
             pipelines: HashMap::new(),
@@ -633,6 +625,7 @@ impl VulkanBackend {
 
     fn shader_kind(&self, effect: Option<&ShaderEffect>) -> ShaderKind {
         match effect.map(|effect| effect.name.as_str()) {
+            Some(crate::shader::SPRITE_NEAREST_SHADER) => ShaderKind::Sprite,
             Some(crate::shader::ALPHA_MASK_SHADER) => ShaderKind::AlphaMask,
             Some(crate::shader::GROUP_COMPOSITE_SHADER) => ShaderKind::GroupComposite,
             Some(crate::shader::RULE_TRANS_SHADER) => ShaderKind::RuleTransition,
@@ -667,6 +660,21 @@ fn sampled_binding(binding: u32) -> vk::DescriptorSetLayoutBinding<'static> {
         .descriptor_count(1)
         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+}
+
+fn create_sampler(device: &Device, filter: vk::Filter) -> Result<vk::Sampler, String> {
+    unsafe {
+        device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(filter)
+                .min_filter(filter)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        )
+    }
+    .map_err(|e| format!("create Vulkan sampler: {e}"))
 }
 
 fn select_physical_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u32), String> {
@@ -2791,6 +2799,11 @@ impl VulkanBackend {
             VertexLayout::IndexedQuad
         };
         let shader = self.shader_kind(c.shader.as_ref());
+        let sampler = if crate::shader::uses_nearest_sampler(c.shader.as_ref()) {
+            self.nearest_sampler
+        } else {
+            self.sampler
+        };
         let key = PipelineKey {
             shader,
             format: target.format,
@@ -2902,7 +2915,7 @@ impl VulkanBackend {
         let back = [vk::DescriptorImageInfo::default()
             .image_view(self.transparent.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let sam = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+        let sam = [vk::DescriptorImageInfo::default().sampler(sampler)];
         let mut writes = vec![
             vk::WriteDescriptorSet::default()
                 .dst_set(set)
@@ -3605,6 +3618,7 @@ impl Drop for VulkanBackend {
             self.device.destroy_shader_module(self.shaders.group, None);
             self.device.destroy_shader_module(self.shaders.rule, None);
             self.device.destroy_sampler(self.sampler, None);
+            self.device.destroy_sampler(self.nearest_sampler, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device
