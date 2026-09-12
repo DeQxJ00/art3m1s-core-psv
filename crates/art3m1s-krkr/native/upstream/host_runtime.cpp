@@ -64,6 +64,42 @@ std::string NormalizeRuntimePath(std::string path)
     return path;
 }
 
+std::string ResolveRuntimeEntry(const std::string& game_root)
+{
+    std::error_code error;
+    const std::filesystem::path root(game_root);
+    if (std::filesystem::is_regular_file(root, error) && !error)
+        return game_root;
+    if (!std::filesystem::is_directory(root, error) || error)
+        return {};
+
+    const std::filesystem::path data_xp3 = root / "data.xp3";
+    if (std::filesystem::is_regular_file(data_xp3, error) && !error)
+        return data_xp3.string();
+
+    const std::filesystem::path startup_tjs = root / "startup.tjs";
+    if (std::filesystem::is_regular_file(startup_tjs, error) && !error)
+        return NormalizeRuntimePath(game_root);
+
+    std::filesystem::path sole_xp3;
+    uint32_t xp3_count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(root, error))
+    {
+        if (error)
+            return {};
+        if (!entry.is_regular_file(error) || error || !HasExtension(entry.path(), "xp3"))
+            continue;
+        sole_xp3 = entry.path();
+        ++xp3_count;
+    }
+    if (error)
+        return {};
+    if (xp3_count == 1)
+        return sole_xp3.string();
+
+    return NormalizeRuntimePath(game_root);
+}
+
 void DestroyWindowTextures()
 {
     for (tjs_int index = 0; index < TVPGetWindowCount(); ++index)
@@ -212,7 +248,9 @@ int32_t RuntimeCreateImpl(const char* game_root_utf8,
 #else
     std::string program = "art3m1s-krkr";
 #endif
-    std::string game_root = NormalizeRuntimePath(game_root_utf8);
+    std::string game_root = ResolveRuntimeEntry(game_root_utf8);
+    if (game_root.empty())
+        return ART3M1S_KRKR_STATUS_INVALID_ARGUMENT;
     std::string window_arg =
         "-window=" + std::to_string(config->width) + "x" + std::to_string(config->height);
     std::string render_arg = "-render=software";
