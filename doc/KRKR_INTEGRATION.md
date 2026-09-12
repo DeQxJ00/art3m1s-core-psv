@@ -14,7 +14,7 @@ Host
 ## 构建 feature
 
 ```toml
-krkr-engine = ["dep:art3m1s-krkr"]
+krkr-engine = ["dep:art3m1s-krkr", "art3m1s-krkr/native-upstream"]
 ```
 
 启用后，core 动态库导出：
@@ -26,9 +26,22 @@ const Art3m1sKrkrApiV1 *art3m1s_krkr_get_api_v1(size_t *out_size);
 宿主必须同时校验 `struct_size`、`abi_version` 和 `magic`。native shim 自己的
 入口名是私有的 `art3m1s_krkr_native_get_api_v1`，core 不会把该符号暴露给宿主。
 
-当前 `krkr-engine` 默认连接 `native-bootstrap`，用于 CI 和 ABI 布局测试；
-真实 XP3 路径由 `native-upstream-smoke` 验证。发布打包需要把构建后的
-`libart3m1s_krkr_host` 和 `Res/` 与 core 一起分发。
+`krkr-engine` 会请求 `native-upstream`。当 `KRKRSDL3_SOURCE_DIR` 和
+`KRKRSDL3_BUILD_DIR` 都已配置时，构建真实的 Kirikiri runtime；未配置时暂时回退到
+`native-bootstrap` 并输出 Cargo warning。bootstrap 只用于 CI 和 ABI 布局测试，
+不能运行游戏。发布构建应显式要求上游 runtime：
+
+```sh
+VCPKG_ROOT=/path/to/vcpkg \
+KRKRSDL3_SOURCE_DIR=/path/to/krkrsdl3 \
+KRKRSDL3_BUILD_DIR=/path/to/krkrsdl3_build \
+ART3M1S_KRKR_REQUIRE_UPSTREAM=1 \
+cargo build --no-default-features --features krkr-engine
+```
+
+发布打包需要把构建后的 `libart3m1s_krkr_host`、其 `Res/` 目录和 C++ runtime
+依赖与 core 一起分发。core 会写入 native shim 输出目录的 rpath，同时附加
+`@loader_path`（Apple）或 `$ORIGIN`（Linux/Android），允许发布时统一重定位。
 
 ## 句柄与生命周期
 
