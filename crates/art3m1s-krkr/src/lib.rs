@@ -7,7 +7,11 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod abi;
-#[cfg(any(feature = "native-bootstrap", feature = "native-upstream-smoke"))]
+#[cfg(any(
+    feature = "native-bootstrap",
+    feature = "native-upstream",
+    feature = "native-upstream-smoke"
+))]
 pub mod native;
 pub mod probe;
 pub mod protocol;

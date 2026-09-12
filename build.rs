@@ -19,10 +19,16 @@ fn main() {
             std::env::var_os("DEP_ART3M1S_KRKR_NATIVE_NATIVE_DIR").map(PathBuf::from)
         {
             if matches!(target_os.as_str(), "macos" | "ios" | "linux" | "android") {
-                println!(
-                    "cargo:rustc-link-arg=-Wl,-rpath,{}",
-                    native_dir.display()
-                );
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", native_dir.display());
+            }
+            match target_os.as_str() {
+                "macos" | "ios" => {
+                    println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
+                }
+                "linux" | "android" => {
+                    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+                }
+                _ => {}
             }
         }
     }

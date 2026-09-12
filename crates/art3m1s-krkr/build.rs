@@ -8,20 +8,35 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CMAKE");
     println!("cargo:rerun-if-env-changed=KRKRSDL3_SOURCE_DIR");
     println!("cargo:rerun-if-env-changed=KRKRSDL3_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=ART3M1S_KRKR_REQUIRE_UPSTREAM");
 
     let bootstrap = env::var_os("CARGO_FEATURE_NATIVE_BOOTSTRAP").is_some();
-    let upstream = env::var_os("CARGO_FEATURE_NATIVE_UPSTREAM_SMOKE").is_some();
-    if !bootstrap && !upstream {
+    let upstream_feature = env::var_os("CARGO_FEATURE_NATIVE_UPSTREAM").is_some();
+    let upstream_smoke = env::var_os("CARGO_FEATURE_NATIVE_UPSTREAM_SMOKE").is_some();
+    let upstream_requested = upstream_feature || upstream_smoke;
+    if !bootstrap && !upstream_requested {
         return;
     }
+
+    let krkr_source = env::var_os("KRKRSDL3_SOURCE_DIR");
+    let krkr_build = env::var_os("KRKRSDL3_BUILD_DIR");
+    let upstream_available = krkr_source.is_some() && krkr_build.is_some();
+    let require_upstream = upstream_smoke || env::var_os("ART3M1S_KRKR_REQUIRE_UPSTREAM").is_some();
     assert!(
-        !(bootstrap && upstream),
-        "enable only one native KRKR backend feature"
+        !require_upstream || upstream_available,
+        "KRKRSDL3_SOURCE_DIR and KRKRSDL3_BUILD_DIR are required for the upstream KRKR backend"
     );
+    let upstream = upstream_requested && upstream_available;
+    if upstream_requested && !upstream {
+        println!(
+            "cargo:warning=KRKRSDL3 source/build directories are not configured; \
+             falling back to the bootstrap KRKR shim"
+        );
+    }
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join(if upstream {
-        "native-upstream-smoke"
+        "native-upstream"
     } else {
         "native-bootstrap"
     });
@@ -40,7 +55,7 @@ fn main() {
     };
     assert!(
         !upstream || target_os == "macos",
-        "native-upstream-smoke currently supports macOS only"
+        "the upstream KRKR backend currently supports macOS only"
     );
 
     let _ = fs::remove_dir_all(&out_dir);
@@ -62,11 +77,8 @@ fn main() {
         .arg(format!("-DCMAKE_BUILD_TYPE={build_type}"));
 
     if upstream {
-        let krkr_source = env::var_os("KRKRSDL3_SOURCE_DIR")
-            .expect("KRKRSDL3_SOURCE_DIR is required for native-upstream-smoke");
-        let krkr_build = env::var_os("KRKRSDL3_BUILD_DIR")
-            .expect("KRKRSDL3_BUILD_DIR is required for native-upstream-smoke");
-        let krkr_build = PathBuf::from(krkr_build);
+        let krkr_source = krkr_source.expect("checked above");
+        let krkr_build = PathBuf::from(krkr_build.expect("checked above"));
         configure
             .arg(format!(
                 "-DKRKRSDL3_SOURCE_DIR={}",
@@ -141,7 +153,7 @@ fn main() {
     let status = configure
         .status()
         .unwrap_or_else(|error| panic!("failed to run cmake: {error}"));
-    assert!(status.success(), "native-bootstrap configure failed");
+    assert!(status.success(), "KRKR native shim configure failed");
 
     let status = Command::new(&cmake)
         .arg("--build")
@@ -150,7 +162,7 @@ fn main() {
         .arg(build_type)
         .status()
         .unwrap_or_else(|error| panic!("failed to run cmake --build: {error}"));
-    assert!(status.success(), "native-bootstrap build failed");
+    assert!(status.success(), "KRKR native shim build failed");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=dylib=art3m1s_krkr_host");
