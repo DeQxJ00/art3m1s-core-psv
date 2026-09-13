@@ -39,4 +39,4 @@ run cargo test --manifest-path crates/eluna/Cargo.toml --all-targets
 run cargo test --manifest-path crates/pf8/Cargo.toml --all-targets
 run cargo test --manifest-path crates/pfs-upk-rust/Cargo.toml --all-targets
 run cargo build --release --lib
-run "$repo_root/scripts/check-ffi-exports.sh"
+run "$repo_root/scripts/check-ffi-exports.sh" --require-rfvp
