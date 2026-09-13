@@ -5,6 +5,7 @@
 #define SDL_MAIN_USE_CALLBACKS
 #define SDL_MAIN_NOIMPL
 #include <SDL3/SDL_main.h>
+#include <SDL3/SDL_video.h>
 
 #include <algorithm>
 #include <cctype>
@@ -337,6 +338,15 @@ int32_t RuntimeCreateImpl(const char* game_root_utf8,
     auto* capture = new art3m1s::krkr::CaptureBackend;
     krkrsdl3::TVPSetRenderBackend(capture);
     RecreateWindowTextures();
+
+    // The host presents captured frames itself; the SDL window SDL_AppInit
+    // showed must not linger as a blank top-level window next to the host.
+    if (int window_count = 0; SDL_Window** windows = SDL_GetWindows(&window_count))
+    {
+        for (int index = 0; index < window_count; ++index)
+            SDL_HideWindow(windows[index]);
+        SDL_free(windows);
+    }
 
     tjs_int width = 0;
     tjs_int height = 0;
