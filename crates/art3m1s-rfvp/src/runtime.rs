@@ -131,6 +131,7 @@ pub struct ExternalRenderer {
     textures: HashMap<TextureHandle, CachedTexture>,
     clear_color: [f32; 4],
     frame_cache: Option<FrameCache>,
+    damage_visualization: bool,
 }
 
 impl ExternalRenderer {
@@ -141,6 +142,16 @@ impl ExternalRenderer {
             textures: HashMap::new(),
             clear_color,
             frame_cache: None,
+            damage_visualization: false,
+        }
+    }
+
+    /// Toggles the flashing damage-rect debug overlay. When enabled, frame
+    /// skipping stays active but a stale overlay is still cleared on skip.
+    pub fn set_damage_visualization(&mut self, enabled: bool) {
+        if self.damage_visualization != enabled {
+            self.damage_visualization = enabled;
+            self.frame_cache = None;
         }
     }
 
@@ -198,6 +209,21 @@ impl ExternalRenderer {
         if let Some(cache) = &self.frame_cache
             && cache.signature == signature
         {
+            // Even on a skipped frame a previously drawn debug overlay must
+            // be cleaned up, or it would linger on screen forever.
+            if self.damage_visualization {
+                self.backend
+                    .begin_frame(FrameTarget::Main)
+                    .map_err(ExternalRendererError::Backend)?;
+                let cleared = self.backend.clear_damage_overlay(&adapted.draw_list);
+                self.backend.end_frame();
+                if let Some(region) = cleared {
+                    return Ok(Some(RfvpRenderResult {
+                        hit_proxies,
+                        region,
+                    }));
+                }
+            }
             return Ok(None);
         }
 
@@ -225,9 +251,11 @@ impl ExternalRenderer {
         if damage.is_none() {
             self.backend.clear(self.clear_color);
         }
-        let region = match damage {
-            Some(rect) => self.backend.render_damage(&adapted.draw_list, rect),
-            None => self.backend.render(&adapted.draw_list),
+        let region = match (damage, self.damage_visualization) {
+            (Some(rect), true) => self.backend.render_damage_visualized(&adapted.draw_list, rect),
+            (Some(rect), false) => self.backend.render_damage(&adapted.draw_list, rect),
+            (None, true) => self.backend.render_visualized(&adapted.draw_list),
+            (None, false) => self.backend.render(&adapted.draw_list),
         };
         self.backend.end_frame();
 

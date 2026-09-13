@@ -22,6 +22,7 @@ use rfvp::host_abi::runtime::{
     rfvp_runtime_next_event_size, rfvp_runtime_poll_audio_command, rfvp_runtime_poll_events,
     rfvp_runtime_push_input, rfvp_runtime_set_font_override, rfvp_runtime_set_text_hidpi,
     rfvp_runtime_set_text_replacements, rfvp_runtime_set_text_translation_enabled,
+    rfvp_runtime_set_trace_mask,
     rfvp_runtime_stage_height, rfvp_runtime_stage_width, rfvp_runtime_step,
     rfvp_runtime_submit_text_translation,
 };
@@ -217,6 +218,7 @@ pub enum RfvpHostRuntimeError {
     EventRead(i32),
     TranslationRejected(i32),
     FontRejected(i32),
+    TraceRejected(i32),
     MalformedEvent,
     AudioCommandRead(i32),
     UnsupportedAudioCommandKind(u32),
@@ -273,6 +275,9 @@ impl fmt::Display for RfvpHostRuntimeError {
             }
             Self::FontRejected(status) => {
                 write!(f, "RFVP font override failed with status {status}")
+            }
+            Self::TraceRejected(status) => {
+                write!(f, "RFVP trace mask update failed with status {status}")
             }
             Self::MalformedEvent => write!(f, "RFVP event record is malformed"),
             Self::AudioCommandRead(status) => {
@@ -593,6 +598,23 @@ impl RfvpHostRuntime {
         let status = unsafe { rfvp_runtime_clear_font_override(self.runtime) };
         if status != RFVP_STATUS_OK {
             return Err(RfvpHostRuntimeError::FontRejected(status));
+        }
+        Ok(())
+    }
+
+    /// Toggles the flashing damage-rect debug overlay.
+    pub fn set_damage_visualization(&mut self, enabled: bool) {
+        self.renderer.set_damage_visualization(enabled);
+    }
+
+    /// Overrides the engine's trace categories (vm/syscall/prim/prim_tree/
+    /// motion/render bits in that order). `None` returns to `RFVP_TRACE*`
+    /// env-var behavior. The mask is process-wide.
+    pub fn set_trace_mask(&mut self, mask: Option<u32>) -> Result<(), RfvpHostRuntimeError> {
+        let status =
+            unsafe { rfvp_runtime_set_trace_mask(self.runtime, mask.unwrap_or(u32::MAX)) };
+        if status != RFVP_STATUS_OK {
+            return Err(RfvpHostRuntimeError::TraceRejected(status));
         }
         Ok(())
     }

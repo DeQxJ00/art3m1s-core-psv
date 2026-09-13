@@ -133,6 +133,9 @@ fn main() -> Result<()> {
     if profiler_enabled {
         runtime.set_profiler_enabled(true);
     }
+    if std::env::var_os("RFVP_SMOKE_DAMAGE").is_some() {
+        runtime.set_damage_visualization(true);
+    }
     if translate_enabled {
         runtime.set_text_translation_enabled(true)?;
     }

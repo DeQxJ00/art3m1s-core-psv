@@ -193,6 +193,16 @@ type RuntimePollTextEventsFn =
 type RuntimeSetFontOverrideFn =
     unsafe extern "C" fn(runtime: u64, data: *const u8, data_size: u32) -> i32;
 type RuntimeClearFontOverrideFn = unsafe extern "C" fn(runtime: u64) -> i32;
+/// Trace category mask (vm/syscall/prim/prim_tree/motion/render as bits 0-5).
+/// `u32::MAX` restores `RFVP_TRACE*` env-var behavior. Process-wide.
+type RuntimeSetTraceMaskFn = unsafe extern "C" fn(runtime: u64, mask: u32) -> i32;
+type RuntimeSetProfilerEnabledFn = unsafe extern "C" fn(runtime: u64, enabled: i32) -> i32;
+type RuntimeSetDamageVisualizationFn = unsafe extern "C" fn(runtime: u64, enabled: i32) -> i32;
+/// Length-probe JSON protocol: null/out-of-capacity returns the required
+/// byte count (negated when the buffer is too small), success returns the
+/// written byte count.
+type RuntimeProfilerSnapshotFn =
+    unsafe extern "C" fn(runtime: u64, out: *mut u8, capacity: u32) -> i32;
 
 #[repr(C)]
 pub struct Art3m1sRfvpApiV1 {
@@ -224,6 +234,10 @@ pub struct Art3m1sRfvpApiV1 {
     pub runtime_poll_text_events: Option<RuntimePollTextEventsFn>,
     pub runtime_set_font_override: Option<RuntimeSetFontOverrideFn>,
     pub runtime_clear_font_override: Option<RuntimeClearFontOverrideFn>,
+    pub runtime_set_trace_mask: Option<RuntimeSetTraceMaskFn>,
+    pub runtime_set_profiler_enabled: Option<RuntimeSetProfilerEnabledFn>,
+    pub runtime_profiler_snapshot: Option<RuntimeProfilerSnapshotFn>,
+    pub runtime_set_damage_visualization: Option<RuntimeSetDamageVisualizationFn>,
 }
 
 static RFVP_LOG_CALLBACK: Mutex<Option<(Art3m1sRfvpLogCallbackFn, usize)>> = Mutex::new(None);
@@ -278,6 +292,10 @@ static API_V1: Art3m1sRfvpApiV1 = Art3m1sRfvpApiV1 {
     runtime_poll_text_events: Some(runtime_poll_text_events),
     runtime_set_font_override: Some(runtime_set_font_override),
     runtime_clear_font_override: Some(runtime_clear_font_override),
+    runtime_set_trace_mask: Some(runtime_set_trace_mask),
+    runtime_set_profiler_enabled: Some(runtime_set_profiler_enabled),
+    runtime_profiler_snapshot: Some(runtime_profiler_snapshot),
+    runtime_set_damage_visualization: Some(runtime_set_damage_visualization),
 };
 
 #[unsafe(no_mangle)]
@@ -973,6 +991,61 @@ unsafe extern "C" fn runtime_clear_font_override(runtime: u64) -> i32 {
     })
 }
 
+unsafe extern "C" fn runtime_set_trace_mask(runtime: u64, mask: u32) -> i32 {
+    guard_status(|| {
+        RUNTIMES.with_mut(
+            runtime,
+            ART3M1S_RFVP_STATUS_INVALID_HANDLE,
+            |runtime| match runtime.runtime.set_trace_mask(Some(mask)) {
+                Ok(()) => ART3M1S_RFVP_STATUS_OK,
+                Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
+            },
+        )
+    })
+}
+
+unsafe extern "C" fn runtime_set_profiler_enabled(runtime: u64, enabled: i32) -> i32 {
+    guard_status(|| {
+        RUNTIMES.with_mut(runtime, ART3M1S_RFVP_STATUS_INVALID_HANDLE, |runtime| {
+            runtime.runtime.set_profiler_enabled(enabled != 0);
+            ART3M1S_RFVP_STATUS_OK
+        })
+    })
+}
+
+unsafe extern "C" fn runtime_set_damage_visualization(runtime: u64, enabled: i32) -> i32 {
+    guard_status(|| {
+        RUNTIMES.with_mut(runtime, ART3M1S_RFVP_STATUS_INVALID_HANDLE, |runtime| {
+            runtime.runtime.set_damage_visualization(enabled != 0);
+            ART3M1S_RFVP_STATUS_OK
+        })
+    })
+}
+
+unsafe extern "C" fn runtime_profiler_snapshot(
+    runtime: u64,
+    out: *mut u8,
+    capacity: u32,
+) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        RUNTIMES.with_mut(runtime, 0, |runtime| {
+            let json = runtime.runtime.profiler_snapshot_json();
+            let required = i32::try_from(json.len()).unwrap_or(i32::MAX);
+            if out.is_null() || capacity == 0 {
+                return required;
+            }
+            if (capacity as usize) < json.len() {
+                return -required;
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(json.as_ptr(), out, json.len());
+            }
+            required
+        })
+    }))
+    .unwrap_or(0)
+}
+
 fn guard_status(callback: impl FnOnce() -> i32) -> i32 {
     catch_unwind(AssertUnwindSafe(callback)).unwrap_or(ART3M1S_RFVP_STATUS_ENGINE)
 }
@@ -1011,6 +1084,10 @@ mod tests {
         assert!(api.runtime_poll_text_events.is_some());
         assert!(api.runtime_set_font_override.is_some());
         assert!(api.runtime_clear_font_override.is_some());
+        assert!(api.runtime_set_trace_mask.is_some());
+        assert!(api.runtime_set_profiler_enabled.is_some());
+        assert!(api.runtime_profiler_snapshot.is_some());
+        assert!(api.runtime_set_damage_visualization.is_some());
     }
 
     #[test]
@@ -1069,6 +1146,22 @@ mod tests {
             );
             assert_eq!(
                 unsafe { runtime_clear_font_override(garbage) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_set_trace_mask(garbage, 0) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_set_profiler_enabled(garbage, 1) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_profiler_snapshot(garbage, ptr::null_mut(), 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { runtime_set_damage_visualization(garbage, 1) },
                 ART3M1S_RFVP_STATUS_INVALID_HANDLE
             );
             // Double destroy and garbage destroy are safe no-ops.
