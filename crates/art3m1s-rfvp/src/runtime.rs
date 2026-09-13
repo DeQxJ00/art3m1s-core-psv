@@ -1,11 +1,12 @@
 //! Runtime adapter between RFVP's captured frames and an Art3m1s GPU backend.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use art3m1s_render::{
-    Extent2D, FrameTarget, GpuBackend, RenderRegion, TextureData, TextureDesc, TextureId,
-    TextureInfo, TextureUpdate,
+    DrawCommand, Extent2D, FrameTarget, GpuBackend, RenderRegion, TextureData, TextureDesc,
+    TextureId, TextureInfo, TextureUpdate,
 };
 use rfvp::host_api::{TextureFormat, TextureHandle, TextureRect};
 use rfvp::rendering::external::{
@@ -106,12 +107,30 @@ pub struct RfvpRenderResult {
     pub region: RenderRegion,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CommandState {
+    hash: u64,
+    texture: TextureId,
+    bbox: [f32; 4],
+}
+
+/// Presented-frame snapshot used to skip unchanged frames and to derive a
+/// conservative damage rectangle for changed ones.
+#[derive(Debug)]
+struct FrameCache {
+    signature: u64,
+    commands: Vec<CommandState>,
+    /// RFVP texture handle -> generation at the presented frame.
+    generations: HashMap<u32, u64>,
+}
+
 /// Owns RFVP textures and submits captured frames to an Art3m1s backend.
 pub struct ExternalRenderer {
     backend: Box<dyn GpuBackend>,
     adapter: DrawListAdapter,
     textures: HashMap<TextureHandle, CachedTexture>,
     clear_color: [f32; 4],
+    frame_cache: Option<FrameCache>,
 }
 
 impl ExternalRenderer {
@@ -121,7 +140,14 @@ impl ExternalRenderer {
             adapter: DrawListAdapter::new(),
             textures: HashMap::new(),
             clear_color,
+            frame_cache: None,
         }
+    }
+
+    /// Drops the presented-frame snapshot so the next `render_frame`
+    /// repaints fully. Call after backend resize or surface changes.
+    pub fn invalidate_frame_cache(&mut self) {
+        self.frame_cache = None;
     }
 
     pub fn backend(&self) -> &dyn GpuBackend {
@@ -140,10 +166,13 @@ impl ExternalRenderer {
         self.textures.len()
     }
 
+    /// Renders a captured frame. Returns `Ok(None)` when the frame is
+    /// pixel-identical to the previously presented one (same adapted commands
+    /// and texture generations) so the host can skip presentation entirely.
     pub fn render_frame(
         &mut self,
         frame: &ExternalFrame,
-    ) -> Result<RfvpRenderResult, ExternalRendererError> {
+    ) -> Result<Option<RfvpRenderResult>, ExternalRendererError> {
         if frame.texture_commands.is_empty() {
             self.sync_texture_creates(&frame.textures)?;
         } else {
@@ -153,17 +182,65 @@ impl ExternalRenderer {
         let adapted: AdaptedFrame = self.adapter.convert_rfvp_frame(&frame.frame)?;
         let hit_proxies = adapted.hit_proxies.clone();
 
+        let commands: Vec<CommandState> = adapted
+            .draw_list
+            .commands
+            .iter()
+            .map(command_state)
+            .collect();
+        let generations: HashMap<u32, u64> = self
+            .textures
+            .iter()
+            .map(|(handle, cached)| (handle.0, cached.generation))
+            .collect();
+        let signature = frame_signature(&commands, &generations);
+
+        if let Some(cache) = &self.frame_cache {
+            if cache.signature == signature {
+                return Ok(None);
+            }
+        }
+
+        let damage = self
+            .frame_cache
+            .as_ref()
+            .and_then(|cache| self.frame_damage(cache, &commands, &generations));
+
+        // A change confined to fully clipped commands produces empty damage:
+        // nothing to present, but the cache must still advance.
+        if damage.is_some_and(|rect| rect[2] <= 0.0 || rect[3] <= 0.0) {
+            self.frame_cache = Some(FrameCache {
+                signature,
+                commands,
+                generations,
+            });
+            return Ok(None);
+        }
+
         self.backend
             .begin_frame(FrameTarget::Main)
             .map_err(ExternalRendererError::Backend)?;
-        self.backend.clear(self.clear_color);
-        let region = self.backend.render(&adapted.draw_list);
+        // The damage path clears only the damage rect inside the backend; a
+        // full clear here would erase undamaged content.
+        if damage.is_none() {
+            self.backend.clear(self.clear_color);
+        }
+        let region = match damage {
+            Some(rect) => self.backend.render_damage(&adapted.draw_list, rect),
+            None => self.backend.render(&adapted.draw_list),
+        };
         self.backend.end_frame();
 
-        Ok(RfvpRenderResult {
+        self.frame_cache = Some(FrameCache {
+            signature,
+            commands,
+            generations,
+        });
+
+        Ok(Some(RfvpRenderResult {
             hit_proxies,
             region,
-        })
+        }))
     }
 
     pub fn readback_rgba(&mut self, extent: Extent2D) -> Result<Vec<u8>, ExternalRendererError> {
@@ -309,6 +386,183 @@ impl ExternalRenderer {
             .bindings_mut()
             .remove(crate::TextureHandle(destroy.handle.0));
     }
+
+    /// Conservative damage rect for a changed frame, in stage pixels.
+    /// Positional diff over the adapted draw list (RFVP's prim-tree traversal
+    /// keeps command order stable within a scene); any structural change or
+    /// ambiguity falls back to a full repaint.
+    fn frame_damage(
+        &self,
+        cache: &FrameCache,
+        commands: &[CommandState],
+        generations: &HashMap<u32, u64>,
+    ) -> Option<[f32; 4]> {
+        if cache.commands.len() != commands.len() {
+            return None;
+        }
+        let changed_textures: HashSet<TextureId> = generations
+            .iter()
+            .filter(|(handle, generation)| cache.generations.get(*handle) != Some(generation))
+            .filter_map(|(handle, _)| {
+                self.adapter
+                    .bindings()
+                    .get(crate::TextureHandle(*handle))
+                    .map(|binding| binding.texture)
+            })
+            .collect();
+
+        let mut damage: Option<[f32; 4]> = None;
+        for (index, command) in commands.iter().enumerate() {
+            let previous = cache.commands[index];
+            if previous.hash == command.hash && !changed_textures.contains(&command.texture) {
+                continue;
+            }
+            damage = Some(match damage {
+                Some(rect) => union_rect(union_rect(rect, previous.bbox), command.bbox),
+                None => union_rect(previous.bbox, command.bbox),
+            });
+        }
+
+        let [x, y, width, height] = damage?;
+        let (stage_width, stage_height) = self.stage_extent();
+        let x0 = (x - 2.0).floor().max(0.0);
+        let y0 = (y - 2.0).floor().max(0.0);
+        let x1 = (x + width + 2.0).ceil().min(stage_width as f32);
+        let y1 = (y + height + 2.0).ceil().min(stage_height as f32);
+        if x1 <= x0 || y1 <= y0 {
+            return Some([0.0, 0.0, 0.0, 0.0]);
+        }
+        let rect = [x0, y0, x1 - x0, y1 - y0];
+        let stage_area = stage_width as f32 * stage_height as f32;
+        // A near-full damage rect costs more to scissor than to repaint.
+        if rect[2] * rect[3] >= stage_area * 0.8 {
+            return None;
+        }
+        Some(rect)
+    }
+
+    fn stage_extent(&self) -> (u32, u32) {
+        self.backend
+            .render_dimensions()
+            .map(|dimensions| {
+                (
+                    dimensions.render_size.width,
+                    dimensions.render_size.height,
+                )
+            })
+            .unwrap_or((0, 0))
+    }
+}
+
+fn union_rect(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
+    let x0 = left[0].min(right[0]);
+    let y0 = left[1].min(right[1]);
+    let x1 = (left[0] + left[2]).max(right[0] + right[2]);
+    let y1 = (left[1] + left[3]).max(right[1] + right[3]);
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+fn command_state(command: &DrawCommand) -> CommandState {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_f32_slice(&mut hasher, &command.transform.matrix2.x_axis.to_array());
+    hash_f32_slice(&mut hasher, &command.transform.matrix2.y_axis.to_array());
+    hash_f32_slice(&mut hasher, &command.transform.translation.to_array());
+    command.texture.0.hash(&mut hasher);
+    command.size.width.hash(&mut hasher);
+    command.size.height.hash(&mut hasher);
+    command.opacity.to_bits().hash(&mut hasher);
+    (command.blend as u8).hash(&mut hasher);
+    hash_f32_slice(&mut hasher, &command.color.multiply);
+    command.color.grayscale.hash(&mut hasher);
+    command.color.negative.hash(&mut hasher);
+    hash_f32_slice(&mut hasher, &command.clip.uv_offset);
+    hash_f32_slice(&mut hasher, &command.clip.uv_scale);
+    hash_f32_slice(&mut hasher, &command.clip.quad_size);
+    if let Some(bounds) = &command.clip_bounds {
+        hash_f32_slice(&mut hasher, bounds);
+    }
+    if let Some(shader) = &command.shader {
+        shader.name.hash(&mut hasher);
+        for (key, values) in &shader.uniforms {
+            key.hash(&mut hasher);
+            hash_f32_slice(&mut hasher, values);
+        }
+        shader.mask_texture.map(|id| id.0).hash(&mut hasher);
+        shader.user_texture.map(|id| id.0).hash(&mut hasher);
+    }
+    if let Some(mesh) = &command.mesh {
+        for vertex in mesh.vertices.iter() {
+            hash_f32_slice(&mut hasher, vertex);
+        }
+    }
+    CommandState {
+        hash: hasher.finish(),
+        texture: command.texture,
+        bbox: command_bbox(command),
+    }
+}
+
+fn hash_f32_slice(hasher: &mut impl Hasher, values: &[f32]) {
+    for value in values {
+        value.to_bits().hash(hasher);
+    }
+}
+
+/// Screen-space bbox of a draw command in stage pixels, clipped to
+/// `clip_bounds` when present.
+fn command_bbox(command: &DrawCommand) -> [f32; 4] {
+    let (mut x0, mut y0, mut x1, mut y1) = if let Some(mesh) = &command.mesh {
+        let mut bounds = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for vertex in mesh.vertices.iter() {
+            bounds.0 = bounds.0.min(vertex[0]);
+            bounds.1 = bounds.1.min(vertex[1]);
+            bounds.2 = bounds.2.max(vertex[0]);
+            bounds.3 = bounds.3.max(vertex[1]);
+        }
+        bounds
+    } else {
+        let [width, height] = command.clip.quad_size;
+        let corners = [
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(width, 0.0),
+            glam::Vec2::new(0.0, height),
+            glam::Vec2::new(width, height),
+        ];
+        let mut bounds = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for corner in corners {
+            let point = command.transform.transform_point2(corner);
+            bounds.0 = bounds.0.min(point.x);
+            bounds.1 = bounds.1.min(point.y);
+            bounds.2 = bounds.2.max(point.x);
+            bounds.3 = bounds.3.max(point.y);
+        }
+        bounds
+    };
+    if let Some([cx, cy, cw, ch]) = command.clip_bounds {
+        x0 = x0.max(cx);
+        y0 = y0.max(cy);
+        x1 = x1.min(cx + cw);
+        y1 = y1.min(cy + ch);
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+fn frame_signature(commands: &[CommandState], generations: &HashMap<u32, u64>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    commands.len().hash(&mut hasher);
+    for command in commands {
+        command.hash.hash(&mut hasher);
+    }
+    let mut generations: Vec<(u32, u64)> = generations
+        .iter()
+        .map(|(handle, generation)| (*handle, *generation))
+        .collect();
+    generations.sort_unstable();
+    generations.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn texture_rgba(

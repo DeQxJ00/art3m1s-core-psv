@@ -519,6 +519,7 @@ impl RfvpHostRuntime {
     ) -> Result<(), RfvpHostRuntimeError> {
         let surface = NativeSurface::from_legacy_parts(kind, handle, width, height)
             .map_err(RfvpHostRuntimeError::Surface)?;
+        self.renderer.invalidate_frame_cache();
         self.renderer
             .backend_mut()
             .set_native_surface(surface)
@@ -570,7 +571,11 @@ impl RfvpHostRuntime {
         let frame = self.read_frame(native_frame);
         unsafe { rfvp_frame_release(native_frame) };
         let frame = frame?;
-        let result = self.renderer.render_frame(&frame)?;
+        // Unchanged frames are skipped by the renderer and reported as no
+        // presentation; callers already treat `None` as "nothing new".
+        let Some(result) = self.renderer.render_frame(&frame)? else {
+            return Ok(None);
+        };
         Ok(Some(result))
     }
 
