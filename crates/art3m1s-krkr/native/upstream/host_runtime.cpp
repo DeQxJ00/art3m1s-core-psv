@@ -15,6 +15,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
 #include "TVPApplication.h"
 #include "TVPCompositor.h"
 #include "TVPSystem.h"
@@ -109,6 +113,52 @@ std::string ResolveRuntimeEntry(const std::string& game_root)
         return sole_xp3.string();
 
     return NormalizeRuntimePath(game_root);
+}
+
+std::filesystem::path CurrentExecutablePath()
+{
+#if defined(__APPLE__)
+    uint32_t size = 0;
+    if (_NSGetExecutablePath(nullptr, &size) != -1 || size == 0)
+        return {};
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0)
+        return {};
+    return std::filesystem::path(buffer.data());
+#else
+    return {};
+#endif
+}
+
+bool HasRuntimeResources(const std::filesystem::path& executable)
+{
+    if (executable.empty())
+        return false;
+    std::error_code error;
+    return std::filesystem::is_directory(executable.parent_path() / "Res", error) && !error;
+}
+
+std::string ResolveResourceExecutable()
+{
+    const std::filesystem::path executable = CurrentExecutablePath();
+    // A macOS app keeps non-code assets in Contents/Resources. Return a virtual
+    // executable path whose sibling Res directory is relocatable with the app.
+    const std::filesystem::path bundle_resource_executable =
+        executable.parent_path().parent_path() / "Resources" / "krkr" / "art3m1s-krkr";
+    if (HasRuntimeResources(bundle_resource_executable))
+        return bundle_resource_executable.string();
+
+    // Standalone packaged hosts may place Res next to their executable.
+    if (HasRuntimeResources(executable))
+        return executable.string();
+
+    // The isolated smoke binary lives outside the CMake output directory, so
+    // retain the configured build-tree path as a development fallback.
+#ifdef ART3M1S_KRKR_RESOURCE_EXE
+    return ART3M1S_KRKR_RESOURCE_EXE;
+#else
+    return executable.empty() ? "art3m1s-krkr" : executable.string();
+#endif
 }
 
 void DestroyWindowTextures()
@@ -254,11 +304,7 @@ int32_t RuntimeCreateImpl(const char* game_root_utf8,
         return ART3M1S_KRKR_STATUS_ENGINE;
     art3m1s::krkr::ResetAudioHost();
 
-#ifdef ART3M1S_KRKR_RESOURCE_EXE
-    std::string program = ART3M1S_KRKR_RESOURCE_EXE;
-#else
-    std::string program = "art3m1s-krkr";
-#endif
+    std::string program = ResolveResourceExecutable();
     std::string game_root = ResolveRuntimeEntry(game_root_utf8);
     if (game_root.empty())
         return ART3M1S_KRKR_STATUS_INVALID_ARGUMENT;
