@@ -1,8 +1,8 @@
 # Art3m1s Core 公共 Crate 迁移实施指南
 
-版本：2026-09-12  
+版本：2026-09-12
 适用范围：`art3m1s-core` 向 `art3m1s-log`、`art3m1s-media`、`art3m1s-render`
-及可选 `art3m1s-rfvp` 的迁移  
+及可选 `art3m1s-rfvp`、`art3m1s-krkr` 的迁移
 目标读者：后续执行迁移的 Codex/人工 agent
 
 ## 1. 目标与范围
@@ -14,6 +14,8 @@
 - Host 继续只依赖 engine 总抽象，不直接依赖某个引擎的内部类型。
 - RFVP 依赖只允许通过 `art3m1s-rfvp` 和独立 `rfvp_api` 边界进入 core；
   core 主体不得直接引用 RFVP 类型。
+- KRKR 依赖只允许通过 `art3m1s-krkr` 和独立 `krkr_api` 边界进入 core；
+  KRKR C++ runtime、XP3/TJS/KAG 和 native shim 不进入 core 主体。
 
 本指南覆盖：
 
@@ -21,6 +23,7 @@
 - 媒体类型和解码边界迁移到 `art3m1s-media`
 - DrawList、GPU backend、external resource 和 shader 边界迁移到 `art3m1s-render`
 - 可选 RFVP engine adapter 接入 `art3m1s-rfvp`
+- 可选 KRKR/Kirikiri engine adapter 接入 `art3m1s-krkr`
 
 本指南不覆盖：
 
@@ -32,8 +35,9 @@
 
 以下约束优先级高于“尽快删除重复代码”：
 
-1. 当前 FFI 正在由其他 agent 重构。迁移 agent 默认不得修改
-   `src/ffi.rs`、`src/ffi_api.rs` 或任何导出 ABI 定义。
+1. FFI 已经拆分为 `src/ffi/mod.rs`、`src/ffi/api.rs`、`src/ffi/rfvp_api.rs` 和
+   `src/ffi/krkr_api.rs`。迁移 agent 默认不得修改这些导出 ABI 定义；需要改 ABI 时
+   必须先完成版本和所有权设计。
 2. 如果日志宏或其他迁移必须修改 FFI 文件，任务应停在边界处并报告，
    不要私自改 FFI。
 3. 公共 crate 不得反向依赖 core、FFI、Dart callback、wgpu surface 或宿主设备。
@@ -53,6 +57,7 @@ art3m1s-core
 
 Host / engine adapter
   -> art3m1s-rfvp
+  -> art3m1s-krkr
   -> art3m1s-render
   -> art3m1s-log
 
@@ -68,6 +73,7 @@ art3m1s-render -> Dart FFI
 art3m1s-log    -> GPU / 解释器 / 宿主文件系统
 art3m1s-media  -> GPU / FFI / 宿主音频设备
 art3m1s-core   -> rfvp（必须经由 art3m1s-rfvp 和 src/ffi/rfvp_api.rs）
+art3m1s-core   -> krkr（必须经由 art3m1s-krkr 和 src/ffi/krkr_api.rs）
 ```
 
 ## 4. 当前状态
@@ -78,7 +84,8 @@ art3m1s-core   -> rfvp（必须经由 art3m1s-rfvp 和 src/ffi/rfvp_api.rs）
 | `art3m1s-media` | 已被 core 部分接入，FFmpeg 可选 feature 可独立测试 | 继续收口 `src/video` 和 runtime media session |
 | `art3m1s-render` | 已包含 draw、backend、external、post-process、shader 和 GL/Metal/Vulkan 可选实现 | 先迁纯类型，再按 GL、Metal、Vulkan 顺序替换 backend |
 | `art3m1s-rfvp` | 独立 adapter，不依赖 core；已提供 `host-runtime` 和真实 RFVP 游戏 smoke | 保持引擎逻辑在 adapter，core 只保留独立的 `rfvp_api` ABI 边界 |
-| `src/profiler.rs` | 仍是 core 私有实现 | 暂不塞进 `art3m1s-log`；后续可单独抽 `art3m1s-profiler` |
+| `art3m1s-krkr` | 独立 adapter；已有 ABI、探针、macOS upstream smoke 和 native bootstrap | 保持 C++ runtime 隔离，core 只保留独立的 `krkr_api` facade |
+| `src/profiler/mod.rs` | 仍是 core 私有实现 | 暂不塞进 `art3m1s-log`；后续可单独抽 `art3m1s-profiler` |
 
 已验证基线：
 
@@ -105,7 +112,8 @@ art3m1s-core   -> rfvp（必须经由 art3m1s-rfvp 和 src/ffi/rfvp_api.rs）
 6. Vulkan backend
 7. `art3m1s-media` 收口
 8. 可选 `art3m1s-rfvp` 接线
-9. 删除 core 重复模块
+9. 可选 `art3m1s-krkr` 接线
+10. 删除 core 重复模块
 
 `runtime` 和 `ffi` 最后迁移。不要先从这两个目录开始全局替换。
 
@@ -158,7 +166,7 @@ cargo check --locked --offline --no-default-features --features vulkan-backend
 - `art3m1s-log` 只负责记录、过滤和分发。
 - core 保留对 FFI 事件格式的所有权。
 - 同一进程只安装一次 global logger。
-- 不修改 `src/ffi.rs` 里的宏。
+- 不修改 `src/ffi/mod.rs` 里的宏。
 
 ### 推荐实现
 
@@ -181,7 +189,7 @@ host events/FFI 层。
 ### FFI 边界
 
 当前 `core_info!`、`core_warn!`、`core_debug!`、`core_error!` 定义在
-`src/ffi.rs`。在 FFI 重构未完成前：
+`src/ffi/mod.rs`。在 FFI 重构未完成前：
 
 - 不修改这些宏。
 - 不让 `art3m1s-log` 知道 Dart ABI。
@@ -192,7 +200,7 @@ FFI 冻结结束后，再由 FFI 所有者把宏体改成标准 `log` 或
 
 ### profiler
 
-不要把 `src/profiler.rs` 直接塞进 `art3m1s-log`。profiler 的边界应保持为：
+不要把 `src/profiler/mod.rs` 直接塞进 `art3m1s-log`。profiler 的边界应保持为：
 
 - `art3m1s-profiler`：采样、聚合、快照和 JSON
 - `art3m1s-log`：日志记录和过滤
@@ -278,7 +286,7 @@ cargo test --locked --offline
 2. 让 core 的 `GpuBackend` 对象安全地持有或包装共享 backend。
 3. 跑 crate GL 测试和 core GL feature。
 4. 用真实游戏检查首帧、持续帧、视频、截图和 damage 更新。
-5. 最后删除 `src/backend/gl/*` 的重复实现。
+5. 确认 core 不再保留 `src/backend/gl/*` 的重复实现。
 
 ### YUV
 
@@ -321,7 +329,7 @@ cargo test --locked --offline --no-default-features --features gl-backend
 2. 将 backend 实例切换为共享 Metal backend。
 3. 逐项跑 crate 的 Metal 测试。
 4. 跑 iOS/macOS 真实游戏、视频和 surface 恢复。
-5. 最后删除 `src/backend/metal/*` 的重复实现。
+5. 确认 core 不再保留 `src/backend/metal/*` 的重复实现。
 
 ### 验收
 
@@ -484,6 +492,10 @@ CARGO_TARGET_DIR=/tmp/art3m1s-render-target cargo test \
 CARGO_TARGET_DIR=/tmp/art3m1s-rfvp-target cargo test \
   --manifest-path crates/art3m1s-rfvp/Cargo.toml \
   --locked --offline --all-targets --all-features
+
+CARGO_TARGET_DIR=/tmp/art3m1s-krkr-target cargo test \
+  --manifest-path crates/art3m1s-krkr/Cargo.toml \
+  --locked --offline --features native-bootstrap
 ```
 
 ### core feature matrix
@@ -494,6 +506,7 @@ cargo check --locked --offline --no-default-features --features gl-backend
 cargo check --locked --offline --no-default-features --features metal-backend
 cargo check --locked --offline --no-default-features --features vulkan-backend
 cargo check --locked --offline --features ffmpeg
+cargo check --locked --offline --features krkr-engine
 cargo test --locked --offline
 ```
 
@@ -556,7 +569,8 @@ refactor(core): remove duplicated render and media modules
 目标：让 core 消费 art3m1s_render::draw 的 DrawList 和 TextureId
 迁移边界：render pure types only
 允许修改：Cargo.toml、src/render_pipeline/draw.rs、相关 import
-禁止修改：src/ffi.rs、src/ffi_api.rs、backend implementation
+禁止修改：src/ffi/mod.rs、src/ffi/api.rs、src/ffi/rfvp_api.rs、
+          src/ffi/krkr_api.rs、backend implementation
 基线提交：core master 79b542b
 完成后的验证命令：cargo test --locked --offline
 必须保留的 ABI：TextureId(u64) 和所有 FFI handle 整数宽度
