@@ -56,6 +56,63 @@ fn main() -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     let dump_hit_proxies = std::env::var_os("RFVP_SMOKE_HIT_PROXIES").is_some();
+    let rclicks = std::env::var("RFVP_SMOKE_RCLICK")
+        .ok()
+        .map(|value| {
+            value
+                .split(';')
+                .map(|click| {
+                    let mut parts = click.split(',');
+                    let frame = parts
+                        .next()
+                        .context("RFVP_SMOKE_RCLICK needs frame")?
+                        .parse::<u32>()
+                        .context("RFVP_SMOKE_RCLICK frame must be an integer")?;
+                    let x = parts
+                        .next()
+                        .context("RFVP_SMOKE_RCLICK needs x")?
+                        .parse::<i32>()
+                        .context("RFVP_SMOKE_RCLICK x must be an integer")?;
+                    let y = parts
+                        .next()
+                        .context("RFVP_SMOKE_RCLICK needs y")?
+                        .parse::<i32>()
+                        .context("RFVP_SMOKE_RCLICK y must be an integer")?;
+                    if parts.next().is_some() {
+                        bail!("RFVP_SMOKE_RCLICK entry has trailing fields: {click}");
+                    }
+                    Ok::<_, anyhow::Error>((frame, x, y))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let keys = std::env::var("RFVP_SMOKE_KEY")
+        .ok()
+        .map(|value| {
+            value
+                .split(';')
+                .map(|key| {
+                    let mut parts = key.split(',');
+                    let frame = parts
+                        .next()
+                        .context("RFVP_SMOKE_KEY needs frame")?
+                        .parse::<u32>()
+                        .context("RFVP_SMOKE_KEY frame must be an integer")?;
+                    let code = parts
+                        .next()
+                        .context("RFVP_SMOKE_KEY needs code")?
+                        .parse::<u32>()
+                        .context("RFVP_SMOKE_KEY code must be an integer")?;
+                    if parts.next().is_some() {
+                        bail!("RFVP_SMOKE_KEY entry has trailing fields: {key}");
+                    }
+                    Ok::<_, anyhow::Error>((frame, code))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     let size = (1024u32, 640u32);
     let backend = MetalBackend::new(size.0, size.1).map_err(anyhow::Error::msg)?;
@@ -103,6 +160,53 @@ fn main() -> Result<()> {
                         y: *y,
                     }])
                     .with_context(|| format!("click up frame {frame} at {x},{y}"))?;
+            }
+        }
+        for (click_frame, x, y) in &rclicks {
+            if frame == *click_frame {
+                runtime
+                    .push_input(&[
+                        art3m1s_rfvp::RfvpHostInputEvent::PointerMove { x: *x, y: *y },
+                        art3m1s_rfvp::RfvpHostInputEvent::PointerButton {
+                            button: RfvpPointerButton::Right,
+                            pressed: true,
+                            x: *x,
+                            y: *y,
+                        },
+                    ])
+                    .with_context(|| format!("right-click down frame {frame} at {x},{y}"))?;
+            }
+            if frame == click_frame.saturating_add(2) {
+                runtime
+                    .push_input(&[art3m1s_rfvp::RfvpHostInputEvent::PointerButton {
+                        button: RfvpPointerButton::Right,
+                        pressed: false,
+                        x: *x,
+                        y: *y,
+                    }])
+                    .with_context(|| format!("right-click up frame {frame} at {x},{y}"))?;
+            }
+        }
+        for (key_frame, code) in &keys {
+            if frame == *key_frame {
+                runtime
+                    .push_input(&[art3m1s_rfvp::RfvpHostInputEvent::Key {
+                        code: *code,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: 0,
+                    }])
+                    .with_context(|| format!("key down frame {frame} code {code}"))?;
+            }
+            if frame == key_frame.saturating_add(2) {
+                runtime
+                    .push_input(&[art3m1s_rfvp::RfvpHostInputEvent::Key {
+                        code: *code,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: 0,
+                    }])
+                    .with_context(|| format!("key up frame {frame} code {code}"))?;
             }
         }
         if let Some(result) = runtime
