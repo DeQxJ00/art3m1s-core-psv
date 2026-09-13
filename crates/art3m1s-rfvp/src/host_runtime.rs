@@ -17,9 +17,13 @@ use rfvp::host_abi::runtime::{
     rfvp_frame_get_commands, rfvp_frame_get_hit_proxies, rfvp_frame_get_size,
     rfvp_frame_get_textures, rfvp_frame_release, rfvp_resources_create, rfvp_resources_destroy,
     rfvp_resources_mount_directory, rfvp_resources_set_save_root, rfvp_runtime_acquire_frame,
-    rfvp_runtime_capabilities, rfvp_runtime_create, rfvp_runtime_destroy,
-    rfvp_runtime_is_exit_requested, rfvp_runtime_poll_audio_command, rfvp_runtime_push_input,
+    rfvp_runtime_capabilities, rfvp_runtime_clear_font_override, rfvp_runtime_create,
+    rfvp_runtime_destroy, rfvp_runtime_events_enable, rfvp_runtime_is_exit_requested,
+    rfvp_runtime_next_event_size, rfvp_runtime_poll_audio_command, rfvp_runtime_poll_events,
+    rfvp_runtime_push_input, rfvp_runtime_set_font_override, rfvp_runtime_set_text_hidpi,
+    rfvp_runtime_set_text_replacements, rfvp_runtime_set_text_translation_enabled,
     rfvp_runtime_stage_height, rfvp_runtime_stage_width, rfvp_runtime_step,
+    rfvp_runtime_submit_text_translation,
 };
 use rfvp::host_abi::v1::{
     RFVP_AUDIO_CREATE_STREAM, RFVP_AUDIO_DESTROY_STREAM, RFVP_AUDIO_ENCODED_FLAC,
@@ -33,7 +37,8 @@ use rfvp::host_abi::v1::{
     RFVP_INPUT_PHASE_DOWN, RFVP_INPUT_PHASE_MOVE, RFVP_INPUT_PHASE_REPEAT, RFVP_INPUT_PHASE_UP,
     RFVP_INPUT_POINTER_BUTTON, RFVP_INPUT_POINTER_MOVE, RFVP_INPUT_QUIT, RFVP_INPUT_TEXT,
     RFVP_INPUT_TOUCH, RFVP_INPUT_WHEEL, RFVP_NLS_GBK, RFVP_NLS_SHIFT_JIS, RFVP_NLS_UTF8,
-    RFVP_POINTER_LEFT, RFVP_POINTER_MIDDLE, RFVP_POINTER_RIGHT, RFVP_STATUS_ENGINE,
+    RFVP_EVENT_TEXT_TRANSLATION, RFVP_POINTER_LEFT, RFVP_POINTER_MIDDLE, RFVP_POINTER_RIGHT,
+    RFVP_SERIALIZATION_JSON, RFVP_STATUS_ENGINE,
     RFVP_STATUS_NO_COMMAND, RFVP_STATUS_NO_FRAME, RFVP_STATUS_OK, RFVP_TEXTURE_CREATE,
     RFVP_TEXTURE_DESTROY, RFVP_TEXTURE_FORMAT_LUMA_A8, RFVP_TEXTURE_FORMAT_RGBA8,
     RFVP_TEXTURE_FILTER_LINEAR, RFVP_TEXTURE_FILTER_NEAREST, RFVP_TEXTURE_UPDATE,
@@ -51,7 +56,8 @@ use rfvp::rendering::external::{
 
 use crate::{ExternalRenderer, ExternalRendererError, RfvpRenderResult};
 
-const RFVP_HOST_CAPABILITY_SPATIAL_UPSCALING: u64 = 1 << 11;
+// Bit 11 is the fork's RFVP_CAPABILITY_FONT_OVERRIDE; host-only bits start at 12.
+const RFVP_HOST_CAPABILITY_SPATIAL_UPSCALING: u64 = 1 << 12;
 
 /// Native NLS used while mounting an RFVP project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +214,10 @@ pub enum RfvpHostRuntimeError {
     RectOverflow,
     HitProxyOverflow,
     InputRejected(i32),
+    EventRead(i32),
+    TranslationRejected(i32),
+    FontRejected(i32),
+    MalformedEvent,
     AudioCommandRead(i32),
     UnsupportedAudioCommandKind(u32),
     InvalidAudioPayload,
@@ -257,6 +267,14 @@ impl fmt::Display for RfvpHostRuntimeError {
             Self::InputRejected(status) => {
                 write!(f, "RFVP input was rejected with status {status}")
             }
+            Self::EventRead(status) => write!(f, "RFVP event read failed with status {status}"),
+            Self::TranslationRejected(status) => {
+                write!(f, "RFVP text translation call failed with status {status}")
+            }
+            Self::FontRejected(status) => {
+                write!(f, "RFVP font override failed with status {status}")
+            }
+            Self::MalformedEvent => write!(f, "RFVP event record is malformed"),
             Self::AudioCommandRead(status) => {
                 write!(f, "RFVP audio command read failed with status {status}")
             }
@@ -293,6 +311,7 @@ pub struct RfvpHostRuntime {
     last_texture_count: usize,
     exit_requested: bool,
     renderer: ExternalRenderer,
+    profiler: crate::profiler::RfvpProfiler,
 }
 
 impl RfvpHostRuntime {
@@ -380,14 +399,14 @@ impl RfvpHostRuntime {
             }
         };
 
-        if width != requested_width || height != requested_height {
-            if let Err(error) = backend.resize(Extent2D::new(width, height)) {
-                unsafe { rfvp_runtime_destroy(runtime) };
-                unsafe { rfvp_resources_destroy(resources) };
-                return Err(RfvpHostRuntimeError::Render(
-                    ExternalRendererError::Backend(error),
-                ));
-            }
+        if (width != requested_width || height != requested_height)
+            && let Err(error) = backend.resize(Extent2D::new(width, height))
+        {
+            unsafe { rfvp_runtime_destroy(runtime) };
+            unsafe { rfvp_resources_destroy(resources) };
+            return Err(RfvpHostRuntimeError::Render(
+                ExternalRendererError::Backend(error),
+            ));
         }
 
         Ok(Self {
@@ -399,6 +418,7 @@ impl RfvpHostRuntime {
             last_texture_count: 0,
             exit_requested: false,
             renderer: ExternalRenderer::new(backend, clear_color),
+            profiler: crate::profiler::RfvpProfiler::default(),
         })
     }
 
@@ -442,12 +462,27 @@ impl RfvpHostRuntime {
     }
 
     pub fn step(&mut self, delta_ms: u32) -> Result<(), RfvpHostRuntimeError> {
+        let started = self.profiler.enabled().then(std::time::Instant::now);
         let status = unsafe { rfvp_runtime_step(self.runtime, delta_ms.max(1)) };
+        if let Some(started) = started {
+            self.profiler.record_step(started.elapsed());
+        }
         if status != RFVP_STATUS_OK {
             return Err(RfvpHostRuntimeError::Step(status));
         }
         self.is_exit_requested();
         Ok(())
+    }
+
+    /// Toggles the rolling profiler and the backend's GPU stats collection.
+    pub fn set_profiler_enabled(&mut self, enabled: bool) {
+        self.profiler.set_enabled(enabled);
+        self.renderer.backend_mut().set_profile_enabled(enabled);
+    }
+
+    /// Profiler snapshot JSON compatible with the core runtime's schema.
+    pub fn profiler_snapshot_json(&self) -> String {
+        self.profiler.snapshot_json((self.width, self.height))
     }
 
     pub fn push_input(
@@ -462,6 +497,121 @@ impl RfvpHostRuntime {
             unsafe { rfvp_runtime_push_input(self.runtime, events.as_ptr(), events.len()) };
         if status != RFVP_STATUS_OK {
             return Err(RfvpHostRuntimeError::InputRejected(status));
+        }
+        Ok(())
+    }
+
+    /// Enables or disables the pull-based event queue (text translation
+    /// requests). Disabling clears queued events.
+    pub fn set_events_enabled(&mut self, enabled: bool) -> Result<(), RfvpHostRuntimeError> {
+        let status = unsafe { rfvp_runtime_events_enable(self.runtime, i32::from(enabled)) };
+        if status != RFVP_STATUS_OK {
+            return Err(RfvpHostRuntimeError::EventRead(status));
+        }
+        Ok(())
+    }
+
+    /// Drains pending host events.
+    pub fn poll_events(&mut self) -> Result<Vec<RfvpHostEvent>, RfvpHostRuntimeError> {
+        let mut events = Vec::new();
+        loop {
+            let size = unsafe { rfvp_runtime_next_event_size(self.runtime) };
+            if size == 0 {
+                break;
+            }
+            let mut buffer = vec![0u8; size];
+            let mut count = 0u32;
+            let written = unsafe {
+                rfvp_runtime_poll_events(self.runtime, buffer.as_mut_ptr(), size, &mut count)
+            };
+            if written == 0 || count == 0 {
+                // The record did not fit (or the handle raced); drop it so a
+                // corrupt or oversized record cannot wedge the queue.
+                return Err(RfvpHostRuntimeError::EventRead(RFVP_STATUS_ENGINE));
+            }
+            events.push(parse_event_record(&buffer[..written])?);
+        }
+        Ok(events)
+    }
+
+    /// Installs the exact text replacement table from a UTF-8 JSON object
+    /// mapping source strings to their replacements. An empty blob clears it.
+    pub fn set_text_replacements(&mut self, json: &str) -> Result<(), RfvpHostRuntimeError> {
+        let status = unsafe {
+            rfvp_runtime_set_text_replacements(
+                self.runtime,
+                json.as_ptr(),
+                json.len(),
+                RFVP_SERIALIZATION_JSON,
+            )
+        };
+        if status != RFVP_STATUS_OK {
+            return Err(RfvpHostRuntimeError::TranslationRejected(status));
+        }
+        Ok(())
+    }
+
+    pub fn set_text_translation_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), RfvpHostRuntimeError> {
+        let status = unsafe {
+            rfvp_runtime_set_text_translation_enabled(self.runtime, i32::from(enabled))
+        };
+        if status != RFVP_STATUS_OK {
+            return Err(RfvpHostRuntimeError::TranslationRejected(status));
+        }
+        // Translation requests are observed through the event queue; keep the
+        // two knobs coupled so hosts see requests whenever online translation
+        // is on.
+        self.set_events_enabled(enabled)
+    }
+
+    pub fn set_text_hidpi(&mut self, enabled: bool) -> Result<(), RfvpHostRuntimeError> {
+        let status = unsafe { rfvp_runtime_set_text_hidpi(self.runtime, i32::from(enabled)) };
+        if status != RFVP_STATUS_OK {
+            return Err(RfvpHostRuntimeError::TranslationRejected(status));
+        }
+        Ok(())
+    }
+
+    /// Forces a replacement font face (raw TrueType/OpenType bytes) as the
+    /// primary for every text draw, regardless of the face the script
+    /// requests. Glyphs the override lacks still fall through the engine's
+    /// fallback chain. Invalid font data is rejected and leaves any previous
+    /// override untouched.
+    pub fn set_font_override(&mut self, data: &[u8]) -> Result<(), RfvpHostRuntimeError> {
+        let status =
+            unsafe { rfvp_runtime_set_font_override(self.runtime, data.as_ptr(), data.len()) };
+        if status != RFVP_STATUS_OK {
+            return Err(RfvpHostRuntimeError::FontRejected(status));
+        }
+        Ok(())
+    }
+
+    pub fn clear_font_override(&mut self) -> Result<(), RfvpHostRuntimeError> {
+        let status = unsafe { rfvp_runtime_clear_font_override(self.runtime) };
+        if status != RFVP_STATUS_OK {
+            return Err(RfvpHostRuntimeError::FontRejected(status));
+        }
+        Ok(())
+    }
+
+    /// Submits an asynchronous translation result. `None` keeps the original
+    /// text. Unknown or stale serials are ignored by the engine.
+    pub fn submit_text_translation(
+        &mut self,
+        serial: u64,
+        translated: Option<&str>,
+    ) -> Result<(), RfvpHostRuntimeError> {
+        let (pointer, length) = translated
+            .map(|text| (text.as_ptr(), text.len()))
+            .unwrap_or((ptr::null(), 0));
+        let status = unsafe {
+            rfvp_runtime_submit_text_translation(self.runtime, serial, pointer, length)
+        };
+        if status != RFVP_STATUS_OK {
+            return Err(RfvpHostRuntimeError::TranslationRejected(status));
         }
         Ok(())
     }
@@ -571,12 +721,21 @@ impl RfvpHostRuntime {
         let frame = self.read_frame(native_frame);
         unsafe { rfvp_frame_release(native_frame) };
         let frame = frame?;
+        let started = self.profiler.enabled().then(std::time::Instant::now);
         // Unchanged frames are skipped by the renderer and reported as no
         // presentation; callers already treat `None` as "nothing new".
-        let Some(result) = self.renderer.render_frame(&frame)? else {
-            return Ok(None);
-        };
-        Ok(Some(result))
+        let result = self.renderer.render_frame(&frame)?;
+        if let Some(started) = started {
+            let gpu = self.renderer.backend_mut().take_profile_stats();
+            self.profiler.record_render(
+                started.elapsed(),
+                result.as_ref().map(|result| &result.region),
+                self.last_command_count,
+                (self.width, self.height),
+                gpu,
+            );
+        }
+        Ok(result)
     }
 
     pub fn advance_and_present(&mut self, delta_ms: u32) -> Result<bool, RfvpHostRuntimeError> {
@@ -584,17 +743,27 @@ impl RfvpHostRuntime {
         let Some(result) = self.render_pending_frame()? else {
             return Ok(false);
         };
+        let started = self.profiler.enabled().then(std::time::Instant::now);
         self.renderer
             .backend_mut()
             .present(result.region.damage())
             .map_err(RfvpHostRuntimeError::Present)?;
+        if let Some(started) = started {
+            self.profiler.record_present(started.elapsed());
+        }
         Ok(true)
     }
 
     pub fn readback_rgba(&mut self) -> Result<Vec<u8>, RfvpHostRuntimeError> {
-        self.renderer
+        let started = self.profiler.enabled().then(std::time::Instant::now);
+        let pixels = self
+            .renderer
             .readback_rgba(Extent2D::new(self.width, self.height))
-            .map_err(Into::into)
+            .map_err(Into::into);
+        if let Some(started) = started {
+            self.profiler.record_readback(started.elapsed());
+        }
+        pixels
     }
 
     fn read_frame(&mut self, native_frame: u64) -> Result<ExternalFrame, RfvpHostRuntimeError> {
@@ -690,6 +859,81 @@ impl Drop for RfvpHostRuntime {
             rfvp_runtime_destroy(self.runtime);
             rfvp_resources_destroy(self.resources);
         }
+    }
+}
+
+/// Event drained from the runtime's pull-based event queue.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RfvpHostEvent {
+    /// A text slot needs translation. `ruby` carries the furigana reading
+    /// when the engine captured one.
+    TextTranslation {
+        serial: u64,
+        slot: u32,
+        generation: u64,
+        source: String,
+        ruby: Option<String>,
+    },
+}
+
+fn parse_event_record(record: &[u8]) -> Result<RfvpHostEvent, RfvpHostRuntimeError> {
+    fn u32_at(record: &[u8], offset: usize) -> Result<u32, RfvpHostRuntimeError> {
+        record
+            .get(offset..offset + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .ok_or(RfvpHostRuntimeError::MalformedEvent)
+    }
+    fn u64_at(record: &[u8], offset: usize) -> Result<u64, RfvpHostRuntimeError> {
+        record
+            .get(offset..offset + 8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+            .ok_or(RfvpHostRuntimeError::MalformedEvent)
+    }
+
+    const HEADER_LEN: usize = 24;
+    const TEXT_EVENT_LEN: usize = 48;
+
+    let kind = u32_at(record, 4)?;
+    let payload_size = u32_at(record, 16)? as usize;
+    if record.len() != HEADER_LEN + payload_size {
+        return Err(RfvpHostRuntimeError::MalformedEvent);
+    }
+    match kind {
+        RFVP_EVENT_TEXT_TRANSLATION => {
+            if payload_size < TEXT_EVENT_LEN {
+                return Err(RfvpHostRuntimeError::MalformedEvent);
+            }
+            let payload = &record[HEADER_LEN..];
+            let serial = u64_at(payload, 8)?;
+            let generation = u64_at(payload, 16)?;
+            let slot = u32_at(payload, 24)?;
+            let source_offset = u32_at(payload, 28)? as usize;
+            let source_len = u32_at(payload, 32)? as usize;
+            let ruby_offset = u32_at(payload, 36)? as usize;
+            let ruby_len = u32_at(payload, 40)? as usize;
+            let source = payload
+                .get(source_offset..source_offset + source_len)
+                .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
+                .ok_or(RfvpHostRuntimeError::MalformedEvent)?;
+            let ruby = if ruby_len == 0 {
+                None
+            } else {
+                Some(
+                    payload
+                        .get(ruby_offset..ruby_offset + ruby_len)
+                        .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
+                        .ok_or(RfvpHostRuntimeError::MalformedEvent)?,
+                )
+            };
+            Ok(RfvpHostEvent::TextTranslation {
+                serial,
+                slot,
+                generation,
+                source,
+                ruby,
+            })
+        }
+        _ => Err(RfvpHostRuntimeError::MalformedEvent),
     }
 }
 
@@ -889,7 +1133,7 @@ fn convert_texture(
         RFVP_TEXTURE_DESTROY => Ok(RecordedTextureCommand::Destroy(RecordedTextureDestroy {
             handle: TextureHandle(texture.texture_id),
         })),
-        kind => return Err(RfvpHostRuntimeError::UnsupportedTextureKind(kind)),
+        kind => Err(RfvpHostRuntimeError::UnsupportedTextureKind(kind)),
     }
 }
 

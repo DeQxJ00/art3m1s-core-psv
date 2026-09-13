@@ -56,6 +56,10 @@ fn main() -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     let dump_hit_proxies = std::env::var_os("RFVP_SMOKE_HIT_PROXIES").is_some();
+    let profiler_enabled = std::env::var_os("RFVP_SMOKE_PROFILER").is_some();
+    // Enables online translation and answers every request with a fixed
+    // marker string so the async re-rasterization path is exercised.
+    let translate_enabled = std::env::var_os("RFVP_SMOKE_TRANSLATE").is_some();
     let rclicks = std::env::var("RFVP_SMOKE_RCLICK")
         .ok()
         .map(|value| {
@@ -126,6 +130,12 @@ fn main() -> Result<()> {
         [0.05, 0.06, 0.08, 1.0],
     )?;
     let stage_size = (runtime.width(), runtime.height());
+    if profiler_enabled {
+        runtime.set_profiler_enabled(true);
+    }
+    if translate_enabled {
+        runtime.set_text_translation_enabled(true)?;
+    }
 
     let mut rendered_frames = 0u32;
     for frame in 0..frame_count {
@@ -137,6 +147,29 @@ fn main() -> Result<()> {
         runtime
             .step(16)
             .with_context(|| format!("step frame {frame}"))?;
+        if translate_enabled {
+            for event in runtime
+                .poll_events()
+                .with_context(|| format!("poll events frame {frame}"))?
+            {
+                match event {
+                    art3m1s_rfvp::RfvpHostEvent::TextTranslation {
+                        serial,
+                        slot,
+                        source,
+                        ruby,
+                        ..
+                    } => {
+                        println!(
+                            "translate frame={frame} serial={serial} slot={slot} ruby={ruby:?} source={source:?}",
+                        );
+                        runtime
+                            .submit_text_translation(serial, Some("【翻译测试】"))
+                            .with_context(|| format!("submit translation frame {frame}"))?;
+                    }
+                }
+            }
+        }
         for (click_frame, x, y) in &clicks {
             if frame == *click_frame {
                 runtime
@@ -258,6 +291,9 @@ fn main() -> Result<()> {
         image::ColorType::Rgba8,
     )
         .with_context(|| format!("save screenshot {}", output.display()))?;
+    if profiler_enabled {
+        println!("profiler={}", runtime.profiler_snapshot_json());
+    }
     println!(
         "rendered_frames={rendered_frames} non_black={non_black} stage={}x{} saved={}",
         stage_size.0,

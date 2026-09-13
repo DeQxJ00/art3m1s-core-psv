@@ -24,7 +24,7 @@ use std::sync::Mutex;
 
 use art3m1s_rfvp::{
     RfvpAudioSampleFormat, RfvpEncodedAudioKind, RfvpHostAudioCommand, RfvpHostAudioCommandKind,
-    RfvpHostInputEvent, RfvpHostRuntime, RfvpNls, RfvpPointerButton, RfvpTouchPhase,
+    RfvpHostEvent, RfvpHostInputEvent, RfvpHostRuntime, RfvpNls, RfvpPointerButton, RfvpTouchPhase,
 };
 
 use crate::backend::BackendSelection;
@@ -133,6 +133,11 @@ pub struct Art3m1sRfvpAudioCommandV1 {
 /// little-endian, followed by the UTF-8 message bytes.
 pub const ART3M1S_RFVP_LOG_HEADER_SIZE: usize = 8;
 
+/// Wire size of one pulled text-translation event header: total_len u32,
+/// serial u64, slot u32, generation u64, source_len u32, ruby_len u32, all
+/// little-endian, followed by the source bytes and then the ruby bytes.
+pub const ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE: usize = 32;
+
 type RuntimeCreateFn = unsafe extern "C" fn(
     game_root_utf8: *const u8,
     game_root_len: usize,
@@ -172,6 +177,22 @@ type RuntimeSetLogCallbackFn =
     unsafe extern "C" fn(callback: Option<Art3m1sRfvpLogCallbackFn>, user_data: *mut c_void);
 type LogNextBytesFn = unsafe extern "C" fn() -> usize;
 type PollLogFn = unsafe extern "C" fn(output: *mut u8, capacity: usize) -> usize;
+type RuntimeSetTextReplacementsFn =
+    unsafe extern "C" fn(runtime: u64, blob: *const u8, blob_size: usize) -> i32;
+type RuntimeSetTextTranslationEnabledFn =
+    unsafe extern "C" fn(runtime: u64, enabled: i32) -> i32;
+type RuntimeSubmitTextTranslationFn = unsafe extern "C" fn(
+    runtime: u64,
+    serial: u64,
+    translated_utf8: *const u8,
+    translated_len: usize,
+) -> i32;
+type RuntimeNextTextEventSizeFn = unsafe extern "C" fn(runtime: u64) -> usize;
+type RuntimePollTextEventsFn =
+    unsafe extern "C" fn(runtime: u64, out: *mut u8, capacity: u32) -> u32;
+type RuntimeSetFontOverrideFn =
+    unsafe extern "C" fn(runtime: u64, data: *const u8, data_size: u32) -> i32;
+type RuntimeClearFontOverrideFn = unsafe extern "C" fn(runtime: u64) -> i32;
 
 #[repr(C)]
 pub struct Art3m1sRfvpApiV1 {
@@ -196,6 +217,13 @@ pub struct Art3m1sRfvpApiV1 {
     pub runtime_set_log_callback: Option<RuntimeSetLogCallbackFn>,
     pub log_next_bytes: Option<LogNextBytesFn>,
     pub poll_log: Option<PollLogFn>,
+    pub runtime_set_text_replacements: Option<RuntimeSetTextReplacementsFn>,
+    pub runtime_set_text_translation_enabled: Option<RuntimeSetTextTranslationEnabledFn>,
+    pub runtime_submit_text_translation: Option<RuntimeSubmitTextTranslationFn>,
+    pub runtime_next_text_event_size: Option<RuntimeNextTextEventSizeFn>,
+    pub runtime_poll_text_events: Option<RuntimePollTextEventsFn>,
+    pub runtime_set_font_override: Option<RuntimeSetFontOverrideFn>,
+    pub runtime_clear_font_override: Option<RuntimeClearFontOverrideFn>,
 }
 
 static RFVP_LOG_CALLBACK: Mutex<Option<(Art3m1sRfvpLogCallbackFn, usize)>> = Mutex::new(None);
@@ -211,6 +239,7 @@ struct LogRecord {
 struct ApiRuntime {
     runtime: RfvpHostRuntime,
     pending_audio_payload: Vec<u8>,
+    pending_text_events: VecDeque<RfvpHostEvent>,
 }
 
 // Safety: `RfvpHostRuntime` holds raw engine pointers. All access goes through
@@ -242,6 +271,13 @@ static API_V1: Art3m1sRfvpApiV1 = Art3m1sRfvpApiV1 {
     runtime_set_log_callback: Some(runtime_set_log_callback),
     log_next_bytes: Some(log_next_bytes),
     poll_log: Some(poll_log),
+    runtime_set_text_replacements: Some(runtime_set_text_replacements),
+    runtime_set_text_translation_enabled: Some(runtime_set_text_translation_enabled),
+    runtime_submit_text_translation: Some(runtime_submit_text_translation),
+    runtime_next_text_event_size: Some(runtime_next_text_event_size),
+    runtime_poll_text_events: Some(runtime_poll_text_events),
+    runtime_set_font_override: Some(runtime_set_font_override),
+    runtime_clear_font_override: Some(runtime_clear_font_override),
 };
 
 #[unsafe(no_mangle)]
@@ -318,6 +354,7 @@ unsafe extern "C" fn runtime_create(
         let handle = RUNTIMES.insert(ApiRuntime {
             runtime,
             pending_audio_payload: Vec::new(),
+            pending_text_events: VecDeque::new(),
         });
         if handle == 0 {
             return ART3M1S_RFVP_STATUS_ENGINE;
@@ -725,6 +762,217 @@ fn audio_command_v1(command: &RfvpHostAudioCommand, payload: &[u8]) -> Art3m1sRf
     }
 }
 
+unsafe extern "C" fn runtime_set_text_replacements(
+    runtime: u64,
+    blob: *const u8,
+    blob_size: usize,
+) -> i32 {
+    guard_status(|| {
+        let json = if blob.is_null() || blob_size == 0 {
+            ""
+        } else {
+            match std::str::from_utf8(unsafe { std::slice::from_raw_parts(blob, blob_size) }) {
+                Ok(json) => json,
+                Err(_) => return ART3M1S_RFVP_STATUS_INVALID_ARGUMENT,
+            }
+        };
+        RUNTIMES.with_mut(
+            runtime,
+            ART3M1S_RFVP_STATUS_INVALID_HANDLE,
+            |runtime| match runtime.runtime.set_text_replacements(json) {
+                Ok(()) => ART3M1S_RFVP_STATUS_OK,
+                Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
+            },
+        )
+    })
+}
+
+unsafe extern "C" fn runtime_set_text_translation_enabled(runtime: u64, enabled: i32) -> i32 {
+    guard_status(|| {
+        let enabled = enabled != 0;
+        RUNTIMES.with_mut(runtime, ART3M1S_RFVP_STATUS_INVALID_HANDLE, |runtime| {
+            if runtime
+                .runtime
+                .set_text_translation_enabled(enabled)
+                .is_err()
+            {
+                return ART3M1S_RFVP_STATUS_ENGINE;
+            }
+            // The event queue is how the host observes translation requests,
+            // so it tracks the translation toggle.
+            match runtime.runtime.set_events_enabled(enabled) {
+                Ok(()) => ART3M1S_RFVP_STATUS_OK,
+                Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
+            }
+        })
+    })
+}
+
+unsafe extern "C" fn runtime_submit_text_translation(
+    runtime: u64,
+    serial: u64,
+    translated_utf8: *const u8,
+    translated_len: usize,
+) -> i32 {
+    guard_status(|| {
+        let translated = if translated_utf8.is_null() || translated_len == 0 {
+            None
+        } else {
+            match std::str::from_utf8(unsafe {
+                std::slice::from_raw_parts(translated_utf8, translated_len)
+            }) {
+                Ok(text) => Some(text),
+                Err(_) => return ART3M1S_RFVP_STATUS_INVALID_ARGUMENT,
+            }
+        };
+        RUNTIMES.with_mut(
+            runtime,
+            ART3M1S_RFVP_STATUS_INVALID_HANDLE,
+            |runtime| match runtime.runtime.submit_text_translation(serial, translated) {
+                Ok(()) => ART3M1S_RFVP_STATUS_OK,
+                Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
+            },
+        )
+    })
+}
+
+fn drain_host_text_events(runtime: &mut ApiRuntime) {
+    if let Ok(events) = runtime.runtime.poll_events() {
+        for event in events {
+            runtime.pending_text_events.push_back(event);
+        }
+    }
+}
+
+fn text_event_record_len(event: &RfvpHostEvent) -> usize {
+    match event {
+        RfvpHostEvent::TextTranslation { source, ruby, .. } => {
+            ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE
+                + source.len()
+                + ruby.as_deref().map_or(0, str::len)
+        }
+    }
+}
+
+fn encode_text_event(event: &RfvpHostEvent, out: *mut u8, capacity: usize) -> Option<usize> {
+    match event {
+        RfvpHostEvent::TextTranslation {
+            serial,
+            slot,
+            generation,
+            source,
+            ruby,
+        } => {
+            let ruby = ruby.as_deref().unwrap_or("");
+            if source.len() > u32::MAX as usize || ruby.len() > u32::MAX as usize {
+                return None;
+            }
+            let total_len = ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE + source.len() + ruby.len();
+            if total_len > capacity {
+                return None;
+            }
+            let mut header = [0u8; ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE];
+            header[0..4].copy_from_slice(&(total_len as u32).to_le_bytes());
+            header[4..12].copy_from_slice(&serial.to_le_bytes());
+            header[12..16].copy_from_slice(&slot.to_le_bytes());
+            header[16..24].copy_from_slice(&generation.to_le_bytes());
+            header[24..28].copy_from_slice(&(source.len() as u32).to_le_bytes());
+            header[28..32].copy_from_slice(&(ruby.len() as u32).to_le_bytes());
+            unsafe {
+                ptr::copy_nonoverlapping(header.as_ptr(), out, header.len());
+                ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    out.add(header.len()),
+                    source.len(),
+                );
+                ptr::copy_nonoverlapping(
+                    ruby.as_ptr(),
+                    out.add(header.len() + source.len()),
+                    ruby.len(),
+                );
+            }
+            Some(total_len)
+        }
+    }
+}
+
+unsafe extern "C" fn runtime_next_text_event_size(runtime: u64) -> usize {
+    catch_unwind(AssertUnwindSafe(|| {
+        RUNTIMES.with_mut(runtime, 0, |runtime| {
+            drain_host_text_events(runtime);
+            runtime
+                .pending_text_events
+                .front()
+                .map_or(0, text_event_record_len)
+        })
+    }))
+    .unwrap_or(0)
+}
+
+unsafe extern "C" fn runtime_poll_text_events(
+    runtime: u64,
+    out: *mut u8,
+    capacity: u32,
+) -> u32 {
+    guard_u32(|| {
+        if out.is_null() {
+            return 0;
+        }
+        RUNTIMES.with_mut(runtime, 0, |runtime| {
+            drain_host_text_events(runtime);
+            let capacity = capacity as usize;
+            let mut written = 0usize;
+            while let Some(event) = runtime.pending_text_events.front() {
+                let Some(record_len) = encode_text_event(event, out.wrapping_add(written), capacity - written)
+                else {
+                    break;
+                };
+                written += record_len;
+                runtime.pending_text_events.pop_front();
+            }
+            written as u32
+        })
+    })
+}
+
+/// Forces a replacement font face (raw TrueType/OpenType bytes) for every
+/// text draw. Empty or null data is rejected with INVALID_ARGUMENT; font data
+/// the engine cannot parse is also rejected and leaves the current override
+/// untouched.
+unsafe extern "C" fn runtime_set_font_override(
+    runtime: u64,
+    data: *const u8,
+    data_size: u32,
+) -> i32 {
+    guard_status(|| {
+        if data.is_null() || data_size == 0 {
+            return ART3M1S_RFVP_STATUS_INVALID_ARGUMENT;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(data, data_size as usize) };
+        RUNTIMES.with_mut(
+            runtime,
+            ART3M1S_RFVP_STATUS_INVALID_HANDLE,
+            |runtime| match runtime.runtime.set_font_override(bytes) {
+                Ok(()) => ART3M1S_RFVP_STATUS_OK,
+                Err(_) => ART3M1S_RFVP_STATUS_INVALID_ARGUMENT,
+            },
+        )
+    })
+}
+
+unsafe extern "C" fn runtime_clear_font_override(runtime: u64) -> i32 {
+    guard_status(|| {
+        RUNTIMES.with_mut(
+            runtime,
+            ART3M1S_RFVP_STATUS_INVALID_HANDLE,
+            |runtime| match runtime.runtime.clear_font_override() {
+                Ok(()) => ART3M1S_RFVP_STATUS_OK,
+                Err(_) => ART3M1S_RFVP_STATUS_ENGINE,
+            },
+        )
+    })
+}
+
 fn guard_status(callback: impl FnOnce() -> i32) -> i32 {
     catch_unwind(AssertUnwindSafe(callback)).unwrap_or(ART3M1S_RFVP_STATUS_ENGINE)
 }
@@ -756,6 +1004,13 @@ mod tests {
         assert!(api.runtime_set_log_callback.is_some());
         assert!(api.log_next_bytes.is_some());
         assert!(api.poll_log.is_some());
+        assert!(api.runtime_set_text_replacements.is_some());
+        assert!(api.runtime_set_text_translation_enabled.is_some());
+        assert!(api.runtime_submit_text_translation.is_some());
+        assert!(api.runtime_next_text_event_size.is_some());
+        assert!(api.runtime_poll_text_events.is_some());
+        assert!(api.runtime_set_font_override.is_some());
+        assert!(api.runtime_clear_font_override.is_some());
     }
 
     #[test]
@@ -785,6 +1040,36 @@ mod tests {
             assert_eq!(
                 unsafe { runtime_advance_and_render(garbage, 16, ptr::null_mut(), 0) },
                 0
+            );
+            assert_eq!(
+                unsafe { runtime_set_text_replacements(garbage, ptr::null(), 0) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_set_text_translation_enabled(garbage, 1) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_submit_text_translation(garbage, 1, ptr::null(), 0) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(unsafe { runtime_next_text_event_size(garbage) }, 0);
+            assert_eq!(
+                unsafe { runtime_poll_text_events(garbage, ptr::null_mut(), 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { runtime_set_font_override(garbage, ptr::null(), 0) },
+                ART3M1S_RFVP_STATUS_INVALID_ARGUMENT
+            );
+            let font_byte = [0u8; 1];
+            assert_eq!(
+                unsafe { runtime_set_font_override(garbage, font_byte.as_ptr(), 1) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
+            );
+            assert_eq!(
+                unsafe { runtime_clear_font_override(garbage) },
+                ART3M1S_RFVP_STATUS_INVALID_HANDLE
             );
             // Double destroy and garbage destroy are safe no-ops.
             unsafe { runtime_destroy(garbage) };
@@ -843,6 +1128,63 @@ mod tests {
             let mut queue = LOG_QUEUE.lock().unwrap();
             queue.clear();
         }
+    }
+
+    #[test]
+    fn text_events_encode_as_length_prefixed_records() {
+        let event = RfvpHostEvent::TextTranslation {
+            serial: 0x1122_3344_5566_7788,
+            slot: 7,
+            generation: 42,
+            source: "こんにちは".to_string(),
+            ruby: Some("コンにちは".to_string()),
+        };
+        let record_len = text_event_record_len(&event);
+        assert_eq!(
+            record_len,
+            ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE + "こんにちは".len() + "コンにちは".len()
+        );
+
+        let mut output = vec![0u8; record_len + 16];
+        assert_eq!(encode_text_event(&event, output.as_mut_ptr(), 3), None);
+        assert_eq!(
+            encode_text_event(&event, output.as_mut_ptr(), output.len()),
+            Some(record_len)
+        );
+
+        let total = u32::from_le_bytes(output[0..4].try_into().unwrap()) as usize;
+        assert_eq!(total, record_len);
+        let serial = u64::from_le_bytes(output[4..12].try_into().unwrap());
+        let slot = u32::from_le_bytes(output[12..16].try_into().unwrap());
+        let generation = u64::from_le_bytes(output[16..24].try_into().unwrap());
+        let source_len = u32::from_le_bytes(output[24..28].try_into().unwrap()) as usize;
+        let ruby_len = u32::from_le_bytes(output[28..32].try_into().unwrap()) as usize;
+        assert_eq!(serial, 0x1122_3344_5566_7788);
+        assert_eq!(slot, 7);
+        assert_eq!(generation, 42);
+        let source_start = ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE;
+        assert_eq!(
+            &output[source_start..source_start + source_len],
+            "こんにちは".as_bytes()
+        );
+        let ruby_start = source_start + source_len;
+        assert_eq!(
+            &output[ruby_start..ruby_start + ruby_len],
+            "コンにちは".as_bytes()
+        );
+        assert_eq!(source_start + source_len + ruby_len, record_len);
+
+        let no_ruby = RfvpHostEvent::TextTranslation {
+            serial: 1,
+            slot: 0,
+            generation: 0,
+            source: "a".to_string(),
+            ruby: None,
+        };
+        assert_eq!(
+            text_event_record_len(&no_ruby),
+            ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE + 1
+        );
     }
 
     #[test]

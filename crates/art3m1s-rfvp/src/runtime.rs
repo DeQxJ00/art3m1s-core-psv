@@ -195,10 +195,10 @@ impl ExternalRenderer {
             .collect();
         let signature = frame_signature(&commands, &generations);
 
-        if let Some(cache) = &self.frame_cache {
-            if cache.signature == signature {
-                return Ok(None);
-            }
+        if let Some(cache) = &self.frame_cache
+            && cache.signature == signature
+        {
+            return Ok(None);
         }
 
         let damage = self

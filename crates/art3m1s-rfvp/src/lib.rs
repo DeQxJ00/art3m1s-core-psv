@@ -8,6 +8,8 @@
 pub mod commands;
 #[cfg(feature = "host-runtime")]
 pub mod host_runtime;
+#[cfg(feature = "host-runtime")]
+pub mod profiler;
 pub mod protocol;
 #[cfg(feature = "rfvp-fork")]
 pub mod rfvp_bridge;
@@ -19,9 +21,11 @@ pub use commands::{AdaptedFrame, AdapterError, DrawListAdapter};
 #[cfg(feature = "host-runtime")]
 pub use host_runtime::{
     RfvpAudioSampleFormat, RfvpEncodedAudioKind, RfvpHostAudioCommand, RfvpHostAudioCommandKind,
-    RfvpHostInputEvent, RfvpHostRuntime, RfvpHostRuntimeError, RfvpNls, RfvpPointerButton,
-    RfvpTouchPhase,
+    RfvpHostEvent, RfvpHostInputEvent, RfvpHostRuntime, RfvpHostRuntimeError, RfvpNls,
+    RfvpPointerButton, RfvpTouchPhase,
 };
+#[cfg(feature = "host-runtime")]
+pub use profiler::RfvpProfiler;
 pub use protocol::{
     ColorRgba, CommandBlendMode, DrawGlyphCmd, DrawImageCmd, DrawSolidCmd, HitProxy, HitProxyTable,
     PrimId, RectI16, RenderCommand, RenderFrame, Rgba8, TextureHandle, Vertex2D,
