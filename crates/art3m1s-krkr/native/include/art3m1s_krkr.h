@@ -50,6 +50,9 @@ enum Art3m1sKrkrStatus {
 
 #define ART3M1S_KRKR_FRAME_FORMAT_RGBA8 1u
 
+/* Low byte of runtime config flags: shared Art3m1s backend selection. */
+#define ART3M1S_KRKR_CONFIG_BACKEND_MASK 0xffu
+
 #define ART3M1S_KRKR_AUDIO_CREATE_STREAM 1u
 #define ART3M1S_KRKR_AUDIO_SUBMIT_PCM 2u
 #define ART3M1S_KRKR_AUDIO_PLAY 3u
@@ -64,6 +67,8 @@ enum Art3m1sKrkrStatus {
 #define ART3M1S_KRKR_AUDIO_FORMAT_I8 3u
 #define ART3M1S_KRKR_AUDIO_FORMAT_I24 4u
 #define ART3M1S_KRKR_AUDIO_FORMAT_I32 5u
+
+#define ART3M1S_KRKR_RENDER_HOST_ABI_VERSION 1u
 
 typedef struct Art3m1sKrkrProbeV1 {
     uint32_t struct_size;
@@ -138,6 +143,44 @@ typedef struct Art3m1sKrkrAudioConsumedV1 {
     uint64_t reserved[2];
 } Art3m1sKrkrAudioConsumedV1;
 
+/*
+ * Private same-thread bridge from the embedded C++ renderer into
+ * art3m1s-render. These callbacks are native-to-native; they never enter Dart.
+ */
+typedef int32_t (*ArtKrkrRenderBeginFrameFn)(void* user_data,
+                                             uint32_t width,
+                                             uint32_t height);
+typedef uint64_t (*ArtKrkrRenderCreateTextureFn)(void* user_data,
+                                                 uint32_t width,
+                                                 uint32_t height);
+typedef int32_t (*ArtKrkrRenderUpdateTextureFn)(void* user_data,
+                                                uint64_t texture,
+                                                const uint8_t* pixels,
+                                                uint32_t width,
+                                                uint32_t height,
+                                                uint32_t pitch);
+typedef void (*ArtKrkrRenderDestroyTextureFn)(void* user_data, uint64_t texture);
+typedef int32_t (*ArtKrkrRenderDrawTextureFn)(void* user_data,
+                                              uint64_t texture,
+                                              float x,
+                                              float y,
+                                              float width,
+                                              float height);
+typedef int32_t (*ArtKrkrRenderEndFrameFn)(void* user_data);
+
+typedef struct Art3m1sKrkrRenderHostV1 {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    void* user_data;
+    ArtKrkrRenderBeginFrameFn begin_frame;
+    ArtKrkrRenderCreateTextureFn create_texture;
+    ArtKrkrRenderUpdateTextureFn update_texture;
+    ArtKrkrRenderDestroyTextureFn destroy_texture;
+    ArtKrkrRenderDrawTextureFn draw_texture;
+    ArtKrkrRenderEndFrameFn end_frame;
+    uint64_t reserved[4];
+} Art3m1sKrkrRenderHostV1;
+
 typedef int32_t (*ArtKrkrProbeProjectFn)(const char* game_root_utf8,
                                          Art3m1sKrkrProbeV1* out_probe);
 typedef int32_t (*ArtKrkrRuntimeCreateFn)(const char* game_root_utf8,
@@ -195,6 +238,10 @@ ART3M1S_KRKR_EXPORT const Art3m1sKrkrApiV1* art3m1s_krkr_get_api_v1(
 /* Private entry point exported by the native KRKR host shim. */
 ART3M1S_KRKR_EXPORT const Art3m1sKrkrApiV1* art3m1s_krkr_native_get_api_v1(
     size_t* out_size);
+
+/* Private setup used by the Rust facade before runtime_create. */
+ART3M1S_KRKR_EXPORT int32_t art3m1s_krkr_native_set_render_host_v1(
+    const Art3m1sKrkrRenderHostV1* host);
 
 #ifdef __cplusplus
 }

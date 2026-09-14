@@ -100,3 +100,9 @@ extern "C" ART3M1S_KRKR_EXPORT const Art3m1sKrkrApiV1* art3m1s_krkr_native_get_a
         *out_size = sizeof(Art3m1sKrkrApiV1);
     return &kApi;
 }
+
+extern "C" ART3M1S_KRKR_EXPORT int32_t art3m1s_krkr_native_set_render_host_v1(
+    const Art3m1sKrkrRenderHostV1*)
+{
+    return ART3M1S_KRKR_STATUS_UNSUPPORTED;
+}

@@ -7,12 +7,14 @@ The crate currently provides:
 
 - a versioned POD ABI contract for a future native host shim
 - opaque runtime/frame/audio handles
-- borrowed RGBA and PCM pointer plus length payloads
+- a same-thread native render-host vtable used by `art3m1s-render`
+- borrowed RGBA fallback and PCM pointer plus length payloads
 - deterministic project probing for XP3 and TJS entry files
-- a macOS smoke host that boots the pinned C++ runtime and captures RGBA frames
+- a headless macOS smoke host that boots the pinned C++ runtime without an SDL window
 
-The smoke host is not a production backend yet. It intentionally has no
-dependency on `art3m1s-core`, the Flutter host, or `art3m1s-rfvp`.
+The isolated smoke host intentionally has no dependency on `art3m1s-core`, the
+Flutter host, or `art3m1s-rfvp`. The production core facade installs the private
+render-host vtable and owns the `art3m1s-render` backend and native surface.
 
 Run the isolated tests with:
 
@@ -68,7 +70,7 @@ library and points the runtime's virtual executable path there. This supplies
 the built-in Droid Sans Fallback font when the game does not ship
 `default.ttf`.
 
-The smoke host currently covers macOS project loading, TJS/KAG startup,
+The smoke host currently covers headless macOS project loading, TJS/KAG startup,
 XP3/root patch mounting, input event translation, frame capture, host-owned
 audio command extraction, and lifecycle shutdown. The smoke host advances each
 playing stream from the wall clock and submits absolute consumed sample counts

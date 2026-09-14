@@ -19,6 +19,8 @@ pub mod rfvp_api;
 
 #[cfg(feature = "krkr-engine")]
 pub mod krkr_api;
+#[cfg(feature = "krkr-engine")]
+mod krkr_renderer;
 
 #[cfg(any(
     feature = "gl-backend",

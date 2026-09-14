@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "backend/SWRenderBackend.h"
+#include "art3m1s_krkr.h"
 
 namespace art3m1s::krkr
 {
@@ -24,7 +25,7 @@ struct FrameView
 class CaptureBackend final : public krkrsdl3::iTVPRenderBackend
 {
 public:
-    CaptureBackend() = default;
+    explicit CaptureBackend(const Art3m1sKrkrRenderHostV1* render_host = nullptr);
     ~CaptureBackend() override;
 
     const char* GetName() const override { return "art3m1s-capture"; }
@@ -75,6 +76,8 @@ public:
                        float v1) override;
 
     FrameView AcquireFrame() const;
+    bool HostFailed() const { return host_failed_; }
+    bool UsesRenderHost() const { return render_host_.user_data != nullptr; }
 
 private:
     struct ShadowTexture
@@ -88,6 +91,7 @@ private:
     {
         uint32_t width = 0;
         uint32_t height = 0;
+        uint64_t host_texture = 0;
         std::vector<uint8_t> pixels;
     };
 
@@ -105,5 +109,7 @@ private:
     uint32_t published_height_ = 0;
     uint64_t frame_id_ = 0;
     uint64_t generation_ = 0;
+    Art3m1sKrkrRenderHostV1 render_host_{};
+    bool host_failed_ = false;
 };
 } // namespace art3m1s::krkr

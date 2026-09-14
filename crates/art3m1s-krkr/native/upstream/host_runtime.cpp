@@ -26,6 +26,7 @@ namespace
 {
 constexpr uint32_t kAbiVersion = 1;
 constexpr uint64_t kAbiMagic = 0x31564B524D334152ULL; // "RA3MKRV1"
+Art3m1sKrkrRenderHostV1 g_render_host{};
 
 struct Runtime
 {
@@ -292,7 +293,9 @@ int32_t RuntimeCreateImpl(const char* game_root_utf8,
         nullptr,
     };
 
-    auto* capture = new art3m1s::krkr::CaptureBackend;
+    const Art3m1sKrkrRenderHostV1* render_host =
+        g_render_host.user_data ? &g_render_host : nullptr;
+    auto* capture = new art3m1s::krkr::CaptureBackend(render_host);
     if (!Art3m1sKrkrHeadlessInit(
             static_cast<int>(argv.size() - 1), argv.data(), capture))
         return ART3M1S_KRKR_STATUS_ENGINE;
@@ -429,6 +432,8 @@ int32_t RuntimeTickImpl(uint64_t handle)
         return ART3M1S_KRKR_STATUS_INVALID_HANDLE;
     if (!Art3m1sKrkrHeadlessIterate())
         runtime->exit_requested = true;
+    if (runtime->capture->HostFailed())
+        return ART3M1S_KRKR_STATUS_ENGINE;
     return ART3M1S_KRKR_STATUS_OK;
 }
 
@@ -710,4 +715,24 @@ extern "C" ART3M1S_KRKR_EXPORT const Art3m1sKrkrApiV1* art3m1s_krkr_native_get_a
     if (out_size)
         *out_size = sizeof(Art3m1sKrkrApiV1);
     return &kApi;
+}
+
+extern "C" ART3M1S_KRKR_EXPORT int32_t art3m1s_krkr_native_set_render_host_v1(
+    const Art3m1sKrkrRenderHostV1* host)
+{
+    if (Application)
+        return ART3M1S_KRKR_STATUS_ENGINE;
+    if (!host)
+    {
+        g_render_host = {};
+        return ART3M1S_KRKR_STATUS_OK;
+    }
+    if (host->struct_size != sizeof(Art3m1sKrkrRenderHostV1) ||
+        host->abi_version != ART3M1S_KRKR_RENDER_HOST_ABI_VERSION ||
+        !host->user_data || !host->begin_frame || !host->create_texture ||
+        !host->update_texture || !host->destroy_texture || !host->draw_texture ||
+        !host->end_frame)
+        return ART3M1S_KRKR_STATUS_INVALID_ARGUMENT;
+    g_render_host = *host;
+    return ART3M1S_KRKR_STATUS_OK;
 }

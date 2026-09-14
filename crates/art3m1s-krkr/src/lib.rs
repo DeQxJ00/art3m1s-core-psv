@@ -15,6 +15,7 @@ pub mod abi;
 pub mod native;
 pub mod probe;
 pub mod protocol;
+pub mod render_host;
 
 pub use abi::{
     ART3M1S_KRKR_API_ABI_MAGIC, ART3M1S_KRKR_API_ABI_VERSION, Art3M1sKrkrApiV1, KrkrAbiError,

@@ -15,7 +15,7 @@
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use art3m1s_krkr::abi::Art3M1sKrkrApiV1;
 use art3m1s_krkr::abi::KrkrAbiError;
@@ -30,18 +30,26 @@ use art3m1s_krkr::protocol::{
     Art3m1sKrkrInputEventV1 as CoreInputEventV1, Art3m1sKrkrProbeV1 as CoreProbeV1,
     Art3m1sKrkrRuntimeConfigV1 as CoreRuntimeConfigV1,
 };
+use art3m1s_krkr::render_host::set_native_render_host;
 
 use crate::ffi::handles::LockedHandleTable;
+use crate::ffi::krkr_renderer::KrkrRenderer;
 
 static NATIVE_API: OnceLock<Result<&'static Art3M1sKrkrApiV1, KrkrAbiError>> = OnceLock::new();
 
 struct ApiRuntime {
     api: &'static Art3M1sKrkrApiV1,
     handle: u64,
+    renderer: Arc<Mutex<KrkrRenderer>>,
     pending_frame_pixels: Vec<u8>,
     pending_frame_id: Option<u64>,
+    last_frame_generation: u64,
     pending_audio_payload: Vec<u8>,
 }
+
+// `LockedHandleTable` serializes API access, and `renderer` has its own mutex
+// for same-thread callbacks made by the native KRKR runtime.
+unsafe impl Send for ApiRuntime {}
 
 static RUNTIMES: LockedHandleTable<ApiRuntime> = LockedHandleTable::new();
 
@@ -119,6 +127,30 @@ unsafe extern "C" fn runtime_create(
         }
         unsafe { *out_runtime = 0 };
 
+        let config_ref = unsafe { &*config };
+        if config_ref.struct_size != std::mem::size_of::<CoreRuntimeConfigV1>() as u32 {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let backend_value = (config_ref.flags & ART3M1S_KRKR_CONFIG_BACKEND_MASK) as i32;
+        let selection = match crate::backend::BackendSelection::try_from_legacy_int(backend_value) {
+            Ok(selection) => selection,
+            Err(_) => return ART3M1S_KRKR_STATUS_UNSUPPORTED,
+        };
+        let backend =
+            match crate::backend::create_backend(selection, config_ref.width, config_ref.height) {
+                Ok(backend) => backend,
+                Err(_) => return STATUS_ENGINE,
+            };
+        let renderer = Arc::new(Mutex::new(KrkrRenderer::new(
+            backend,
+            config_ref.width,
+            config_ref.height,
+        )));
+        let render_host = KrkrRenderer::host_v1(&renderer);
+        if let Err(status) = set_native_render_host(Some(&render_host)) {
+            return status;
+        }
+
         let mut native_runtime = 0u64;
         let status = unsafe {
             (api.runtime_create.expect("runtime_create is required"))(
@@ -128,6 +160,7 @@ unsafe extern "C" fn runtime_create(
                 &mut native_runtime,
             )
         };
+        let _ = set_native_render_host(None);
         if status != STATUS_OK {
             return status;
         }
@@ -138,8 +171,10 @@ unsafe extern "C" fn runtime_create(
         let handle = RUNTIMES.insert(ApiRuntime {
             api,
             handle: native_runtime,
+            renderer,
             pending_frame_pixels: Vec::new(),
             pending_frame_id: None,
+            last_frame_generation: 0,
             pending_audio_payload: Vec::new(),
         });
         if handle == 0 {
@@ -242,38 +277,34 @@ unsafe extern "C" fn runtime_acquire_frame(runtime: u64, out_frame: *mut CoreFra
             return STATUS_INVALID_ARGUMENT;
         }
         RUNTIMES.with_mut(runtime, STATUS_INVALID_HANDLE, |runtime| {
-            let mut native_frame = CoreFrameV1::default();
-            let status = unsafe {
-                (runtime
-                    .api
-                    .runtime_acquire_frame
-                    .expect("runtime_acquire_frame is required"))(
-                    runtime.handle, &mut native_frame
-                )
+            let mut renderer = match runtime.renderer.lock() {
+                Ok(renderer) => renderer,
+                Err(_) => return STATUS_ENGINE,
             };
-            if status != STATUS_OK {
-                return status;
+            let generation = renderer.generation();
+            if generation == 0 || generation == runtime.last_frame_generation {
+                return ART3M1S_KRKR_STATUS_NO_FRAME;
             }
-
-            let copied = copy_native_frame(&native_frame, &mut runtime.pending_frame_pixels);
-            unsafe {
-                (runtime
-                    .api
-                    .runtime_release_frame
-                    .expect("runtime_release_frame is required"))(
-                    runtime.handle,
-                    native_frame.frame_id,
-                );
-            }
-            if !copied {
-                return STATUS_ENGINE;
-            }
-
-            runtime.pending_frame_id = Some(native_frame.frame_id);
+            runtime.pending_frame_pixels = match renderer.readback_rgba() {
+                Ok(pixels) => pixels,
+                Err(_) => return STATUS_ENGINE,
+            };
+            let extent = renderer.extent();
+            drop(renderer);
+            runtime.last_frame_generation = generation;
+            runtime.pending_frame_id = Some(generation);
             let frame = CoreFrameV1 {
+                struct_size: std::mem::size_of::<CoreFrameV1>() as u32,
+                format: ART3M1S_KRKR_FRAME_FORMAT_RGBA8,
+                width: extent.width,
+                height: extent.height,
+                stride: extent.width.saturating_mul(4),
+                flags: 0,
+                frame_id: generation,
+                generation,
                 pixels: runtime.pending_frame_pixels.as_ptr(),
                 pixels_len: runtime.pending_frame_pixels.len(),
-                ..native_frame
+                reserved: [0; 2],
             };
             unsafe { *out_frame = frame };
             STATUS_OK
@@ -384,49 +415,23 @@ unsafe extern "C" fn runtime_set_external_surface(
     height: u32,
 ) -> i32 {
     guard_status(|| {
-        RUNTIMES.with(runtime, STATUS_INVALID_HANDLE, |runtime| unsafe {
-            (runtime
-                .api
-                .runtime_set_external_surface
-                .expect("runtime_set_external_surface is required"))(
-                runtime.handle,
-                kind,
-                handle,
-                width,
-                height,
-            )
+        RUNTIMES.with_mut(runtime, STATUS_INVALID_HANDLE, |runtime| {
+            let mut renderer = match runtime.renderer.lock() {
+                Ok(renderer) => renderer,
+                Err(_) => return STATUS_ENGINE,
+            };
+            if handle.is_null() && kind == 0 && width == 0 && height == 0 {
+                renderer.clear_native_surface();
+                return STATUS_OK;
+            }
+            if handle.is_null() || width == 0 || height == 0 {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            renderer
+                .set_native_surface(kind, handle, width, height)
+                .map_or(ART3M1S_KRKR_STATUS_UNSUPPORTED, |_| STATUS_OK)
         })
     })
-}
-
-fn copy_native_frame(frame: &CoreFrameV1, destination: &mut Vec<u8>) -> bool {
-    if frame.pixels.is_null() || frame.width == 0 || frame.height == 0 {
-        return false;
-    }
-    let Ok(stride) = usize::try_from(frame.stride) else {
-        return false;
-    };
-    let Some(row_bytes) = usize::try_from(frame.width)
-        .ok()
-        .and_then(|width| width.checked_mul(4))
-    else {
-        return false;
-    };
-    let Some(height) = usize::try_from(frame.height).ok() else {
-        return false;
-    };
-    let Some(required) = stride.checked_mul(height) else {
-        return false;
-    };
-    if stride < row_bytes || required == 0 || frame.pixels_len < required {
-        return false;
-    }
-
-    destination.resize(required, 0);
-    unsafe {
-        ptr::copy_nonoverlapping(frame.pixels, destination.as_mut_ptr(), required);
-    }
-    true
 }
 
 fn guard_status(callback: impl FnOnce() -> i32) -> i32 {
@@ -480,19 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn copies_native_frame_into_core_owned_storage() {
-        let pixels = [1u8, 2, 3, 4, 5, 6, 7, 8];
-        let frame = CoreFrameV1 {
-            struct_size: std::mem::size_of::<CoreFrameV1>() as u32,
-            width: 1,
-            height: 2,
-            stride: 4,
-            pixels: pixels.as_ptr(),
-            pixels_len: pixels.len(),
-            ..Default::default()
-        };
-        let mut destination = Vec::new();
-        assert!(copy_native_frame(&frame, &mut destination));
-        assert_eq!(destination, pixels);
+    fn frame_acquire_validates_the_public_output_layout() {
+        let mut frame = CoreFrameV1::default();
+        frame.struct_size = 0;
+        assert_eq!(
+            unsafe { runtime_acquire_frame(u64::MAX, &mut frame) },
+            STATUS_INVALID_ARGUMENT
+        );
     }
 }

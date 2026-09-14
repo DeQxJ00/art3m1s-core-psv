@@ -14,6 +14,12 @@ uint8_t Lerp8(uint8_t dst, uint8_t src, uint8_t alpha)
 }
 } // namespace
 
+CaptureBackend::CaptureBackend(const Art3m1sKrkrRenderHostV1* render_host)
+{
+    if (render_host)
+        render_host_ = *render_host;
+}
+
 CaptureBackend::~CaptureBackend()
 {
 }
@@ -34,11 +40,26 @@ void CaptureBackend::BeginFrame(int winWidth, int winHeight)
 {
     width_ = static_cast<uint32_t>(std::max(0, winWidth));
     height_ = static_cast<uint32_t>(std::max(0, winHeight));
+    if (UsesRenderHost())
+    {
+        if (render_host_.begin_frame(render_host_.user_data, width_, height_) !=
+            ART3M1S_KRKR_STATUS_OK)
+            host_failed_ = true;
+        return;
+    }
     canvas_.assign(static_cast<size_t>(width_) * height_ * 4, 0);
 }
 
 void CaptureBackend::EndFrame()
 {
+    if (UsesRenderHost())
+    {
+        if (render_host_.end_frame(render_host_.user_data) != ART3M1S_KRKR_STATUS_OK)
+            host_failed_ = true;
+        ++frame_id_;
+        generation_ = frame_id_;
+        return;
+    }
     published_.swap(canvas_);
     published_width_ = width_;
     published_height_ = height_;
@@ -53,7 +74,21 @@ void* CaptureBackend::CreateWindowTexture(int width, int height)
     auto* texture = new WindowTexture;
     texture->width = static_cast<uint32_t>(width);
     texture->height = static_cast<uint32_t>(height);
-    texture->pixels.resize(static_cast<size_t>(width) * height * 4);
+    if (UsesRenderHost())
+    {
+        texture->host_texture = render_host_.create_texture(
+            render_host_.user_data, texture->width, texture->height);
+        if (!texture->host_texture)
+        {
+            host_failed_ = true;
+            delete texture;
+            return nullptr;
+        }
+    }
+    else
+    {
+        texture->pixels.resize(static_cast<size_t>(width) * height * 4);
+    }
     window_textures_.insert(texture);
     return texture;
 }
@@ -64,6 +99,21 @@ void CaptureBackend::UpdateWindowTexture(
     auto* texture = FindWindowTexture(handle);
     if (!texture || !buff || width <= 0 || height <= 0 || pitch < width * 4)
         return;
+
+    if (UsesRenderHost())
+    {
+        if (render_host_.update_texture(render_host_.user_data,
+                                        texture->host_texture,
+                                        buff,
+                                        static_cast<uint32_t>(width),
+                                        static_cast<uint32_t>(height),
+                                        static_cast<uint32_t>(pitch)) !=
+            ART3M1S_KRKR_STATUS_OK)
+            host_failed_ = true;
+        texture->width = static_cast<uint32_t>(width);
+        texture->height = static_cast<uint32_t>(height);
+        return;
+    }
 
     texture->width = static_cast<uint32_t>(width);
     texture->height = static_cast<uint32_t>(height);
@@ -81,6 +131,8 @@ void CaptureBackend::DestroyWindowTexture(void* handle)
     auto* texture = FindWindowTexture(handle);
     if (!texture)
         return;
+    if (UsesRenderHost() && texture->host_texture)
+        render_host_.destroy_texture(render_host_.user_data, texture->host_texture);
     window_textures_.erase(texture);
     delete texture;
 }
@@ -89,7 +141,21 @@ void CaptureBackend::DrawWindowTexture(
     void* handle, float posX, float posY, float width, float height)
 {
     auto* texture = FindWindowTexture(handle);
-    if (!texture || texture->pixels.empty() || canvas_.empty() || width <= 0 || height <= 0)
+    if (!texture || width <= 0 || height <= 0)
+        return;
+
+    if (UsesRenderHost())
+    {
+        if (render_host_.draw_texture(render_host_.user_data,
+                                      texture->host_texture,
+                                      posX,
+                                      posY,
+                                      width,
+                                      height) != ART3M1S_KRKR_STATUS_OK)
+            host_failed_ = true;
+        return;
+    }
+    if (texture->pixels.empty() || canvas_.empty())
         return;
 
     const int dstLeft = std::max(0, static_cast<int>(std::lround(posX)));

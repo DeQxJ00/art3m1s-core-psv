@@ -7,9 +7,15 @@
 Host
   -> art3m1s_krkr_get_api_v1
   -> src/ffi/krkr_api.rs
-  -> crates/art3m1s-krkr
-  -> C++ krkr host shim
+     -> crates/art3m1s-krkr -> C++ krkr host shim
+     <- private render-host vtable
+     -> art3m1s-render (Metal / Vulkan / GL)
+     -> Host-owned native surface
 ```
+
+C++ shim 与 Rust renderer 之间使用私有、同线程的 native vtable。它只传递纹理
+生命周期和窗口合成命令，不调用 Dart。KRKR 的 TJS/KAG `Window` 仍是逻辑对象，嵌入
+路径不编译 `sdl3_app.cpp`，不初始化 SDL video，也不创建 `SDL_Window`。
 
 ## 构建 feature
 
@@ -29,6 +35,9 @@ const Art3m1sKrkrApiV1 *art3m1s_krkr_get_api_v1(size_t *out_size);
 `runtime_create` 的 game root 可以是 XP3 文件，也可以是游戏目录。目录中存在
 `data.xp3` 时优先以其为入口；没有 `data.xp3` 时接受带 `startup.tjs` 的目录或仅含一个
 根级 XP3 的目录。
+
+`Art3m1sKrkrRuntimeConfigV1.flags` 的低 8 位使用 Art3m1s 统一 backend 编号；`0`
+表示平台默认。Darwin 默认使用 Metal。
 
 `krkr-engine` 会请求 `native-upstream`。当 `KRKRSDL3_SOURCE_DIR` 和
 `KRKRSDL3_BUILD_DIR` 都已配置时，构建真实的 Kirikiri runtime；未配置时暂时回退到
@@ -51,16 +60,16 @@ cargo build --no-default-features --features krkr-engine
 
 - `runtime` 是 `uint64_t` 不透明句柄，只能由 `runtime_create` 产生并由
   `runtime_destroy` 释放一次。
-- `frame_id` 标识一次 `runtime_acquire_frame`；返回的 `pixels` 指向 core 复制的
-  数据，在对应的 `runtime_release_frame` 前有效。
+- `frame_id` 标识一次 `runtime_acquire_frame`；回退路径从 `art3m1s-render` 回读，
+  返回的 `pixels` 指向 core 持有的数据，在对应的 `runtime_release_frame` 前有效。
 - `runtime_poll_audio_command` 返回的 `payload` 指向 core 暂存区，在下一次 poll
   前有效。宿主需要同步复制 PCM。
 - `runtime_submit_audio_consumed` 回传的是当前 stream 自创建或最近一次
   stop/reset 后的绝对已消费 sample frame 数。
 
-core 会复制 native frame 和 audio payload，因此 C++ 借用指针不会直接穿过
-公共 ABI。宿主仍不能并发调用同一个 runtime；创建、推进、输入、音频回传和销毁
-应固定在同一个 owner 线程。
+窗口纹理由 `art3m1s-render` 持有；C++ 像素指针仅在同步的 update callback 内借用，
+不会进入 Dart。core 会复制回读帧和 audio payload。宿主仍不能并发调用同一个
+runtime；创建、推进、输入、音频回传和销毁应固定在同一个 owner 线程。
 
 ## 帧循环
 
@@ -78,18 +87,26 @@ loop:
 runtime_destroy(rt)
 ```
 
-`runtime_tick` 当前每次推进一帧；宿主仍需负责真实帧时钟、显示缩放、扬声器播放和
-输入坐标转换。
+生产显示路径应先用 `runtime_set_external_surface` 绑定 Host 的 IOSurface、Metal
+texture、CAMetalLayer 或对应平台 surface。surface 存在时 `runtime_tick` 会直接经
+`art3m1s-render` 呈现；传入 `(kind=0, handle=null, width=0, height=0)` 可解绑。
+`runtime_acquire_frame` 仅作为无共享 surface 时的 RGBA 回退和诊断路径。
+
+`runtime_tick` 当前每次推进一帧；宿主仍需负责真实帧时钟、扬声器播放和输入坐标
+转换。
 
 ## 已验证范围
 
-2026-09-12 使用 `/Users/alphaly/Downloads/王様恋愛【体験版】/data.xp3` 通过
+2026-09-15 使用 `/Users/alphaly/Downloads/王様恋愛【体験版】/data.xp3` 通过
 core ABI 实测：
 
 - 挂载 `data.xp3` 和 `patch.xp3`，启动 KAG 3.32 / Kirikiri 2.32.2。
 - 注入标题菜单点击并进入 `TIPlugin_Base.ks -> ADV_Start.ks -> 0_1.ks`。
-- 抓取正文首句画面，尺寸 `1920x947`。
+- 无 SDL video/window 启动并抓取 `1920x1080` Metal 回读帧。
+- 同一帧直接呈现到 Host 风格的 BGRA IOSurface，回读与 IOSurface checksum 一致。
 - 读取 4 路音频流、374 个 PCM chunk、`8,177,634` 字节非零 PCM。
 
-尚未完成：真实扬声器播放、任意 Windows `.dll`/`.tpm` 插件、视频帧路径、
-iOS 动态 framework 打包和发布级 rpath 重定位。
+当前直接路径先接管最终窗口纹理与呈现；KRKR 内部 Layer/插件离屏 target、mask 和
+mesh 仍走其软件合成，后续可沿同一 vtable 逐项下沉。尚未完成：真实扬声器播放、
+任意 Windows `.dll`/`.tpm` 插件、视频帧路径、iOS 动态 framework 打包和发布级
+rpath 重定位。
