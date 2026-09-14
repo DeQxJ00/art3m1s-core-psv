@@ -50,7 +50,7 @@ ctt-astcenc = "0.5"
 asb-interpreter = { path = "crates/asb-interpreter", default-features = false, features = ["backend-lua51"] }
 
 [features]
-default = ["gl-backend", "metal-backend", "vulkan-backend", "experimental-eluna", "rfvp-engine"]
+default = ["gl-backend", "metal-backend", "vulkan-backend", "experimental-eluna", "rfvp-engine", "krkr-engine"]
 gl-backend = ["art3m1s-render/gl"]
 metal-backend = ["runtime-shader", "art3m1s-render/metal"]
 vulkan-backend = ["runtime-shader", "art3m1s-render/vulkan"]

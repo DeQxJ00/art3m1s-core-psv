@@ -179,8 +179,7 @@ type LogNextBytesFn = unsafe extern "C" fn() -> usize;
 type PollLogFn = unsafe extern "C" fn(output: *mut u8, capacity: usize) -> usize;
 type RuntimeSetTextReplacementsFn =
     unsafe extern "C" fn(runtime: u64, blob: *const u8, blob_size: usize) -> i32;
-type RuntimeSetTextTranslationEnabledFn =
-    unsafe extern "C" fn(runtime: u64, enabled: i32) -> i32;
+type RuntimeSetTextTranslationEnabledFn = unsafe extern "C" fn(runtime: u64, enabled: i32) -> i32;
 type RuntimeSubmitTextTranslationFn = unsafe extern "C" fn(
     runtime: u64,
     serial: u64,
@@ -865,9 +864,7 @@ fn drain_host_text_events(runtime: &mut ApiRuntime) {
 fn text_event_record_len(event: &RfvpHostEvent) -> usize {
     match event {
         RfvpHostEvent::TextTranslation { source, ruby, .. } => {
-            ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE
-                + source.len()
-                + ruby.as_deref().map_or(0, str::len)
+            ART3M1S_RFVP_TEXT_EVENT_HEADER_SIZE + source.len() + ruby.as_deref().map_or(0, str::len)
         }
     }
 }
@@ -898,11 +895,7 @@ fn encode_text_event(event: &RfvpHostEvent, out: *mut u8, capacity: usize) -> Op
             header[28..32].copy_from_slice(&(ruby.len() as u32).to_le_bytes());
             unsafe {
                 ptr::copy_nonoverlapping(header.as_ptr(), out, header.len());
-                ptr::copy_nonoverlapping(
-                    source.as_ptr(),
-                    out.add(header.len()),
-                    source.len(),
-                );
+                ptr::copy_nonoverlapping(source.as_ptr(), out.add(header.len()), source.len());
                 ptr::copy_nonoverlapping(
                     ruby.as_ptr(),
                     out.add(header.len() + source.len()),
@@ -927,11 +920,7 @@ unsafe extern "C" fn runtime_next_text_event_size(runtime: u64) -> usize {
     .unwrap_or(0)
 }
 
-unsafe extern "C" fn runtime_poll_text_events(
-    runtime: u64,
-    out: *mut u8,
-    capacity: u32,
-) -> u32 {
+unsafe extern "C" fn runtime_poll_text_events(runtime: u64, out: *mut u8, capacity: u32) -> u32 {
     guard_u32(|| {
         if out.is_null() {
             return 0;
@@ -941,7 +930,8 @@ unsafe extern "C" fn runtime_poll_text_events(
             let capacity = capacity as usize;
             let mut written = 0usize;
             while let Some(event) = runtime.pending_text_events.front() {
-                let Some(record_len) = encode_text_event(event, out.wrapping_add(written), capacity - written)
+                let Some(record_len) =
+                    encode_text_event(event, out.wrapping_add(written), capacity - written)
                 else {
                     break;
                 };
@@ -1022,11 +1012,7 @@ unsafe extern "C" fn runtime_set_damage_visualization(runtime: u64, enabled: i32
     })
 }
 
-unsafe extern "C" fn runtime_profiler_snapshot(
-    runtime: u64,
-    out: *mut u8,
-    capacity: u32,
-) -> i32 {
+unsafe extern "C" fn runtime_profiler_snapshot(runtime: u64, out: *mut u8, capacity: u32) -> i32 {
     catch_unwind(AssertUnwindSafe(|| {
         RUNTIMES.with_mut(runtime, 0, |runtime| {
             let json = runtime.runtime.profiler_snapshot_json();
