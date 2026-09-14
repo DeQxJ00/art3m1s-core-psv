@@ -638,24 +638,42 @@ pub fn decode_audio_to_wav(source: Arc<dyn MediaSource>, output: &Path) -> Resul
         let mut frame = ffmpeg::frame::Audio::empty();
         match decoder.receive_frame(&mut frame) {
             Ok(()) => {
+                let input_layout =
+                    normalized_audio_layout(frame.channel_layout(), frame.channels());
+                if frame.channel_layout() != input_layout {
+                    frame.set_channel_layout(input_layout);
+                }
+                let input_rate = frame.rate().max(1);
                 let needs_resampler = resampler.as_ref().is_none_or(|resampler| {
                     resampler.input().format != frame.format()
-                        || resampler.input().channel_layout != frame.channel_layout()
-                        || resampler.input().rate != frame.rate()
+                        || resampler.input().channel_layout != input_layout
+                        || resampler.input().rate != input_rate
                 });
                 if needs_resampler {
                     resampler = Some(
-                        frame
-                            .resampler(output_format, output_layout, output_sample_rate)
-                            .map_err(|error| error.to_string())?,
+                        resampling::Context::get(
+                            frame.format(),
+                            input_layout,
+                            input_rate,
+                            output_format,
+                            output_layout,
+                            output_sample_rate,
+                        )
+                        .map_err(|error| format!("audio resampler create failed: {error}"))?,
                     );
                 }
-                let mut converted = ffmpeg::frame::Audio::empty();
+                let output_capacity = ((frame.samples() as u64)
+                    .saturating_mul(u64::from(output_sample_rate))
+                    / u64::from(input_rate))
+                .saturating_add(256)
+                .min(usize::MAX as u64) as usize;
+                let mut converted =
+                    ffmpeg::frame::Audio::new(output_format, output_capacity, output_layout);
                 resampler
                     .as_mut()
                     .ok_or_else(|| "audio resampler is unavailable".to_string())?
                     .run(&frame, &mut converted)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| format!("audio resampler run failed: {error}"))?;
                 let samples = converted.plane::<i16>(0);
                 for sample in samples {
                     writer
@@ -706,6 +724,17 @@ pub fn decode_audio_to_wav(source: Arc<dyn MediaSource>, output: &Path) -> Resul
     writer.flush().map_err(|error| error.to_string())?;
     let _ = (source_box, io_state);
     Ok(true)
+}
+
+fn normalized_audio_layout(layout: ChannelLayout, channels: u16) -> ChannelLayout {
+    if !layout.is_empty() {
+        return layout;
+    }
+    match channels {
+        0 => ChannelLayout::STEREO,
+        1 => ChannelLayout::MONO,
+        channels => ChannelLayout::default(i32::from(channels)),
+    }
 }
 
 fn write_wav_header(
