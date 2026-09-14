@@ -1,11 +1,7 @@
 #include "art3m1s_krkr.h"
 #include "capture_backend.h"
+#include "headless_platform.h"
 #include "host_audio.h"
-
-#define SDL_MAIN_USE_CALLBACKS
-#define SDL_MAIN_NOIMPL
-#include <SDL3/SDL_main.h>
-#include <SDL3/SDL_video.h>
 
 #include <algorithm>
 #include <cctype>
@@ -162,30 +158,6 @@ std::string ResolveResourceExecutable()
 #endif
 }
 
-void DestroyWindowTextures()
-{
-    for (tjs_int index = 0; index < TVPGetWindowCount(); ++index)
-    {
-        TVPWindow* window = TVPGetWindowListAt(index);
-        if (window && window->pSprite && window->pSprite->texture)
-            krkrsdl3::TVPDestroyTexture(window->pSprite);
-    }
-}
-
-void RecreateWindowTextures()
-{
-    for (tjs_int index = 0; index < TVPGetWindowCount(); ++index)
-    {
-        TVPWindow* window = TVPGetWindowListAt(index);
-        if (window && window->pSprite && !window->pSprite->texture)
-        {
-            krkrsdl3::TVPCreateTexture(*window->pSprite);
-            if (window->pSprite->texture)
-                window->UpdateContent();
-        }
-    }
-}
-
 uint32_t PreferredKind(const Art3m1sKrkrProbeV1& probe)
 {
     if (probe.has_data_xp3)
@@ -320,32 +292,14 @@ int32_t RuntimeCreateImpl(const char* game_root_utf8,
         nullptr,
     };
 
-    const SDL_AppResult result =
-        SDL_AppInit(nullptr, static_cast<int>(argv.size() - 1), argv.data());
-    if (result == SDL_APP_FAILURE)
+    auto* capture = new art3m1s::krkr::CaptureBackend;
+    if (!Art3m1sKrkrHeadlessInit(
+            static_cast<int>(argv.size() - 1), argv.data(), capture))
         return ART3M1S_KRKR_STATUS_ENGINE;
     if (!Application || TVPGetWindowCount() <= 0)
     {
-        SDL_AppQuit(nullptr, SDL_APP_FAILURE);
+        Art3m1sKrkrHeadlessQuit();
         return ART3M1S_KRKR_STATUS_ENGINE;
-    }
-
-    // SDL_AppInit creates the first window with the SDL software backend.
-    // Release those handles before deleting the backend, then create equivalent
-    // capture-backed textures for every existing window.
-    DestroyWindowTextures();
-    krkrsdl3::TVPShutdownRenderBackend();
-    auto* capture = new art3m1s::krkr::CaptureBackend;
-    krkrsdl3::TVPSetRenderBackend(capture);
-    RecreateWindowTextures();
-
-    // The host presents captured frames itself; the SDL window SDL_AppInit
-    // showed must not linger as a blank top-level window next to the host.
-    if (int window_count = 0; SDL_Window** windows = SDL_GetWindows(&window_count))
-    {
-        for (int index = 0; index < window_count; ++index)
-            SDL_HideWindow(windows[index]);
-        SDL_free(windows);
     }
 
     tjs_int width = 0;
@@ -353,9 +307,7 @@ int32_t RuntimeCreateImpl(const char* game_root_utf8,
     TVPGetWindowListAt(0)->GetSize(width, height);
     if (width <= 0 || height <= 0)
     {
-        delete capture;
-        krkrsdl3::TVPSetRenderBackend(nullptr);
-        SDL_AppQuit(nullptr, SDL_APP_FAILURE);
+        Art3m1sKrkrHeadlessQuit();
         return ART3M1S_KRKR_STATUS_ENGINE;
     }
 
@@ -379,7 +331,7 @@ void RuntimeDestroyImpl(uint64_t handle)
     if (!runtime)
         return;
     runtime->capture = nullptr;
-    SDL_AppQuit(nullptr, SDL_APP_SUCCESS);
+    Art3m1sKrkrHeadlessQuit();
     art3m1s::krkr::ResetAudioHost();
     delete runtime;
 }
@@ -475,10 +427,7 @@ int32_t RuntimeTickImpl(uint64_t handle)
     Runtime* runtime = GetRuntime(handle);
     if (!runtime)
         return ART3M1S_KRKR_STATUS_INVALID_HANDLE;
-    const SDL_AppResult result = SDL_AppIterate(nullptr);
-    if (result == SDL_APP_FAILURE)
-        return ART3M1S_KRKR_STATUS_ENGINE;
-    if (result == SDL_APP_SUCCESS)
+    if (!Art3m1sKrkrHeadlessIterate())
         runtime->exit_requested = true;
     return ART3M1S_KRKR_STATUS_OK;
 }
@@ -576,7 +525,7 @@ int32_t RuntimeCreateNoThrow(const char* game_root_utf8,
         {
             try
             {
-                SDL_AppQuit(nullptr, SDL_APP_FAILURE);
+                Art3m1sKrkrHeadlessQuit();
             }
             catch (...)
             {
