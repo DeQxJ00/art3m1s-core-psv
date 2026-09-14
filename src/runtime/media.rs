@@ -89,12 +89,7 @@ impl CoreRuntime {
             self.clear_video_layer_texture(&id);
         }
         hm::emit(Kind::AudioStopAll, hm::EmptyPayload {});
-        #[cfg(not(feature = "ffmpeg"))]
         hm::emit(Kind::VideoStopAll, hm::EmptyPayload {});
-        #[cfg(feature = "ffmpeg")]
-        if !self.media_session.is_enabled() {
-            hm::emit(Kind::VideoStopAll, hm::EmptyPayload {});
-        }
         self.refresh_sound_info_snapshot();
     }
 

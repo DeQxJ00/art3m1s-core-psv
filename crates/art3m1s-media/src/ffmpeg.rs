@@ -9,10 +9,13 @@ use crate::{
 };
 use ffmpeg::format::{self, Pixel};
 use ffmpeg::media::Type;
-use ffmpeg::software::scaling;
-use ffmpeg::{Error, Packet, Rational};
+use ffmpeg::software::{resampling, scaling};
+use ffmpeg::{ChannelLayout, Error, Packet, Rational};
 use ffmpeg_next as ffmpeg;
 use std::ffi::{c_int, c_void};
+use std::fs::File;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Once};
 use std::time::Duration;
@@ -554,6 +557,184 @@ fn checked_plane_len(width: u32, height: u32) -> Result<usize, String> {
     (width as usize)
         .checked_mul(height as usize)
         .ok_or_else(|| "video plane size overflow".to_string())
+}
+
+/// Decodes the best audio stream from `source` into a canonical stereo PCM WAV.
+///
+/// Returning `Ok(false)` means the media contains no decodable audio stream.
+/// The caller owns the output path and is responsible for deleting it.
+pub fn decode_audio_to_wav(source: Arc<dyn MediaSource>, output: &Path) -> Result<bool, String> {
+    initialize();
+    let source_box = Box::new(Arc::clone(&source));
+    let mut io_state = Box::new(SourceIoState { source, offset: 0 });
+    let io_pointer = (&mut *io_state as *mut SourceIoState).cast::<c_void>();
+    let avio_buffer = unsafe { ffmpeg::ffi::av_malloc(AVIO_BUFFER_SIZE) }.cast::<u8>();
+    if avio_buffer.is_null() {
+        return Err("unable to allocate audio AVIO buffer".to_string());
+    }
+    let avio = unsafe {
+        ffmpeg::ffi::avio_alloc_context(
+            avio_buffer,
+            AVIO_BUFFER_SIZE as c_int,
+            0,
+            io_pointer,
+            Some(read_packet),
+            None,
+            Some(seek_packet),
+        )
+    };
+    if avio.is_null() {
+        unsafe { ffmpeg::ffi::av_free(avio_buffer.cast()) };
+        return Err("unable to allocate audio AVIO context".to_string());
+    }
+    let mut format = unsafe { ffmpeg::ffi::avformat_alloc_context() };
+    if format.is_null() {
+        unsafe { free_avio(avio) };
+        return Err("unable to allocate audio format context".to_string());
+    }
+    unsafe {
+        (*format).pb = avio;
+        (*format).flags |= ffmpeg::ffi::AVFMT_FLAG_CUSTOM_IO;
+    }
+    let open_result = unsafe {
+        ffmpeg::ffi::avformat_open_input(&mut format, ptr::null(), ptr::null_mut(), ptr::null_mut())
+    };
+    if open_result < 0 {
+        unsafe { free_avio(avio) };
+        return Err(Error::from(open_result).to_string());
+    }
+    let stream_info_result =
+        unsafe { ffmpeg::ffi::avformat_find_stream_info(format, ptr::null_mut()) };
+    if stream_info_result < 0 {
+        unsafe { ffmpeg::ffi::avformat_close_input(&mut format) };
+        return Err(Error::from(stream_info_result).to_string());
+    }
+
+    let mut input = unsafe { format::context::Input::wrap(format) };
+    let Some(stream) = input.streams().best(Type::Audio) else {
+        return Ok(false);
+    };
+    let stream_index = stream.index();
+    let decoder_context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|error| error.to_string())?;
+    let mut decoder = decoder_context
+        .decoder()
+        .audio()
+        .map_err(|error| error.to_string())?;
+    let output_sample_rate = 48_000;
+    let output_format = format::Sample::I16(format::sample::Type::Packed);
+    let output_layout = ChannelLayout::STEREO;
+    let mut resampler: Option<resampling::Context> = None;
+    let mut eof = false;
+
+    let file = File::create(output).map_err(|error| error.to_string())?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(&[0u8; 44])
+        .map_err(|error| error.to_string())?;
+    let mut data_len = 0u64;
+
+    loop {
+        let mut frame = ffmpeg::frame::Audio::empty();
+        match decoder.receive_frame(&mut frame) {
+            Ok(()) => {
+                let needs_resampler = resampler.as_ref().is_none_or(|resampler| {
+                    resampler.input().format != frame.format()
+                        || resampler.input().channel_layout != frame.channel_layout()
+                        || resampler.input().rate != frame.rate()
+                });
+                if needs_resampler {
+                    resampler = Some(
+                        frame
+                            .resampler(output_format, output_layout, output_sample_rate)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                let mut converted = ffmpeg::frame::Audio::empty();
+                resampler
+                    .as_mut()
+                    .ok_or_else(|| "audio resampler is unavailable".to_string())?
+                    .run(&frame, &mut converted)
+                    .map_err(|error| error.to_string())?;
+                let samples = converted.plane::<i16>(0);
+                for sample in samples {
+                    writer
+                        .write_all(&sample.to_le_bytes())
+                        .map_err(|error| error.to_string())?;
+                }
+                data_len = data_len.saturating_add((samples.len() * 2) as u64);
+            }
+            Err(Error::Eof) => break,
+            Err(Error::Other { errno }) if errno == libc::EAGAIN => {
+                if eof {
+                    break;
+                }
+                let mut packet = Packet::empty();
+                match packet.read(&mut input) {
+                    Ok(()) if packet.stream() != stream_index => continue,
+                    Ok(()) => decoder
+                        .send_packet(&packet)
+                        .map_err(|error| error.to_string())?,
+                    Err(Error::Eof) => {
+                        eof = true;
+                        decoder.send_eof().map_err(|error| error.to_string())?;
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    if data_len == 0 {
+        drop(writer);
+        let _ = std::fs::remove_file(output);
+        return Ok(false);
+    }
+    if data_len > u32::MAX as u64 - 36 {
+        return Err("decoded audio is too large for a WAV file".to_string());
+    }
+    writer
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    write_wav_header(
+        &mut writer,
+        data_len as u32,
+        output_sample_rate,
+        output_layout.channels() as u16,
+    )?;
+    writer.flush().map_err(|error| error.to_string())?;
+    let _ = (source_box, io_state);
+    Ok(true)
+}
+
+fn write_wav_header(
+    writer: &mut BufWriter<File>,
+    data_len: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<(), String> {
+    let byte_rate = sample_rate
+        .checked_mul(u32::from(channels))
+        .and_then(|value| value.checked_mul(2))
+        .ok_or_else(|| "WAV byte rate overflow".to_string())?;
+    let block_align = channels
+        .checked_mul(2)
+        .ok_or_else(|| "WAV block align overflow".to_string())?;
+    writer
+        .write_all(b"RIFF")
+        .and_then(|_| writer.write_all(&(36 + data_len).to_le_bytes()))
+        .and_then(|_| writer.write_all(b"WAVEfmt "))
+        .and_then(|_| writer.write_all(&16u32.to_le_bytes()))
+        .and_then(|_| writer.write_all(&1u16.to_le_bytes()))
+        .and_then(|_| writer.write_all(&channels.to_le_bytes()))
+        .and_then(|_| writer.write_all(&sample_rate.to_le_bytes()))
+        .and_then(|_| writer.write_all(&byte_rate.to_le_bytes()))
+        .and_then(|_| writer.write_all(&block_align.to_le_bytes()))
+        .and_then(|_| writer.write_all(&16u16.to_le_bytes()))
+        .and_then(|_| writer.write_all(b"data"))
+        .and_then(|_| writer.write_all(&data_len.to_le_bytes()))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

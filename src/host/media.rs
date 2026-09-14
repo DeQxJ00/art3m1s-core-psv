@@ -26,6 +26,7 @@ pub enum HostMediaCommandKind {
     AudioStopAll,
     VideoPlay,
     VideoStopAll,
+    VideoAudioPlay,
 }
 
 impl HostMediaCommandKind {
@@ -45,6 +46,7 @@ impl HostMediaCommandKind {
             Self::AudioStopAll => "audio_stop_all",
             Self::VideoPlay => "video_play",
             Self::VideoStopAll => "video_stop_all",
+            Self::VideoAudioPlay => "video_audio_play",
         }
     }
 }
@@ -168,6 +170,14 @@ pub struct VideoPlay<'a> {
     pub file: &'a str,
     pub resolved_file: Option<&'a str>,
     pub skippable: bool,
+    #[serde(rename = "loop")]
+    pub loop_play: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VideoAudioPlay<'a> {
+    pub id: Option<&'a str>,
+    pub path: &'a str,
     #[serde(rename = "loop")]
     pub loop_play: bool,
 }
