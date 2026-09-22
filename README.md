@@ -1,9 +1,11 @@
 # art3m1s-core
 
 Artemis 视觉小说引擎的 Rust 兼容运行时：解释 ASB/IET 脚本、维护场景与图层树、
-渲染文本与特效，经 C FFI 与宿主连接。本仓库的生产宿主是 `host-direct/`，
+渲染文本与特效，经 C FFI 与宿主连接。配套 [PSV 主项目](https://github.com/DeQxJ00/Art3m1sPSV) 的生产宿主是 `host-direct/`，
 由 core 的原生 GXM 后端组织绘制，宿主执行 GPU 提交并提供文件与媒体回调。
-根目录 `core/` 是当前生产核心；旧独立工作区仅作历史回溯。
+本仓库由 PSV 主项目以 `core/` Git 子模块引用。维护分支为 `codex/psv`；
+`master` 保留上游版本。首次导入的上游基线为 `e54a5f9495febbce2b6c992d61ed588c787c99df`。
+上游修复在 `codex/upstream-sync` 分批验证，再合入 `codex/psv`；不直接用上游最新版覆盖 PSV 核心。
 core 本身不创建窗口，不做音视频解码。
 
 ## 功能
@@ -33,17 +35,17 @@ doc/                  宿主接入指南与 FFI 参考
 
 ## 构建与测试
 
-PSV 完整构建从仓库根目录运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1`，
+PSV 完整构建从配套主项目根目录运行 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1`，
 先将本目录编译为 `libart3m1s_core.a`，再链接宿主并输出 VPK 到 `build/releases/`。
 PSV 使用 Lua 5.1；启用 `gl-backend,gxm-native-renderer,gxm-text-epoch,gxm-menu-key-alias,gxm-builtin-effects`，
 关闭默认 features。其中 `gl-backend` 保留共享资源与运行时接口，实际绘制走原生 GXM。
 
-Windows 逻辑回归入口为根目录 `scripts/check-direct-effects-core.ps1`，包含生产 GXM feature 组合。
+Windows 逻辑回归入口为配套主项目根目录 `scripts/check-direct-effects-core.ps1`，包含生产 GXM feature 组合。
 以下为 core 的通用桌面开发入口：
 
 ```bash
 cargo fmt --check
-./scripts/test-all.sh
+bash scripts/test-all.sh
 cargo build --release
 ```
 
