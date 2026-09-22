@@ -42,6 +42,9 @@ impl CoreRuntime {
         self.save_screenshot = None;
         self.loaded_font_face = None;
         self.pending_dialog = None;
+        self.gameplay_save_checkpoint = None;
+        self.pending_load_resume = None;
+        self.pending_message_text = None;
         self.clear_pending_text_translation();
         self.clear_emote_state("project reload");
         self.install_interpreter(project.create_interpreter());
@@ -312,6 +315,7 @@ fn event_requires_host_pause(e: &Event) -> bool {
         // script can execute its following cleanup/exit instructions.
         Event::Reset
             | Event::GoTitle
+            | Event::LoadGame { .. }
             | Event::Wait { .. }
             | Event::YesNo { .. }
             | Event::ShowDialog { .. }
@@ -680,4 +684,19 @@ boot_marker = (boot_marker or 0) + 1
         assert!(!runtime.is_exit_requested(), "旧队列尾部 exit 不得执行");
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn load_pauses_before_old_script_fallthrough() {
+        assert!(event_requires_host_pause(&Event::LoadGame {
+            file: "slot.dat".into(),
+            trans_type: Some(0),
+        }));
+    }
+
+    #[test]
+    fn save_pauses_so_the_snapshot_is_not_a_later_wait() {
+        assert!(event_requires_host_pause(&Event::SaveGame {
+            file: "slot.dat".into(),
+        }));
+    }
+
 }

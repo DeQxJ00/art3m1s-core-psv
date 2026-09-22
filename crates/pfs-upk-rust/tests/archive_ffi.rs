@@ -240,3 +240,31 @@ fn single_archive_auto_encoding_preserves_utf8_and_legacy_names() {
         pfs_upk::pfs_close(archive);
     }
 }
+
+#[test]
+fn standalone_patch_volumes_keep_their_own_names_and_payloads() {
+    let temp = TempDir::new("mixed_volumes");
+    let (legacy, _, _) = encoding_rs::SHIFT_JIS.encode("sound/着信.ogg");
+    let entries: [(&str, &[u8], &[u8]); 3] = [
+        ("game.pfs", legacy.as_ref(), b"legacy-base"),
+        ("game.pfs.000", "sound/着信.ogg".as_bytes(), b"utf8-patch"),
+        ("game.pfs.001", b"sound/voice.ogg", b"ascii-patch"),
+    ];
+    for (file, name, payload) in entries {
+        std::fs::write(temp.0.join(file), build_pf6(&[(name, payload)])).unwrap();
+    }
+    for (file, expected_name, payload) in [
+        ("game.pfs", "sound/着信.ogg", b"legacy-base".as_slice()),
+        ("game.pfs.000", "sound/着信.ogg", b"utf8-patch".as_slice()),
+        ("game.pfs.001", "sound/voice.ogg", b"ascii-patch".as_slice()),
+    ] {
+        let path = temp.0.join(file);
+        let archive = unsafe { pfs_upk::pfs_open_single(cstring(path.to_str().unwrap()).as_ptr(), cstring("auto").as_ptr()) };
+        assert!(!archive.is_null(), "{file}");
+        unsafe {
+            assert_eq!(entry_path(archive, 0), expected_name);
+            assert_eq!(read_all(archive, expected_name), payload);
+            pfs_upk::pfs_close(archive);
+        }
+    }
+}
