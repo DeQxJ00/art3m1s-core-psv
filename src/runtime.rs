@@ -4,18 +4,30 @@
 
 use crate::audio::AudioBackend;
 use crate::backend::gl::platform::{self, GfxBackend};
+#[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
 use crate::backend::gl::{GlRenderer, GlTextureProvider, ShaderProfile};
+#[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+use crate::backend::gxm::{GxmRenderer as RuntimeRenderer, GxmTextureProvider as RuntimeTextureProvider};
+#[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
+type RuntimeRenderer = GlRenderer;
+#[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
+type RuntimeTextureProvider = GlTextureProvider;
 use crate::compositor::Compositor;
 use crate::text::TextRenderer;
 use crate::video::VideoBackend;
 use asb_interpreter::event::WaitReason;
+#[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
 use glow::HasContext;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16};
+
+const NO_SCRIPT_STATUS_REQUEST: u16 = 256;
 use std::sync::{Arc, Mutex};
 
 mod callbacks;
+#[cfg(any(all(target_os = "vita", feature = "gxm-backend"), test))]
+mod surface_loader;
 mod control;
 mod dialog;
 pub(crate) mod emote;
@@ -24,7 +36,12 @@ mod input;
 mod layer_info;
 mod magic_path;
 mod media;
+mod png_comments;
 mod project;
+#[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
+mod render;
+#[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+#[path = "runtime/render_gxm.rs"]
 mod render;
 mod save_io;
 mod script;
@@ -55,12 +72,15 @@ struct InlineEventFrame {
 }
 
 pub struct CoreRuntime {
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     gl: Rc<glow::Context>,
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     fbo: glow::Framebuffer,
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     fbo_tex: glow::Texture,
 
-    renderer: GlRenderer,
-    texture_provider: GlTextureProvider,
+    renderer: RuntimeRenderer,
+    texture_provider: RuntimeTextureProvider,
     compositor: Compositor,
     /// 上一帧已经提交的逻辑场景。转场源帧需保留旧图像层，同时按当前状态
     /// 剔除刚隐藏或删除的消息文字，不能直接复用已经烘入文字的 FBO。
@@ -83,6 +103,7 @@ pub struct CoreRuntime {
     video_finished: Arc<AtomicBool>,
     debug_skip_active: Arc<AtomicBool>,
     script_status: Arc<AtomicU8>,
+    script_status_request: Arc<AtomicU16>,
     magic_paths: Arc<magic_path::MagicPathTable>,
     layer_info: callbacks::LayerInfoTable,
     /// Whether interpreter-visible `get_layer_info` data must be rebuilt.
@@ -92,6 +113,9 @@ pub struct CoreRuntime {
     /// Conservative per-tick invalidation for CPU-side frame construction.
     /// Texture revisions are checked separately immediately before rendering.
     frame_visual_dirty: bool,
+    message_cache_enabled: bool,
+    text_epoch_enabled: bool,
+    gxm_keyless_enabled: bool,
     emote: emote::SharedEmoteState,
 
     stage_w: u32,
@@ -142,57 +166,56 @@ pub struct CoreRuntime {
     was_click_wait: bool,
     /// 本帧是否派发了剧情文本（用于已读判定：只在文本展示后的点击等待处标记已读）。
     scenario_text_shown: bool,
-    /// Click/key-wait interpreter snapshot. Numbered saves taken from a nested
-    /// menu persist this instead of the menu program counter.
-    gameplay_save_checkpoint: Option<crate::save::GameplayCheckpoint>,
-    /// After `[load]`, keep running onLoad follow-up until this wait is restored.
-    pending_load_resume: Option<PendingLoadResume>,
-    /// Message-page snapshot restored once onLoad follow-up has rebuilt the MW.
-    pending_message_text: Option<crate::save::MessageTextSnapshot>,
     /// 已读记录自上次持久化后是否有新增（syssave 时落 aread.dat）。
     read_dirty: bool,
     /// Saved host GL context while libmpv is rendering directly into a
     /// runtime-owned video-layer FBO. Leases are explicit and non-nestable.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     video_gl_saved_context: Option<platform::SavedGlContext>,
     profiler: crate::profiler::RuntimeProfiler,
     /// Must drop after every GL-owned field. Runtime destruction first makes
     /// this context current, then renderer/provider drops can release objects.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     gl_ctx: Box<dyn platform::GLPlatformContext>,
-}
-
-/// Restored click-wait that must not run until onLoad follow-up returns.
-struct PendingLoadResume {
-    script: String,
-    line: usize,
-    stack_len: usize,
 }
 
 impl CoreRuntime {
     /// Create a new runtime with the given rendering backend.
-
     pub fn create(
         stage_width: u32,
         stage_height: u32,
         backend: GfxBackend,
     ) -> Result<Self, String> {
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
         let (gl, gl_ctx, effective_backend) =
             platform::create_offscreen_context(backend, stage_width, stage_height)?;
 
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
         let (fbo, fbo_tex) = unsafe {
+            crate::core_warn!("Creating stage FBO {}x{}", stage_width, stage_height);
             platform::create_fbo_target(&gl, stage_width as i32, stage_height as i32)
                 .map_err(|e| format!("FBO: {e}"))?
         };
 
+        #[cfg(all(target_os = "vita", not(feature = "gxm-backend")))]
+        let profile = ShaderProfile::Vita100;
+        #[cfg(not(target_os = "vita"))]
         let profile = match effective_backend {
             GfxBackend::Cgl => ShaderProfile::GlCore330,
             GfxBackend::Angle(_) => ShaderProfile::Gles300,
         };
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
         let renderer = GlRenderer::new(gl.clone(), stage_width, stage_height, profile)
             .map_err(|e| format!("创建渲染器失败: {e}"))?;
+        #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+        let renderer = RuntimeRenderer::new(stage_width, stage_height)?;
 
         // load_project 时会带 magic-path 解析重建 provider；这里先建一个
         // 无字节源的裸 provider 占位即可，不必接 FFI 源。
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
         let texture_provider = GlTextureProvider::new(gl.clone());
+        #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+        let texture_provider = RuntimeTextureProvider::new();
 
         let compositor = Compositor::new();
         let audio = Box::new(crate::audio::AudioStateBackend::new()) as Box<dyn AudioBackend>;
@@ -205,13 +228,17 @@ impl CoreRuntime {
         let video_finished = Arc::new(AtomicBool::new(false));
         let debug_skip_active = Arc::new(AtomicBool::new(false));
         let script_status = Arc::new(AtomicU8::new(0));
+        let script_status_request = Arc::new(AtomicU16::new(NO_SCRIPT_STATUS_REQUEST));
         let magic_paths: Arc<magic_path::MagicPathTable> = Arc::new(Mutex::new(HashMap::new()));
         let layer_info = Arc::new(Mutex::new(layer_info::LayerQueryState::default()));
         let emote = Arc::new(Mutex::new(emote::EmoteState::default()));
 
         Ok(Self {
+            #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
             gl,
+            #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
             fbo,
+            #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
             fbo_tex,
             renderer,
             texture_provider,
@@ -232,10 +259,14 @@ impl CoreRuntime {
             video_finished,
             debug_skip_active,
             script_status,
+            script_status_request,
             magic_paths: Arc::clone(&magic_paths),
             layer_info: Arc::clone(&layer_info),
             layer_info_dirty: true,
             frame_visual_dirty: true,
+            message_cache_enabled: true,
+            text_epoch_enabled: false,
+            gxm_keyless_enabled: true,
             emote,
             stage_w: stage_width,
             stage_h: stage_height,
@@ -268,12 +299,11 @@ impl CoreRuntime {
             script_forced_stop: false,
             was_click_wait: false,
             scenario_text_shown: false,
-            gameplay_save_checkpoint: None,
-            pending_load_resume: None,
-            pending_message_text: None,
             read_dirty: false,
+            #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
             video_gl_saved_context: None,
             profiler: crate::profiler::RuntimeProfiler::new(),
+            #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
             gl_ctx,
         })
     }
@@ -302,8 +332,54 @@ impl CoreRuntime {
         pixels
     }
 
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn advance_and_render_into(&mut self, delta_ms: u64, _out_pixels: &mut [u8]) -> usize {
+        let _ = self.advance_and_present(delta_ms);
+        0
+    }
+
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn set_external_surface(
+        &mut self,
+        kind: i32,
+        _handle: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        self.external_surface_size = Some((width as i32, height as i32));
+        self.external_surface_kind = Some(kind);
+        self.last_submitted_frame = None;
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn clear_external_surface(&mut self) {
+        self.external_surface_size = None;
+        self.external_surface_kind = None;
+    }
+
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn advance_and_present(&mut self, delta_ms: u64) -> Result<bool, String> {
+        let mut profile = self.begin_profile_frame();
+        self.advance_logic(delta_ms, &mut profile);
+        let repaint = self.render_current_frame(&mut profile).is_some();
+        self.frame_visual_dirty = false;
+        self.clear_input_edges();
+        self.finish_profile_frame(&mut profile);
+        Ok(repaint)
+    }
+
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn advance_without_render(&mut self, delta_ms: u64) {
+        let mut profile = self.begin_profile_frame();
+        self.advance_logic(delta_ms, &mut profile);
+        self.clear_input_edges();
+        self.finish_profile_frame(&mut profile);
+    }
+
     /// Advance logic and render directly into a caller-owned RGBA buffer.
     /// Returns the number of bytes written, or zero when the buffer is too small.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn advance_and_render_into(&mut self, delta_ms: u64, out_pixels: &mut [u8]) -> usize {
         if out_pixels.len() < self.pixel_buffer_size() {
             return 0;
@@ -337,6 +413,7 @@ impl CoreRuntime {
     }
 
     /// Configures a host-owned platform texture as the presentation target.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn set_external_surface(
         &mut self,
         kind: i32,
@@ -362,6 +439,7 @@ impl CoreRuntime {
         result
     }
 
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn clear_external_surface(&mut self) {
         let saved_ctx = self.gl_ctx.bind_save();
         self.gl_ctx.clear_external_surface();
@@ -372,6 +450,7 @@ impl CoreRuntime {
 
     /// Advances logic and presents a changed frame through the host texture.
     /// Returns `Ok(false)` when no visual update was necessary.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn advance_and_present(&mut self, delta_ms: u64) -> Result<bool, String> {
         let mut profile = self.begin_profile_frame();
         let saved_ctx = self.gl_ctx.bind_save();
@@ -389,7 +468,7 @@ impl CoreRuntime {
                 // internal FBO damage-aware, but copy its complete final image
                 // to Android window surfaces. IOSurface is single-buffered and
                 // can safely retain untouched regions.
-                let present_damage = if self.external_surface_kind == Some(1) {
+                let present_damage = if matches!(self.external_surface_kind, Some(1 | 4)) {
                     None
                 } else {
                     repaint.damage()
@@ -426,6 +505,7 @@ impl CoreRuntime {
     /// being consumed by the host. This keeps `onEnterFrame`-driven systems
     /// such as E-Mote lip sync on the audio clock without paying for a GPU
     /// readback whose pixels cannot be displayed yet.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn advance_without_render(&mut self, delta_ms: u64) {
         let mut profile = self.begin_profile_frame();
         let saved_ctx = self.gl_ctx.bind_save();
@@ -491,8 +571,10 @@ impl CoreRuntime {
         self.pointer_hit_test_dirty |= layer_info_clock_changed;
         // get_layer_info 必须反映本帧缓动后的实际位置，而不是缓动开始前的
         // 静态 LayerProps。下一帧输入回调执行 Lua 前会读取这份快照。
-        if self.layer_info_dirty || layer_info_clock_changed {
+        if self.layer_info_dirty {
             self.sync_layer_info_all();
+        } else if layer_info_clock_changed {
+            self.layer_info.lock().unwrap().sync_clock(&self.compositor, |file| self.texture_provider.cached_info(file));
         }
         self.dispatch_tween_handlers();
         profile.compositor_ns = crate::profiler::FrameProfile::elapsed(compositor_started);
@@ -528,8 +610,78 @@ impl CoreRuntime {
         self.profiler.set_enabled(enabled);
     }
 
+    /// Diagnostic toggle for the full-frame GXM path only; desktop keys remain enabled.
+    pub fn set_gxm_keyless_enabled(&mut self, enabled: bool) {
+        if self.gxm_keyless_enabled != enabled {
+            self.gxm_keyless_enabled = enabled;
+            self.frame_visual_dirty = true;
+        }
+    }
+
+    pub fn set_text_epoch_enabled(&mut self, enabled: bool) {
+        self.text_epoch_enabled = enabled;
+        self.frame_visual_dirty = true;
+        crate::core_info!("[text-epoch] enabled={}", u8::from(enabled));
+    }
+
+    pub fn set_message_cache_enabled(&mut self, enabled: bool) {
+        if self.message_cache_enabled != enabled {
+            self.message_cache_enabled = enabled;
+            self.frame_visual_dirty = true;
+        }
+        if let Some(renderer) = &self.text_renderer {
+            let state = renderer.font_state();
+            let fields: usize = state.layers.values().map(|layer| layer.page_font.len()).sum();
+            let tags: usize = state.layers.values().map(|layer| layer.page_tags.len()).sum();
+            crate::core_info!("[message-cache] enabled={} layers={} font_fields={} tags={}",
+                u8::from(enabled), state.layers.len(), fields, tags);
+        }
+    }
+
+
+    pub fn set_text_command_cache_enabled(&mut self, enabled: bool) {
+        if let Some(renderer) = self.text_renderer.as_mut() {
+            renderer.set_command_cache_enabled(enabled);
+        }
+    }
+
+    pub fn set_message_font_sizes(&mut self, enabled: bool, name: u32, dialogue: u32) -> bool {
+        self.sync_message_font_roles();
+        let ok = self.text_renderer.as_mut().is_some_and(|r| r.set_message_font_sizes(enabled, name, dialogue));
+        if ok { self.frame_visual_dirty = true; self.pointer_hit_test_dirty = true; }
+        ok
+    }
+
+    pub fn set_text_layout_cache_enabled(&mut self, enabled: bool) {
+        if let Some(renderer) = self.text_renderer.as_mut() {
+            renderer.set_layout_cache_enabled(enabled);
+        }
+    }
+
     pub fn profiler_snapshot_json(&self) -> String {
-        self.profiler.snapshot_json()
+        let json = self.profiler.snapshot_json();
+        let Ok(mut snapshot) = serde_json::from_str::<serde_json::Value>(&json) else { return json; };
+        // Captured only on explicit diagnostic requests, never in the frame loop.
+        snapshot["execution"] = serde_json::json!({
+            "script": self.interpreter.current_script(),
+            "instruction": self.interpreter.current_line(),
+            "stack_depth": self.interpreter.call_stack().len(),
+            "wait": format!("{:?}", self.wait_reason),
+            "forced_stop": self.script_forced_stop,
+        });
+        if let Some(renderer) = &self.text_renderer {
+            snapshot["text_layers"] = serde_json::Value::Array(renderer.font_state().layers.values().filter(|layer| !layer.text_buffer.is_empty()).map(|layer| {
+                serde_json::json!({
+                    "id": layer.id, "chars": layer.text_buffer.len(),
+                    "hidden": layer.text_hidden, "reveal": layer.reveal_index,
+                    "pending": layer.reveal_pending, "clock_ms": layer.reveal_clock_ms,
+                    "alpha": layer.font.entire_alpha, "left": layer.left, "top": layer.top,
+                    "width": layer.width, "height": layer.height,
+                    "size": layer.font.size, "scetween": layer.scetween.iter().map(|c| serde_json::json!([format!("{:?}",c.mode), c.param, c.diff, c.delay_per_char,c.time_per_char])).collect::<Vec<_>>(),
+                })
+            }).collect());
+        }
+        serde_json::to_string(&snapshot).unwrap_or(json)
     }
 
     fn begin_profile_frame(&self) -> crate::profiler::FrameProfile {
@@ -597,9 +749,12 @@ impl CoreRuntime {
     fn sync_script_status(&mut self) {
         use std::sync::atomic::Ordering;
 
-        let current = self.script_status.load(Ordering::SeqCst);
-        if current != self.last_engine_status {
-            // 原子量与引擎上次写入不一致 ⇒ 脚本经 e:setScriptStatus 改写过。
+        // Displayed status is not a command: debugSkip reports 4 while it is
+        // executing. Consume explicit pause/resume requests separately, also
+        // honoring requests whose numeric value already matches the display.
+        let requested = self.script_status_request.swap(NO_SCRIPT_STATUS_REQUEST, Ordering::SeqCst);
+        if requested != NO_SCRIPT_STATUS_REQUEST {
+            let current = requested as u8;
             if current == 0 {
                 // 设 0 唤醒：清除当前等待并越过触发等待的指令，解除强制停止。
                 if self.wait_reason.is_some() {
@@ -636,6 +791,8 @@ impl CoreRuntime {
 
 impl Drop for CoreRuntime {
     fn drop(&mut self) {
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
+        {
         if self.gl_ctx.make_current() {
             unsafe {
                 self.gl.delete_framebuffer(self.fbo);
@@ -644,8 +801,11 @@ impl Drop for CoreRuntime {
         } else {
             crate::core_warn!("[CoreRuntime] GL context unavailable during destruction");
         }
+        }
         text::clear_process_snapshots();
         media::clear_sound_info_snapshot();
+        #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+        surface_loader::shutdown();
         callbacks::clear_surface_cache();
     }
 }

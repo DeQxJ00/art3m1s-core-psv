@@ -115,6 +115,12 @@ pub fn create_offscreen_context(
     stage_w: u32,
     stage_h: u32,
 ) -> Result<(Rc<glow::Context>, Box<dyn GLPlatformContext>, GfxBackend), String> {
+    #[cfg(target_os = "vita")]
+    {
+        let _ = (backend, stage_w, stage_h);
+        return Err("Vita requires the native GXM renderer; the legacy GL host has been removed".into());
+    }
+    #[cfg(not(target_os = "vita"))]
     match backend {
         GfxBackend::Cgl => create_cgl().map(|(g, c)| (g, c, GfxBackend::Cgl)),
         GfxBackend::Angle(sub) => match create_egl(sub, stage_w, stage_h) {
@@ -276,6 +282,7 @@ fn create_cgl() -> Result<(Rc<glow::Context>, Box<dyn GLPlatformContext>), Strin
 
 // ── EGL / ANGLE ─────────────────────────────────────────────────
 
+#[cfg(not(target_os = "vita"))]
 fn create_egl(
     backend: AngleBackend,
     stage_w: u32,
@@ -1019,7 +1026,9 @@ fn create_egl(
                     return Err("eglCreatePbufferSurface failed".into());
                 }
 
-                let context_version = if cfg!(any(target_os = "ios", target_os = "android")) {
+                // Runtime unit tests compile GLSL ES 3.00; older desktop ANGLE
+                // builds enforce the requested context version strictly.
+                let context_version = if cfg!(test) || cfg!(any(target_os = "ios", target_os = "android")) {
                     3
                 } else {
                     2
@@ -1162,7 +1171,9 @@ pub unsafe fn create_fbo_target(
         let tex = gl
             .create_texture()
             .map_err(|e| format!("create_texture: {e}"))?;
+        crate::core_warn!("FBO: texture allocated {:?}", tex);
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        crate::core_warn!("FBO: texture bound");
         // Use GL_RGBA for both internalformat and format. This is the GLES 2.0
         // compatible path and avoids ANGLE/Metal treating sized desktop formats
         // differently from the ES context we create below.
@@ -1177,11 +1188,14 @@ pub unsafe fn create_fbo_target(
             glow::UNSIGNED_BYTE,
             glow::PixelUnpackData::Slice(None),
         );
+        crate::core_warn!("FBO: texture storage allocated");
         configure_render_texture(gl);
         let fbo = gl
             .create_framebuffer()
             .map_err(|e| format!("create_framebuffer: {e}"))?;
+        crate::core_warn!("FBO: framebuffer allocated {:?}", fbo);
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        crate::core_warn!("FBO: framebuffer bound");
         gl.framebuffer_texture_2d(
             glow::FRAMEBUFFER,
             glow::COLOR_ATTACHMENT0,
@@ -1189,7 +1203,9 @@ pub unsafe fn create_fbo_target(
             Some(tex),
             0,
         );
+        crate::core_warn!("FBO: texture attached");
         let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+        crate::core_warn!("FBO: status {status:#x}");
         if status != glow::FRAMEBUFFER_COMPLETE {
             // Some ANGLE backends (Metal/GL) reject RGBA8 as FBO color attachment.
             // Try RGBA4 as fallback.

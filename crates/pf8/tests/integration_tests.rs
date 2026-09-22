@@ -9,6 +9,20 @@ use std::path::Path;
 use tempfile::TempDir;
 
 #[test]
+fn archive_lookup_normalizes_case_and_both_separators() {
+    let temp = TempDir::new().unwrap();
+    let file = temp.path().join("source.bin");
+    fs::write(&file, b"nested payload").unwrap();
+    let archive = temp.path().join("nested.pfs");
+    let mut builder = Pf8Builder::new();
+    builder.add_file_as(&file, "Folder/Nested/File.bin").unwrap();
+    builder.write_to_file(&archive).unwrap();
+    let mut reader = Pf8Reader::open(&archive).unwrap();
+    assert_eq!(reader.read_file("folder/nested/file.bin").unwrap(), b"nested payload");
+    assert_eq!(reader.read_file("FOLDER\\NESTED\\FILE.BIN").unwrap(), b"nested payload");
+}
+
+#[test]
 fn test_create_and_read_simple_archive() {
     let temp_dir = TempDir::new().unwrap();
     let input_dir = temp_dir.path().join("input");

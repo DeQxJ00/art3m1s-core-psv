@@ -34,7 +34,7 @@ impl Compositor {
             return hits;
         }
         let root_transform = root_props.local_transform();
-        let roots = self.scene.roots();
+        let roots = self.scene.roots_borrowed();
         let scale = self.stage_scale;
         for root in roots.iter().rev() {
             self.hit_test_subtree(root, root_transform, x, y, scale, provider, &mut hits);
@@ -70,7 +70,7 @@ impl Compositor {
         // 先递归检测子层（高 z-order 优先，reverse 遍历）。
         // 注意按 Artemis 图层顺序排序（与绘制次序一致），不能用原始插入顺序，
         // 否则命中的 z-order 与画面不符。
-        let children = self.scene.children(id);
+        let children = self.scene.children_borrowed(id);
         for child_id in children.iter().rev() {
             self.hit_test_subtree(child_id, world, mx, my, scale, provider, hits);
         }

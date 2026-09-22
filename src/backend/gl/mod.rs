@@ -30,7 +30,8 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 
 pub mod platform;
-mod provider;
+pub(crate) mod provider;
+mod residency;
 mod shader;
 
 pub use crate::render_pipeline::ShaderProfile;
@@ -88,6 +89,7 @@ pub struct GlRenderer {
     gl: Rc<glow::Context>,
     program: glow::Program,
     program_bindings: ProgramBindings,
+    simple_program: Option<CustomProgram>,
     custom_programs: HashMap<String, CustomProgram>,
     profile: ShaderProfile,
     white_texture: glow::Texture,
@@ -120,6 +122,10 @@ pub struct GlRenderer {
 }
 
 impl GlRenderer {
+    fn ordinary_sprite_program(&self) -> (glow::Program, &ProgramBindings) {
+        self.simple_program.as_ref().map(|p| (p.program, &p.bindings))
+            .unwrap_or((self.program, &self.program_bindings))
+    }
     /// 用给定的 GL 上下文、舞台尺寸和着色器 profile 创建渲染器。
     ///
     /// # Safety
@@ -134,6 +140,11 @@ impl GlRenderer {
         unsafe {
             let program = shader::build_program(&gl, profile)?;
             let program_bindings = ProgramBindings::new(&gl, program);
+            let simple_program = if profile == ShaderProfile::Vita100 {
+                let program = shader::build_builtin_program(&gl, profile,
+                    crate::render_pipeline::shader::SIMPLE_SPRITE_SHADER)?;
+                Some(CustomProgram { program, bindings: ProgramBindings::new(&gl, program) })
+            } else { None };
             let white_texture = create_solid_texture(&gl, [255, 255, 255, 255])?;
             let transparent_texture = create_solid_texture(&gl, [0, 0, 0, 0])?;
             let alpha_mask_program = shader::build_builtin_program(
@@ -233,6 +244,7 @@ impl GlRenderer {
                 gl: gl.clone(),
                 program,
                 program_bindings,
+                simple_program,
                 custom_programs,
                 profile,
                 white_texture,
@@ -307,14 +319,16 @@ impl GlRenderer {
         if !self.profiling_enabled.get() {
             return;
         }
+        // These per-frame counters cannot realistically overflow u64. Wrapping
+        // addition avoids vqadd.u64, unsupported by Vita3K's CPU backend.
         self.profile_draw_calls
-            .set(self.profile_draw_calls.get().saturating_add(1));
+            .set(self.profile_draw_calls.get().wrapping_add(1));
         self.profile_vertices
-            .set(self.profile_vertices.get().saturating_add(vertices));
+            .set(self.profile_vertices.get().wrapping_add(vertices));
         self.profile_texture_binds.set(
             self.profile_texture_binds
                 .get()
-                .saturating_add(texture_binds),
+                .wrapping_add(texture_binds),
         );
     }
 
@@ -400,6 +414,46 @@ impl GlRenderer {
         }
     }
 
+    // Vita3K retained previous group pixels after vitaGL's transparent glClear.
+    // A normal quad with blending disabled overwrites every RGBA component,
+    // including alpha, before the target is reused. Keep the ordinary clear
+    // on other backends; this path does not require GPU-to-CPU readback.
+    unsafe fn clear_group_target(&self) {
+        unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
+            #[cfg(not(target_os = "vita"))]
+            {
+                self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            #[cfg(target_os = "vita")]
+            {
+                let gl = &self.gl;
+                let (program, b) = self.ordinary_sprite_program();
+                gl.use_program(Some(program));
+                gl.bind_vertex_array(Some(self.vao));
+                gl.disable(glow::BLEND);
+                gl.disable(glow::DEPTH_TEST);
+                gl.disable(glow::STENCIL_TEST);
+                gl.uniform_matrix_3_f32_slice(b.projection.as_ref(), false, &self.texture_target_projection());
+                gl.uniform_matrix_3_f32_slice(b.transform.as_ref(), false, &[1.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,1.0]);
+                gl.uniform_2_f32(b.size.as_ref(), self.stage_width, self.stage_height);
+                gl.uniform_2_f32(b.uv_offset.as_ref(), 0.0, 0.0);
+                gl.uniform_2_f32(b.uv_scale.as_ref(), 1.0, 1.0);
+                gl.uniform_1_f32(b.opacity.as_ref(), 0.0);
+                gl.uniform_3_f32(b.multiply.as_ref(), 0.0, 0.0, 0.0);
+                gl.uniform_1_i32(b.grayscale.as_ref(), 0);
+                gl.uniform_1_i32(b.negative.as_ref(), 0);
+                gl.uniform_1_i32(b.emote_enabled.as_ref(), 0);
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.white_texture));
+                gl.uniform_1_i32(b.sampler.as_ref(), 0);
+                self.record_draw(6, 1);
+                gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn render_range(
         &mut self,
@@ -464,12 +518,9 @@ impl GlRenderer {
                 self.gl
                     .viewport(0, 0, self.stage_width as i32, self.stage_height as i32);
                 // The parent pass may have a top-left damage scissor enabled.
-                // Group targets use their own bottom-left projection and must
-                // start from a fully transparent image; inheriting that scissor
-                // leaves stale pixels in the reused offscreen target.
-                self.gl.disable(glow::SCISSOR_TEST);
-                self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
-                self.gl.clear(glow::COLOR_BUFFER_BIT);
+                // Clear the full offscreen target; partial group rendering showed
+                // seams on Vita3K and must not replace the verified alpha path.
+                self.clear_group_target();
                 self.render_range(
                     frame,
                     mesh_ranges,
@@ -496,9 +547,7 @@ impl GlRenderer {
                         .bind_framebuffer(glow::FRAMEBUFFER, Some(mask_framebuffer));
                     self.gl
                         .viewport(0, 0, self.stage_width as i32, self.stage_height as i32);
-                    self.gl.disable(glow::SCISSOR_TEST);
-                    self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
-                    self.gl.clear(glow::COLOR_BUFFER_BIT);
+                    self.clear_group_target();
                     for mask_index in mask_start..mask_end {
                         self.draw_one(
                             &frame.mask_commands[mask_index],
@@ -663,9 +712,12 @@ impl GlRenderer {
                 .shader
                 .as_ref()
                 .and_then(|effect| self.custom_programs.get(&effect.name));
+            let default_program = if cmd.native_emote.is_none() {
+                self.ordinary_sprite_program()
+            } else { (self.program, &self.program_bindings) };
             let (program, bindings) = custom_program
                 .map(|custom| (custom.program, &custom.bindings))
-                .unwrap_or((self.program, &self.program_bindings));
+                .unwrap_or(default_program);
             gl.use_program(Some(program));
             gl.uniform_matrix_3_f32_slice(
                 bindings.projection.as_ref(),
@@ -799,10 +851,20 @@ impl GlRenderer {
                 );
                 if let Some(effect) = &cmd.shader {
                     for (name, values) in &effect.uniforms {
-                        gl.uniform_1_f32_slice(
-                            gl.get_uniform_location(program, name).as_ref(),
-                            values,
-                        );
+                        let location = gl.get_uniform_location(program, name);
+                        // A vector is not an array of scalars. In particular,
+                        // Vita's scalar arrays have padding between elements.
+                        // Match the linked type, including arrays of vectors.
+                        match bindings.uniform_types.get(name.as_str()).copied() {
+                            Some(glow::FLOAT_VEC2) => gl.uniform_2_f32_slice(location.as_ref(), values),
+                            Some(glow::FLOAT_VEC3) => gl.uniform_3_f32_slice(location.as_ref(), values),
+                            Some(glow::FLOAT_VEC4) => gl.uniform_4_f32_slice(location.as_ref(), values),
+                            Some(glow::FLOAT_MAT2) => gl.uniform_matrix_2_f32_slice(location.as_ref(), false, values),
+                            Some(glow::FLOAT_MAT3) => gl.uniform_matrix_3_f32_slice(location.as_ref(), false, values),
+                            Some(glow::FLOAT_MAT4) => gl.uniform_matrix_4_f32_slice(location.as_ref(), false, values),
+                            Some(glow::FLOAT) => gl.uniform_1_f32_slice(location.as_ref(), values),
+                            _ => {},
+                        }
                     }
                 }
             } else {
@@ -972,7 +1034,7 @@ impl GlRenderer {
                     self.profile_dynamic_mesh_uploaded_bytes.set(
                         self.profile_dynamic_mesh_uploaded_bytes
                             .get()
-                            .saturating_add(std::mem::size_of_val(floats) as u64),
+                            .wrapping_add(std::mem::size_of_val(floats) as u64),
                     );
                 }
             }
@@ -1040,6 +1102,7 @@ impl GlRenderer {
         top_left_memory: bool,
     ) -> Result<(), String> {
         let gl = &self.gl;
+        let (program, bindings) = self.ordinary_sprite_program();
         unsafe {
             // Do not attribute an error left by the scene pass to this copy.
             while gl.get_error() != glow::NO_ERROR {}
@@ -1053,21 +1116,21 @@ impl GlRenderer {
             gl.disable(glow::STENCIL_TEST);
             gl.disable(glow::CULL_FACE);
             gl.color_mask(true, true, true, true);
-            gl.use_program(Some(self.program));
+            gl.use_program(Some(program));
             gl.bind_vertex_array(Some(self.vao));
 
             gl.uniform_matrix_3_f32_slice(
-                self.program_bindings.projection.as_ref(),
+                bindings.projection.as_ref(),
                 false,
                 &self.projection(),
             );
             gl.uniform_matrix_3_f32_slice(
-                self.program_bindings.transform.as_ref(),
+                bindings.transform.as_ref(),
                 false,
                 &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             );
             gl.uniform_2_f32(
-                self.program_bindings.size.as_ref(),
+                bindings.size.as_ref(),
                 self.stage_width,
                 self.stage_height,
             );
@@ -1081,17 +1144,20 @@ impl GlRenderer {
             } else {
                 (1.0, -1.0)
             };
-            gl.uniform_2_f32(self.program_bindings.uv_offset.as_ref(), 0.0, uv_offset_y);
-            gl.uniform_2_f32(self.program_bindings.uv_scale.as_ref(), 1.0, uv_scale_y);
-            gl.uniform_1_f32(self.program_bindings.opacity.as_ref(), 1.0);
-            gl.uniform_3_f32(self.program_bindings.multiply.as_ref(), 1.0, 1.0, 1.0);
-            gl.uniform_1_i32(self.program_bindings.grayscale.as_ref(), 0);
-            gl.uniform_1_i32(self.program_bindings.negative.as_ref(), 0);
-            gl.uniform_1_i32(self.program_bindings.sampler.as_ref(), 0);
+            gl.uniform_2_f32(bindings.uv_offset.as_ref(), 0.0, uv_offset_y);
+            gl.uniform_2_f32(bindings.uv_scale.as_ref(), 1.0, uv_scale_y);
+            gl.uniform_1_f32(bindings.opacity.as_ref(), 1.0);
+            gl.uniform_3_f32(bindings.multiply.as_ref(), 1.0, 1.0, 1.0);
+            gl.uniform_1_i32(bindings.grayscale.as_ref(), 0);
+            gl.uniform_1_i32(bindings.negative.as_ref(), 0);
+            gl.uniform_1_i32(bindings.sampler.as_ref(), 0);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             self.record_draw(6, 1);
             gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            // Vita's glFlush ends and immediately begins another GXM scene.
+            // The host swaps immediately after this draw and submits it there.
+            #[cfg(not(target_os = "vita"))]
             gl.flush();
 
             gl.disable(glow::SCISSOR_TEST);
@@ -1166,6 +1232,7 @@ impl Drop for GlRenderer {
         let gl = &self.gl;
         unsafe {
             gl.delete_program(self.program);
+            if let Some(program) = &self.simple_program { gl.delete_program(program.program); }
             for program in self.custom_programs.values() {
                 gl.delete_program(program.program);
             }
@@ -1201,6 +1268,7 @@ struct CustomProgram {
 }
 
 struct ProgramBindings {
+    uniform_types: HashMap<String, u32>,
     projection: Option<glow::UniformLocation>,
     transform: Option<glow::UniformLocation>,
     size: Option<glow::UniformLocation>,
@@ -1231,7 +1299,14 @@ struct ProgramBindings {
 impl ProgramBindings {
     fn new(gl: &glow::Context, program: glow::Program) -> Self {
         let get = |name| unsafe { gl.get_uniform_location(program, name) };
+        let uniform_types = unsafe {
+            (0..gl.get_active_uniforms(program))
+                .filter_map(|index| gl.get_active_uniform(program, index))
+                .map(|uniform| (uniform.name.trim_end_matches("[0]").to_string(), uniform.utype))
+                .collect()
+        };
         Self {
+            uniform_types,
             projection: get("u_projection"),
             transform: get("u_transform"),
             size: get("u_size"),

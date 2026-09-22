@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::time::Instant;
+use crate::profile_clock::Instant;
 
 /// 资源名 → 原始字节的来源。返回 `None` 表示该资源不存在（将回退占位）。
 pub type AssetSource = dyn Fn(&str) -> Option<Vec<u8>>;
@@ -123,6 +123,9 @@ pub struct GlTextureProvider {
     gl: Rc<glow::Context>,
     /// 资源名 → (句柄, 尺寸)。
     cache: HashMap<String, (TextureId, TextureInfo)>,
+    /// Only successful immutable file loads may survive a scene change.
+    asset_last_used: HashMap<TextureId, u64>,
+    retain_epoch: u64,
     /// CPU pixels retained only when hit-testing or explicit readback needs them.
     cpu_pixels: HashMap<TextureId, CpuTexturePixels>,
     /// 可选的素材字节源（资源名 → 原始字节）。无则一律用占位。
@@ -151,6 +154,8 @@ impl GlTextureProvider {
         Self {
             gl,
             cache: HashMap::new(),
+            asset_last_used: HashMap::new(),
+            retain_epoch: 0,
             cpu_pixels: HashMap::new(),
             source: None,
             placeholder: PlaceholderKind::Checker,
@@ -236,13 +241,15 @@ impl GlTextureProvider {
 
     fn record_upload(&self, started: Option<Instant>, bytes: usize) {
         let Some(started) = started else { return };
+        // Collected/reset every frame; avoid paired saturating u64 NEON adds
+        // that Vita3K does not implement, without disabling image/audio SIMD.
         self.profile_upload_elapsed_ns.set(
             self.profile_upload_elapsed_ns
                 .get()
-                .saturating_add(elapsed_ns(started)),
+                .wrapping_add(elapsed_ns(started)),
         );
         self.profile_upload_bytes
-            .set(self.profile_upload_bytes.get().saturating_add(bytes as u64));
+            .set(self.profile_upload_bytes.get().wrapping_add(bytes as u64));
     }
 
     fn record_video_upload(&self, started: Option<Instant>, bytes: usize) {
@@ -250,12 +257,12 @@ impl GlTextureProvider {
         self.profile_video_elapsed_ns.set(
             self.profile_video_elapsed_ns
                 .get()
-                .saturating_add(elapsed_ns(started)),
+                .wrapping_add(elapsed_ns(started)),
         );
         self.profile_video_bytes
-            .set(self.profile_video_bytes.get().saturating_add(bytes as u64));
+            .set(self.profile_video_bytes.get().wrapping_add(bytes as u64));
         self.profile_video_frames
-            .set(self.profile_video_frames.get().saturating_add(1));
+            .set(self.profile_video_frames.get().wrapping_add(1));
     }
 
     /// Changes whenever an upload can alter pixels sampled by a draw command.
@@ -393,8 +400,8 @@ impl GlTextureProvider {
 
     /// Copies the currently bound framebuffer into a renderer-only texture.
     ///
-    /// Unlike `read_pixels` followed by `upload_rgba_render_only`, this stays
-    /// entirely on the GPU and avoids a synchronous driver readback. The
+    /// Drivers may implement this as a GPU copy, but vitaGL currently performs
+    /// glReadPixels + glTexImage2D internally, including a synchronous wait. The
     /// resulting texture keeps OpenGL's bottom-left row order; callers must
     /// sample it with vertically flipped UVs when drawing in stage space.
     pub(crate) fn copy_bound_framebuffer_render_only(
@@ -698,6 +705,7 @@ impl GlTextureProvider {
             }
         }
         if let Some((id, _)) = self.cache.remove(name) {
+            self.asset_last_used.remove(&id);
             self.cpu_pixels.remove(&id);
             self.texture_revisions.remove(&id);
             self.opaque_textures.remove(&id);
@@ -824,6 +832,9 @@ impl Drop for GlTextureProvider {
 impl TextureProvider for GlTextureProvider {
     fn resolve(&mut self, name: &str) -> Option<(TextureId, TextureInfo)> {
         if let Some(entry) = self.cache.get(name) {
+            if let Some(last_used) = self.asset_last_used.get_mut(&entry.0) {
+                *last_used = self.retain_epoch;
+            }
             return Some(*entry);
         }
 
@@ -839,6 +850,7 @@ impl TextureProvider for GlTextureProvider {
                     Some((w, h, rgba)) => {
                         let entry = unsafe { self.try_create_texture(w, h, &rgba) }?;
                         self.cache.insert(name.to_string(), entry);
+                        self.asset_last_used.insert(entry.0, self.retain_epoch);
                         self.cpu_pixels
                             .insert(entry.0, CpuTexturePixels::alpha_only(w, h, &rgba));
                         self.set_texture_opaque(entry.0, rgba_is_opaque(&rgba));
@@ -935,6 +947,9 @@ impl TextureProvider for GlTextureProvider {
     fn resolve_with_mask(&mut self, file: &str, mask: &str) -> Option<(TextureId, TextureInfo)> {
         let name = crate::render_pipeline::draw::masked_texture_name(file, mask);
         if let Some(entry) = self.cache.get(&name) {
+            if let Some(last_used) = self.asset_last_used.get_mut(&entry.0) {
+                *last_used = self.retain_epoch;
+            }
             return Some(*entry);
         }
 
@@ -958,7 +973,9 @@ impl TextureProvider for GlTextureProvider {
 
         match combined {
             Some((w, h, pixels)) => {
-                GlTextureProvider::upload_rgba_render_only(self, &name, w, h, &pixels)
+                let entry = GlTextureProvider::upload_rgba_render_only(self, &name, w, h, &pixels)?;
+                self.asset_last_used.insert(entry.0, self.retain_epoch);
+                Some(entry)
             }
             None => self.resolve(file),
         }
@@ -986,22 +1003,22 @@ impl TextureProvider for GlTextureProvider {
     }
 
     fn retain(&mut self, names: &std::collections::HashSet<String>) {
-        let stale: Vec<String> = self
-            .cache
-            .keys()
-            .filter(|k| !names.contains(*k))
-            .cloned()
-            .collect();
+        self.retain_epoch = self.retain_epoch.saturating_add(1);
+        let stale = super::residency::evictions(self.cache.iter().map(|(name, (id, info))| {
+            let active = names.contains(name);
+            let last_used = self.asset_last_used.get_mut(id).map(|last| {
+                if active { *last = self.retain_epoch; }
+                *last
+            });
+            // RGBA estimate includes vitaGL's 8-pixel row alignment and CPU
+            // hit-test storage. Compressed runtime textures are conservatively
+            // counted as RGBA too. FBOs outside this provider are not included.
+            let gpu = (info.width as u64 + 7) / 8 * 8 * info.height as u64 * 4;
+            let cpu = self.cpu_pixels.get(id).map_or(0, |pixels| pixels.allocated_bytes() as u64);
+            super::residency::Resident { name, bytes: gpu + cpu, active, last_used }
+        }));
         for name in &stale {
-            if let Some((id, _)) = self.cache.remove(name) {
-                self.cpu_pixels.remove(&id);
-                self.opaque_textures.remove(&id);
-                if let Some(nz) = NonZeroU32::new(id.0 as u32) {
-                    unsafe {
-                        self.gl.delete_texture(glow::NativeTexture(nz));
-                    }
-                }
-            }
+            self.remove_if_cached(name);
         }
     }
 }
@@ -1027,6 +1044,63 @@ fn decode_rgba(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::{CpuTexturePixels, PixelStorage, rgba_is_opaque};
+
+    #[test]
+    #[ignore = "Requires an EGL/ANGLE installation; set ART3M1S_TEST_ANGLE_PATH on Windows"]
+    fn file_cache_gl_reuses_handles_and_releases_replaced_runtime_textures() {
+        use super::*;
+        use std::io::Cursor;
+        if let Ok(path) = std::env::var("ART3M1S_TEST_ANGLE_PATH") {
+            let path = std::ffi::CString::new(path).unwrap();
+            unsafe { crate::ffi::art3m1s_set_angle_path(path.as_ptr()); }
+        }
+        let backend = if cfg!(target_os = "windows") {
+            platform::AngleBackend::D3D11
+        } else {
+            platform::AngleBackend::OpenGL
+        };
+        let (gl, _context, _) = platform::create_offscreen_context(
+            platform::GfxBackend::Angle(backend), 16, 16,
+        ).expect("real offscreen GL context");
+        let mut png = Cursor::new(Vec::new());
+        image::write_buffer_with_format(&mut png, &[255, 255, 255, 64], 1, 1,
+            image::ExtendedColorType::Rgba8, image::ImageFormat::Png).unwrap();
+        let reads = Rc::new(Cell::new(0));
+        let source_reads = reads.clone();
+        let mut provider = GlTextureProvider::new(gl.clone()).with_source(move |_: &str| {
+            source_reads.set(source_reads.get() + 1);
+            Some(png.get_ref().clone())
+        });
+        let first = provider.resolve("face").unwrap();
+        assert_eq!(provider.pixel_alpha(first.0, 0, 0), Some(64));
+        provider.retain(&HashSet::new());
+        assert_eq!(provider.resolve("face"), Some(first));
+        assert_eq!(reads.get(), 1, "returning image must not reread or decode");
+        let masked = provider.resolve_with_mask("face", "mask").unwrap();
+        provider.retain(&HashSet::new());
+        assert_eq!(provider.resolve_with_mask("face", "mask"), Some(masked));
+        assert_eq!(reads.get(), 3, "combined masks must also survive a temporary absence");
+
+        // Uploading new, mutable content under an old asset name must cancel
+        // file eligibility; otherwise a later scene could reuse stale pixels.
+        let edited = provider.upload_rgba("face", 1, 1, &[9, 8, 7, 255]).unwrap();
+        assert!(!provider.asset_last_used.contains_key(&edited.0));
+        provider.retain(&HashSet::new());
+        assert!(provider.cached_info("face").is_none());
+        assert!(!provider.texture_revisions.contains_key(&edited.0));
+        assert!(!provider.cpu_pixels.contains_key(&edited.0));
+        unsafe {
+            assert!(!gl.is_texture(glow::NativeTexture(NonZeroU32::new(edited.0.0 as u32).unwrap())));
+        }
+        provider.resolve("face").unwrap();
+        assert_eq!(reads.get(), 4);
+        assert_eq!(provider.evict_prefix("face"), 2); // Includes face+mask cache key.
+        assert!(provider.asset_last_used.is_empty());
+        provider.resolve("face").unwrap();
+        assert_eq!(reads.get(), 5, "explicit invalidation must force a fresh file load");
+        assert_eq!(provider.asset_last_used.len(), 1);
+        unsafe { assert_eq!(gl.get_error(), glow::NO_ERROR); }
+    }
 
     #[test]
     fn opacity_summary_requires_every_alpha_byte_to_be_full() {

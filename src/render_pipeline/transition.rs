@@ -5,7 +5,7 @@ use crate::render_pipeline::draw::{
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-const CAPTURE_TEXTURE_NAME: &str = "__trans_capture__";
+pub(crate) const CAPTURE_TEXTURE_NAME: &str = "__trans_capture__";
 
 /// Parameters reduced from a `[trans]` script event.
 pub(crate) struct TransitionRequest<'a> {
@@ -149,6 +149,16 @@ pub(crate) fn capture_gpu_texture(
     texture: TextureId,
     info: TextureInfo,
 ) {
+    capture_external_texture(slot, clock_ms, texture, info, true);
+}
+
+pub(crate) fn capture_external_texture(
+    slot: &RefCell<Option<TransitionState>>,
+    clock_ms: u64,
+    texture: TextureId,
+    info: TextureInfo,
+    flipped_y: bool,
+) {
     let mut state = slot.borrow_mut();
     let Some(transition) = state.as_mut() else {
         return;
@@ -158,7 +168,7 @@ pub(crate) fn capture_gpu_texture(
     }
     transition.captured_texture = Some(texture);
     transition.captured_info = Some(info);
-    transition.captured_flipped_y = true;
+    transition.captured_flipped_y = flipped_y;
     transition.needs_capture = false;
     transition.start_ms = clock_ms;
 }
@@ -385,6 +395,23 @@ mod tests {
         let files = retained_files(&slot);
         assert!(files.contains(&"__trans_capture__".to_string()));
         assert!(files.contains(&"rule.png".to_string()));
+    }
+
+    #[test]
+    fn native_capture_preserves_rows_and_starts_time_when_snapshot_is_ready() {
+        let slot = RefCell::new(None);
+        let mut provider = MockProvider::new();
+        start_type2(&slot, 1);
+        capture_external_texture(
+            &slot, 700, TextureId(7), TextureInfo { width: 960, height: 540 }, false,
+        );
+        let mut frame = DrawList::new();
+        overlay_old_frame(&slot, 950, &mut frame, &mut provider);
+        assert_eq!(frame.commands.len(), 1);
+        assert_eq!(frame.commands[0].clip.uv_offset, [0.0, 0.0]);
+        assert_eq!(frame.commands[0].clip.uv_scale, [1.0, 1.0]);
+        assert_eq!(frame.commands[0].shader.as_ref().unwrap().uniforms["progress"], vec![0.25]);
+        assert!(retained_files(&slot).contains(&CAPTURE_TEXTURE_NAME.to_owned()));
     }
 
     #[test]

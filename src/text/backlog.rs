@@ -13,6 +13,7 @@
 //! （见 `MessageLayer::page_tags`），换页（rp）时按配置搬入 [`Backlog`]。
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 /// 历史页数上限的缺省值。超过后丢弃最旧的页。
 pub const DEFAULT_BACKLOG_MAX_PAGES: usize = 100;
@@ -39,7 +40,7 @@ fn tag_with_params(name: &str, params: &HashMap<String, String>) -> String {
 ///
 /// `get_backlog_tags` / `get_message_tags` 把它们序列化为可交给
 /// `tag` 标签逐条执行的标签字符串，从而重现该页文本。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BacklogTag {
     /// 剧情文本段落。再现时以 `[print data="…"]` 执行（print 标签用于
     /// 把字符串显示为剧情文本，正是再现场景所需）。
@@ -52,6 +53,10 @@ pub enum BacklogTag {
     RubyStart(String),
     /// 注音结束，再现为 `[/ruby]`。
     RubyEnd,
+    Indent { pair: String, range: Option<usize>, nest: bool, logical_range: bool },
+    IndentModify(i32),
+    /// Private cross-page state for our own saved message/backlog records.
+    IndentState(String),
 }
 
 impl BacklogTag {
@@ -63,6 +68,14 @@ impl BacklogTag {
             BacklogTag::Font(params) => tag_with_params("font", params),
             BacklogTag::RubyStart(t) => format!("[ruby text=\"{}\"]", escape_attr(t)),
             BacklogTag::RubyEnd => "[/ruby]".to_string(),
+            BacklogTag::Indent { pair, range, nest, logical_range } => format!(
+                "[indent pair=\"{}\" range=\"{}\" nest=\"{}\" logicalrange=\"{}\"]",
+                escape_attr(pair), range.unwrap_or(0), i32::from(*nest), i32::from(*logical_range)),
+            BacklogTag::IndentModify(count) => format!("[indentmodify unindent=\"{count}\"]"),
+            // IET quoted attributes do not round-trip JSON's escaped quotes.
+            // A private ASCII payload also avoids locale-dependent parsing.
+            BacklogTag::IndentState(data) => format!("[__art3_indent_state data=\"{}\"]",
+                data.as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>()),
         }
     }
 }
@@ -146,7 +159,10 @@ impl Default for BacklogSettings {
 /// 历史存储本体：按页保存，超过上限丢最旧页。
 #[derive(Debug, Default)]
 pub struct Backlog {
-    pages: VecDeque<BacklogPage>,
+    // Stored pages are immutable; sharing them avoids duplicate history copies
+    // and lets snapshot caches retain serialization across front eviction.
+    pages: VecDeque<Arc<BacklogPage>>,
+    revision: Arc<()>,
     /// 页数上限（0 视为不限制不合理，构造时给缺省值）。
     pub max_pages: usize,
     /// `writebacklog` 的 mode：true=换页存入历史。文档缺省 0（不存入）。
@@ -159,6 +175,7 @@ impl Backlog {
     pub fn new() -> Self {
         Self {
             pages: VecDeque::new(),
+            revision: Arc::new(()),
             max_pages: DEFAULT_BACKLOG_MAX_PAGES,
             write_mode: false,
             settings: BacklogSettings::default(),
@@ -172,12 +189,25 @@ impl Backlog {
 
     /// 取第 `page` 页（0 起，0=最旧页）。
     pub fn page(&self, page: usize) -> Option<&BacklogPage> {
-        self.pages.get(page)
+        self.pages.get(page).map(Arc::as_ref)
+    }
+
+    // A retained token cannot be reused for another history/revision (no ABA
+    // after clear, replacement or allocator reuse). Settings don't alter pages.
+    pub(crate) fn snapshot_revision(&self) -> &Arc<()> {
+        &self.revision
+    }
+
+    pub(crate) fn snapshot_pages(&self) -> impl Iterator<Item = &Arc<BacklogPage>> {
+        self.pages.iter()
     }
 
     /// `backlog clear=1`：清除当前存储的全部历史。
     pub fn clear(&mut self) {
-        self.pages.clear();
+        if !self.pages.is_empty() {
+            self.pages.clear();
+            self.revision = Arc::new(());
+        }
     }
 
     /// `writebacklog mode=` 的消费入口。
@@ -207,10 +237,11 @@ impl Backlog {
             page.page_font = None;
             page.tags.retain(|t| !matches!(t, BacklogTag::Font(_)));
         }
-        self.pages.push_back(page);
+        self.pages.push_back(Arc::new(page));
         while self.max_pages > 0 && self.pages.len() > self.max_pages {
             self.pages.pop_front();
         }
+        self.revision = Arc::new(());
     }
 }
 
@@ -223,6 +254,32 @@ mod tests {
             page_font: Some(HashMap::from([("size".to_string(), "40".to_string())])),
             tags: vec![BacklogTag::Text(s.to_string())],
         }
+    }
+
+    #[test]
+    fn snapshot_identity_tracks_stored_pages_not_settings_or_rejected_writes() {
+        let mut backlog = Backlog::new();
+        let empty = Arc::clone(backlog.snapshot_revision());
+        backlog.clear();
+        backlog.push_page(BacklogPage::default());
+        backlog.settings.allow = false;
+        backlog.push_page(text_page("ignored"));
+        assert!(Arc::ptr_eq(&empty, backlog.snapshot_revision()));
+        backlog.settings.allow = true;
+        backlog.max_pages = 2;
+        backlog.push_page(text_page("first"));
+        let first = Arc::clone(backlog.snapshot_revision());
+        assert!(!Arc::ptr_eq(&empty, &first));
+        backlog.push_page(text_page("second"));
+        let second_page = Arc::clone(backlog.snapshot_pages().nth(1).unwrap());
+        backlog.push_page(text_page("third"));
+        assert!(Arc::ptr_eq(&second_page, backlog.snapshot_pages().next().unwrap()));
+        assert_eq!(backlog.page(0).unwrap().plain_text(), "second");
+        backlog.clear();
+        assert!(!Arc::ptr_eq(&empty, backlog.snapshot_revision()));
+        let replacement = Backlog::new();
+        assert!(!Arc::ptr_eq(replacement.snapshot_revision(), backlog.snapshot_revision()));
+        assert!(!Arc::ptr_eq(&empty, replacement.snapshot_revision()));
     }
 
     #[test]

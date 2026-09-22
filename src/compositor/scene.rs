@@ -102,15 +102,15 @@ fn compare_layer_id(a: &str, b: &str) -> Ordering {
         _ => {}
     }
 
-    let parts_a: Vec<&str> = a.split('.').collect();
-    let parts_b: Vec<&str> = b.split('.').collect();
+    let mut parts_a = a.split('.');
+    let mut parts_b = b.split('.');
 
-    for i in 0.. {
-        match (parts_a.get(i), parts_b.get(i)) {
+    loop {
+        match (parts_a.next(), parts_b.next()) {
             (None, None) => return Ordering::Equal,
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
-            (Some(&pa), Some(&pb)) => {
+            (Some(pa), Some(pb)) => {
                 let ord = compare_id_part(pa, pb);
                 if ord != Ordering::Equal {
                     return ord;
@@ -118,7 +118,6 @@ fn compare_layer_id(a: &str, b: &str) -> Ordering {
             }
         }
     }
-    Ordering::Equal
 }
 
 /// 比较单个 ID 部分：数字按数值，字符串按字典序，数字优先于字符串。
@@ -152,6 +151,22 @@ pub struct Scene {
 impl Scene {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Snapshot for transition rendering only. Event handlers are needed by
+    /// the live scene and saves, but never by draw-list construction. Avoid
+    /// copying their script parameter maps at every rendered frame.
+    pub fn render_snapshot(&self) -> Self {
+        Self {
+            roots: self.roots.clone(),
+            root_props: self.root_props.clone(),
+            nodes: self.nodes.iter().map(|(id, layer)| (id.clone(), Layer {
+                id: layer.id.clone(), file: layer.file.clone(), mask: layer.mask.clone(),
+                solid_color: layer.solid_color, props: layer.props.clone(),
+                tweens: layer.tweens.clone(), children: layer.children.clone(),
+                event_handlers: HashMap::new(),
+            })).collect(),
+        }
     }
 
     pub fn replace_with(&mut self, other: Scene) {
@@ -263,9 +278,16 @@ impl Scene {
 
     /// 获取指定图层的子图层 ID，按 Artemis 图层顺序排序。
     pub fn children(&self, id: &str) -> Vec<String> {
+        self.children_borrowed(id).into_iter().map(str::to_owned).collect()
+    }
+
+    /// Read-only traversal borrows IDs instead of allocating each string.
+    /// Keep the pre-01.04 traversal while the Vita regression is investigated.
+    /// Sorting borrowed IDs avoids taking a pthread mutex for every subtree.
+    pub fn children_borrowed(&self, id: &str) -> Vec<&str> {
         self.get(id)
             .map(|layer| {
-                let mut sorted = layer.children.clone();
+                let mut sorted: Vec<_> = layer.children.iter().map(String::as_str).collect();
                 sorted.sort_by(|a, b| compare_layer_id(a, b));
                 sorted
             })
@@ -282,7 +304,11 @@ impl Scene {
 
     /// 顶层节点 ID，按 Artemis 图层顺序排序（数字优先，数字按值，字符串按字典序）。
     pub fn roots(&self) -> Vec<String> {
-        let mut sorted = self.roots.clone();
+        self.roots_borrowed().into_iter().map(str::to_owned).collect()
+    }
+
+    pub fn roots_borrowed(&self) -> Vec<&str> {
+        let mut sorted: Vec<_> = self.roots.iter().map(String::as_str).collect();
         sorted.sort_by(|a, b| compare_layer_id(a, b));
         sorted
     }
@@ -324,6 +350,7 @@ impl Scene {
                 && !mask.is_empty()
             {
                 files.insert(mask.clone());
+                files.insert(crate::render_pipeline::draw::masked_texture_name(mask, mask));
             }
 
             if layer
@@ -599,6 +626,29 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_traversal_preserves_numeric_overlay_and_stable_equal_order() {
+        let mut scene = Scene::new();
+        for id in ["1.10", "1.2", "1.-1", "1.01", "1.1", "1.name", "1.9223372036854775808"] {
+            scene.ensure(id);
+        }
+        assert_eq!(scene.children_borrowed("1"), [
+            "1.-1", "1.01", "1.1", "1.2", "1.10", "1.9223372036854775808", "1.name"
+        ]);
+        // Direct public mutation must be reflected without a stale ordering cache.
+        scene.get_mut("1").unwrap().children.swap(3, 4);
+        assert_eq!(&scene.children_borrowed("1")[1..3], ["1.1", "1.01"]);
+        assert!(scene.children_borrowed("missing").is_empty());
+        scene.ensure("@art3m1s-message-test");
+        scene.ensure("z");
+        scene.ensure("-1");
+        let saved: Scene = serde_json::from_str(&serde_json::to_string(&scene).unwrap()).unwrap();
+        assert_eq!(saved.roots_borrowed(), ["-1", "1", "z", "@art3m1s-message-test"]);
+        assert_eq!(saved.children_borrowed("1"), scene.children_borrowed("1"));
+        assert_eq!(compare_layer_id("1.2", "1.2.0"), Ordering::Less);
+        assert_eq!(compare_layer_id("1.+2", "1.02"), Ordering::Equal);
+    }
+
+    #[test]
     fn rename_moves_subtree() {
         let mut scene = Scene::new();
         scene.create("1.0", Some("a".into()));
@@ -616,6 +666,62 @@ mod tests {
                 .children
                 .contains(&"1.9".to_string())
         );
+    }
+
+    #[test]
+    fn borrowed_order_matches_after_mutations_snapshot_and_save_reload() {
+        fn check(scene: &Scene) {
+            let mut expected: Vec<_> = scene.roots.iter().map(String::as_str).collect();
+            expected.sort_by(|a,b| compare_layer_id(a,b));
+            assert_eq!(scene.roots_borrowed(), expected);
+            for (id, layer) in &scene.nodes {
+                let mut expected: Vec<_> = layer.children.iter().map(String::as_str).collect();
+                expected.sort_by(|a,b| compare_layer_id(a,b));
+                assert_eq!(scene.children_borrowed(id), expected);
+            }
+        }
+        let mut scene = Scene::new();
+        for id in ["1.01", "1.1", "1.+1", "1.10", "1.-5", "2.5", "1.word", "@art3m1s-message-test"] { scene.ensure(id); }
+        for i in 0..40 {
+            check(&scene);
+            scene.get_mut("1").unwrap().children.rotate_left(1);
+            let id = format!("1.{}", 100-i);
+            scene.ensure(&id);
+            check(&scene);
+            scene.delete(&id);
+            check(&scene);
+            assert!(scene.rename("2", "3")); check(&scene);
+            assert!(scene.rename("3", "2")); check(&scene);
+            check(&scene.render_snapshot());
+            let json = serde_json::to_string(&scene).unwrap();
+            assert!(!json.contains("traversal_order"));
+            let loaded: Scene = serde_json::from_str(&json).unwrap();
+            check(&loaded);
+            assert_eq!(serde_json::to_string(&loaded.root_props).unwrap(), serde_json::to_string(&scene.root_props).unwrap());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual host microbenchmark; does not measure Vita frame rate"]
+    fn benchmark_cached_scene_order() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut scene = Scene::new();
+        for i in 0..64 { scene.ensure(&format!("1.2.{}", (i*37)%64)); }
+        let live = &scene.get("1.2").unwrap().children;
+        scene.children_borrowed("1.2");
+        let rounds = 20000;
+        let begin = Instant::now();
+        for _ in 0..rounds {
+            let mut sorted: Vec<_> = live.iter().map(String::as_str).collect();
+            sorted.sort_by(|a,b| compare_layer_id(a,b));
+            black_box(sorted);
+        }
+        let baseline = begin.elapsed();
+        let begin = Instant::now();
+        for _ in 0..rounds { black_box(scene.children_borrowed(black_box("1.2"))); }
+        let cached = begin.elapsed();
+        println!("ORDER_BENCH rounds={rounds} siblings=64 uncached_us={} cached_us={} ratio={:.2}", baseline.as_micros(), cached.as_micros(), baseline.as_secs_f64()/cached.as_secs_f64());
     }
 
     #[test]

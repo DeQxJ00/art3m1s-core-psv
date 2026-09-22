@@ -37,23 +37,25 @@ pub(crate) fn take_profile_io_counters() -> HostFfiProfile {
     HOST_FFI_PROFILE.with(|cell| cell.replace(HostFfiProfile::default()))
 }
 
-fn begin_profile_io() -> Option<std::time::Instant> {
+fn begin_profile_io() -> Option<crate::profile_clock::Instant> {
     PROFILE_IO
         .load(Ordering::Relaxed)
-        .then(std::time::Instant::now)
+        .then(crate::profile_clock::Instant::now)
 }
 
-fn finish_profile_io(started: Option<std::time::Instant>, bytes: usize) {
+fn finish_profile_io(started: Option<crate::profile_clock::Instant>, bytes: usize) {
     let Some(started) = started else {
         return;
     };
     HOST_FFI_PROFILE.with(|cell| {
         let mut value = cell.get();
-        value.calls = value.calls.saturating_add(1);
+        // Reset on collection. Avoid LLVM's paired u64 saturating NEON add:
+        // Vita3K cannot execute that instruction on the profiling path.
+        value.calls = value.calls.wrapping_add(1);
         value.elapsed_ns = value
             .elapsed_ns
-            .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-        value.bytes = value.bytes.saturating_add(bytes as u64);
+            .wrapping_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        value.bytes = value.bytes.wrapping_add(bytes as u64);
         cell.set(value);
     });
 }
@@ -136,6 +138,22 @@ pub fn damage_visualization_enabled() -> bool {
 type LogCallback = unsafe extern "C" fn(level: *const c_char, msg: *const c_char);
 
 static LOG_CB: Mutex<Option<LogCallback>> = Mutex::new(None);
+
+// Optional host scheduling policy. Called on the worker itself, before it
+// acquires loader locks. Other hosts keep their existing scheduling unchanged.
+type WorkerInitCallback = unsafe extern "C" fn(role: *const c_char);
+static WORKER_INIT_CB: Mutex<Option<WorkerInitCallback>> = Mutex::new(None);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn art3m1s_register_worker_init_callback(cb: Option<WorkerInitCallback>) {
+    *WORKER_INIT_CB.lock().unwrap() = cb;
+}
+
+pub(crate) fn worker_started(role: &std::ffi::CStr) {
+    let cb = *WORKER_INIT_CB.lock().unwrap();
+    // Release the registration lock before invoking foreign code.
+    if let Some(cb) = cb { unsafe { cb(role.as_ptr()) }; }
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_register_log_callback(cb: LogCallback) {
@@ -629,22 +647,17 @@ pub fn query_window_state() -> (bool, bool) {
 
 // ── Save directory ───────────────────────────────────────────────
 
-// The Flutter host can create several runtimes in one process (for example
-// when switching games). This value must therefore be replaceable; OnceLock
-// would silently keep the first game's directory forever.
-static SAVE_DIR: Mutex<Option<String>> = Mutex::new(None);
+static SAVE_DIR: OnceLock<String> = OnceLock::new();
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_set_save_dir(dir: *const c_char) {
-    if dir.is_null() {
-        *SAVE_DIR.lock().unwrap() = None;
-    } else if let Ok(s) = unsafe { std::ffi::CStr::from_ptr(dir).to_str() } {
-        *SAVE_DIR.lock().unwrap() = Some(s.to_string());
+    if let Ok(s) = unsafe { std::ffi::CStr::from_ptr(dir).to_str() } {
+        let _ = SAVE_DIR.set(s.to_string());
     }
 }
 
-pub fn save_dir() -> Option<String> {
-    SAVE_DIR.lock().unwrap().clone()
+pub fn save_dir() -> Option<&'static str> {
+    SAVE_DIR.get().map(|s| s.as_str())
 }
 
 // ── Query helpers ────────────────────────────────────────────────
@@ -1076,6 +1089,28 @@ pub unsafe extern "C" fn art3m1s_runtime_feed_key(rt: *mut CoreRuntime, vk: u32,
     }
 }
 
+/// Semantic actions for the Direct host: menu, auto, backlog, quick save/load,
+/// save/load, config, and advance. Zero means unavailable, not a fallback key.
+#[cfg(feature = "gxm-menu-key-alias")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_host_action_key(rt: *const CoreRuntime, action: u32) -> u32 {
+    let Some(rt) = (unsafe { rt.as_ref() }) else { return 0; };
+    let Some(action) = ["MENU", "AUTO", "BACKLOG", "QSAVE", "QLOAD", "SAVE", "LOAD", "CONFIG", "CLICK"].get(action as usize) else { return 0; };
+    rt.host_action_key(action)
+}
+
+#[cfg(feature = "gxm-menu-key-alias")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_has_native_host_menu(rt: *const CoreRuntime) -> i32 {
+    unsafe { rt.as_ref() }.is_some_and(|rt| rt.has_native_host_menu()) as i32
+}
+
+#[cfg(feature = "gxm-menu-key-alias")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_host_menu_context(rt: *const CoreRuntime) -> i32 {
+    unsafe { rt.as_ref() }.is_some_and(|rt| rt.host_menu_context()) as i32
+}
+
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_runtime_submit_dialog(
@@ -1215,7 +1250,7 @@ pub unsafe extern "C" fn art3m1s_runtime_advance_without_render(
 
 /// Attaches a host platform texture to the runtime.
 /// `kind`: 1 = Android ANativeWindow, 2 = Apple IOSurface,
-/// 3 = Apple MTLTexture imported through EGLImage.
+/// 3 = Apple MTLTexture imported through EGLImage; 4 = Vita display (null handle).
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_runtime_set_external_surface(
@@ -1225,7 +1260,8 @@ pub unsafe extern "C" fn art3m1s_runtime_set_external_surface(
     width: u32,
     height: u32,
 ) -> i32 {
-    if rt.is_null() || handle.is_null() || width == 0 || height == 0 {
+    let vita_display = cfg!(target_os = "vita") && kind == 4;
+    if rt.is_null() || (handle.is_null() && !vita_display) || width == 0 || height == 0 {
         return 0;
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1288,6 +1324,33 @@ pub unsafe extern "C" fn art3m1s_runtime_advance_and_present(
     }
 }
 
+#[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_prepare_gxm_textures(rt: *mut CoreRuntime) -> i32 {
+    if rt.is_null() { return -1; }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { &mut *rt }.prepare_gxm_textures();
+    })) {
+        Ok(()) => 0,
+        Err(_) => { core_error!("GXM font texture preparation panicked"); -1 }
+    }
+}
+
+#[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_present_gxm(rt: *mut CoreRuntime) -> i32 {
+    if rt.is_null() { return -1; }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { &mut *rt }.present_gxm()
+    })) {
+        Ok(changed) => i32::from(changed),
+        Err(panic_info) => {
+            core_error!("GXM present panicked: {}", panic_msg(&panic_info));
+            -1
+        }
+    }
+}
+
 /// Enables the per-runtime asynchronous profiler. The render thread only
 /// records timestamps and performs a non-blocking queue send; aggregation is
 /// performed by a dedicated worker.
@@ -1299,6 +1362,52 @@ pub unsafe extern "C" fn art3m1s_runtime_set_profiler_enabled(
 ) {
     if !rt.is_null() {
         unsafe { &*rt }.set_profiler_enabled(enabled != 0);
+    }
+}
+
+/// Controls omission of unused damage keys in the full-frame GXM path.
+/// Call on the runtime owner thread, outside any other runtime operation.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_gxm_keyless_enabled(
+    rt: *mut CoreRuntime,
+    enabled: c_int,
+) {
+    if let Some(runtime) = unsafe { rt.as_mut() } {
+        runtime.set_gxm_keyless_enabled(enabled != 0);
+    }
+}
+
+/// Controls completed text command memoization for same-scene comparisons.
+/// Call on the runtime owner thread, outside any other runtime operation.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_text_command_cache_enabled(
+    rt: *mut CoreRuntime,
+    enabled: c_int,
+) {
+    if let Some(runtime) = unsafe { rt.as_mut() } {
+        runtime.set_text_command_cache_enabled(enabled != 0);
+    }
+}
+
+/// Changes host presentation only; original script font tags remain unchanged.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_message_font_sizes(rt: *mut CoreRuntime, enabled: c_int, name: u32, dialogue: u32) -> c_int {
+    unsafe { rt.as_mut() }.map_or(0, |r| i32::from(r.set_message_font_sizes(enabled != 0, name, dialogue)))
+}
+
+/// Controls text layout memoization for same-scene diagnostic comparisons.
+/// Call on the runtime owner thread, outside any other runtime operation.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_text_layout_cache_enabled(
+    rt: *mut CoreRuntime,
+    enabled: c_int,
+) {
+    if let Some(runtime) = unsafe { rt.as_mut() } {
+        runtime.set_text_layout_cache_enabled(enabled != 0);
     }
 }
 
@@ -1362,6 +1471,14 @@ pub unsafe extern "C" fn art3m1s_runtime_notify_video_finished(
         unsafe { std::ffi::CStr::from_ptr(id).to_str().ok() }
     };
     rt.notify_video_finished(id);
+}
+
+/// Host calls only between frames, outside any other runtime call/GXM scene.
+#[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_reclaim_video_gpu_cache(rt:*mut CoreRuntime,bytes:usize)->usize {
+    if rt.is_null(){return 0;}
+    unsafe{&mut *rt}.reclaim_video_gpu_cache(bytes)
 }
 
 /// libmpv OpenGL resolver callback. `ctx` must be the runtime pointer supplied
@@ -1501,6 +1618,53 @@ pub unsafe extern "C" fn art3m1s_runtime_upload_video_layer_frame(
         Err(panic_info) => {
             core_error!(
                 "art3m1s_runtime_upload_video_layer_frame panicked: {}",
+                panic_msg(&panic_info)
+            );
+            0
+        }
+    }
+}
+
+// Host publishes completed GPU-owned RGBA; no per-frame CPU mirror.
+#[cfg(all(target_os = "vita", feature = "gxm-backend", feature = "gl-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_upload_video_layer_shared_frame(
+    rt: *mut CoreRuntime,
+    id: *const c_char,
+    width: u32,
+    height: u32,
+    rgba: *const u8,
+    rgba_len: usize,
+) -> c_int {
+    if rt.is_null() || id.is_null() || rgba.is_null() || width == 0 || height == 0 {
+        return 0;
+    }
+    let Ok(id) = (unsafe { std::ffi::CStr::from_ptr(id).to_str() }) else {
+        return 0;
+    };
+    if id.is_empty() {
+        return 0;
+    }
+    let Some(expected_len) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return 0;
+    };
+    if rgba_len < expected_len {
+        return 0;
+    }
+
+    let rgba = unsafe { std::slice::from_raw_parts(rgba, expected_len) };
+    let rt = unsafe { &mut *rt };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.upload_video_layer_shared_frame(id, width, height, rgba)
+    })) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(panic_info) => {
+            core_error!(
+                "art3m1s_runtime_upload_video_layer_shared_frame panicked: {}",
                 panic_msg(&panic_info)
             );
             0
@@ -1665,8 +1829,8 @@ pub unsafe extern "C" fn art3m1s_runtime_set_reported_os(rt: *mut CoreRuntime, o
 #[cfg(test)]
 mod tests {
     use super::{
-        font_override, log_suppressed_by_filter, path_candidates, save_dir,
-        script_debug_print_allowed, set_font_override, set_log_filter, set_script_debug_config,
+        font_override, log_suppressed_by_filter, path_candidates, script_debug_print_allowed,
+        set_font_override, set_log_filter, set_script_debug_config,
     };
 
     /// 日志过滤钩子是进程级状态，单测里串行验证后卸载，避免影响其它测试。
@@ -1740,16 +1904,23 @@ mod tests {
         let after = font_override().map(|(generation, _)| generation);
         assert_eq!(before, after);
     }
+}
 
-    #[test]
-    fn save_dir_can_switch_between_game_runtimes() {
-        let first = std::ffi::CString::new("/tmp/game-one").unwrap();
-        let second = std::ffi::CString::new("/tmp/game-two").unwrap();
-        unsafe { super::art3m1s_set_save_dir(first.as_ptr()) };
-        assert_eq!(save_dir().as_deref(), Some("/tmp/game-one"));
-        unsafe { super::art3m1s_set_save_dir(second.as_ptr()) };
-        assert_eq!(save_dir().as_deref(), Some("/tmp/game-two"));
-        unsafe { super::art3m1s_set_save_dir(std::ptr::null()) };
-        assert_eq!(save_dir(), None);
+/// Controls ordered, exact live-message input comparison for same-scene A/B.
+/// Call on the runtime owner thread, outside any other runtime operation.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_message_cache_enabled(
+    rt: *mut CoreRuntime,
+    enabled: c_int,
+) {
+    if let Some(runtime) = unsafe { rt.as_mut() } {
+        runtime.set_message_cache_enabled(enabled != 0);
     }
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "gl-backend")]
+pub unsafe extern "C" fn art3m1s_runtime_set_text_epoch_enabled(rt: *mut crate::runtime::CoreRuntime, enabled: i32) {
+    if let Some(runtime) = unsafe { rt.as_mut() } { runtime.set_text_epoch_enabled(enabled != 0); }
 }
