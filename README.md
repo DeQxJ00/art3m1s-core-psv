@@ -68,22 +68,6 @@ E-Mote 后端选择：默认内置；宿主在加载项目前调用
 
 版本详情见 [CHANGELOG.md](CHANGELOG.md)。
 
-## 上游贡献与移植署名
-
-感谢 [Alphaly2K/art3m1s-core](https://github.com/Alphaly2K/art3m1s-core)。
-下列修复的原作者均为 **Alphaly2K**（`52882149+Alphaly2K@users.noreply.github.com`），
-PSV 适配与回归验证由 **DeQxJ00** 维护。
-
-| 上游提交 | PSV 移植提交 | 内容 |
-| --- | --- | --- |
-| [`55d7b04`](https://github.com/Alphaly2K/art3m1s-core/commit/55d7b04d9edade535f8b67a4c87687154ecbd941) | `a4391fd` | 默认滚轮前进与历史记录操作 |
-| [`451f842`](https://github.com/Alphaly2K/art3m1s-core/commit/451f842fc2b55975be8933ef8845daba2dfabf54) | `690091a` | 图层子树的事件处理器状态 |
-| [`e54a5f9`](https://github.com/Alphaly2K/art3m1s-core/commit/e54a5f9495febbce2b6c992d61ed588c787c99df)、[`da58747`](https://github.com/Alphaly2K/art3m1s-core/commit/da5874778e038dce3819b2f9cfe1d95e6e93319f) | `19d7b58` | 读档等待、文字页恢复及辅助跳转 |
-
-后续直接 cherry-pick 使用 `-x` 保留原作者和来源提交；需要重写或合并多项修复时，
-保留 PSV 适配作者，在提交正文列出完整上游 SHA，并用 `Co-authored-by` 标明实际参与该修复的上游作者。
-以上已发布提交通过本记录补充署名，原提交 SHA 保持不变。
-
 ## 许可证
 
 [MPL-2.0](LICENSE)：文件级 copyleft——修改本仓库已覆盖的文件需以 MPL-2.0
