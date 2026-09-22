@@ -1308,6 +1308,49 @@ mod tests {
     }
 
     #[test]
+    fn lyevent_group_reset_is_scoped_and_enable_does_not_invent_handlers() {
+        let mut c = Compositor::new();
+        for id in ["panel.first", "panel.nested.second", "panel2.other"] {
+            c.apply_event(&create(id, "button"));
+            for event_type in ["click", "rollover"] {
+                c.apply_event(&Event::LayerEventHandler {
+                    id: id.into(), event_type: event_type.into(), mode: "init".into(),
+                    file: None, label: None, call: false, handler: Some("calllua".into()),
+                    penetration: false,
+                    extra_params: HashMap::from([("key".into(), id.into())]),
+                });
+            }
+        }
+        for mode in ["disable", "enable", "reset"] {
+            c.apply_event(&Event::LayerEventHandler {
+                id: "panel".into(), event_type: "click".into(), mode: mode.into(),
+                file: None, label: None, call: false, handler: None,
+                penetration: false, extra_params: HashMap::new(),
+            });
+            assert!(c.scene().get("panel").unwrap().event_handlers.is_empty());
+            for id in ["panel.first", "panel.nested.second"] {
+                let handlers = &c.scene().get(id).unwrap().event_handlers;
+                assert!(handlers["rollover"].enabled);
+                if mode == "reset" {
+                    assert!(!handlers.contains_key("click"));
+                } else {
+                    assert_eq!(handlers["click"].enabled, mode == "enable");
+                    assert_eq!(handlers["click"].params["key"], id);
+                }
+            }
+            assert!(c.scene().get("panel2.other").unwrap().event_handlers["click"].enabled);
+        }
+        for mode in ["disable", "reset"] {
+            c.apply_event(&Event::LayerEventHandler {
+                id: "missing".into(), event_type: "click".into(), mode: mode.into(),
+                file: None, label: None, call: false, handler: None,
+                penetration: false, extra_params: HashMap::new(),
+            });
+            assert!(c.scene().get("missing").is_none());
+        }
+    }
+
+    #[test]
     fn hit_test_clickablethreshold_uses_texture_alpha_not_layer_alpha() {
         let mut c = Compositor::new();
         c.apply_event(&create("dock", "dockarea"));
