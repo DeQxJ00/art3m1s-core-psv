@@ -12,6 +12,7 @@ use crate::render_pipeline::draw::{
     LayerShaderGroupKind, ShaderEffect, ShaderGroup, ShaderGroupKey, TextureProvider,
 };
 use glam::{Affine2, Vec2};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 /// 在时刻 `now_ms` 把 `scene` 构建成一帧绘制列表。
@@ -44,7 +45,38 @@ pub fn build_frame_with_content(
     text_for: Option<&mut LayerDrawSource<'_>>,
     file_overrides: Option<&std::collections::HashMap<String, String>>,
 ) -> DrawList {
-    let mut frame = DrawList::new();
+    build_frame_with_command_keys(scene, now_ms, provider, content_for, text_for, file_overrides, true)
+}
+
+/// Backends that redraw the complete target can omit per-command damage keys.
+/// Commands, masks, effects and their ordering remain identical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_frame_with_command_keys(
+    scene: &Scene,
+    now_ms: u64,
+    provider: &mut dyn TextureProvider,
+    content_for: Option<&mut LayerDrawSource<'_>>,
+    text_for: Option<&mut LayerDrawSource<'_>>,
+    file_overrides: Option<&std::collections::HashMap<String, String>>,
+    record_command_keys: bool,
+) -> DrawList {
+    build_frame_reusing(scene, now_ms, provider, content_for, text_for,
+        file_overrides, record_command_keys, DrawList::new())
+}
+
+/// Rebuild into an already consumed CPU list; GPU submission buffers are separate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_frame_reusing(
+    scene: &Scene,
+    now_ms: u64,
+    provider: &mut dyn TextureProvider,
+    content_for: Option<&mut LayerDrawSource<'_>>,
+    text_for: Option<&mut LayerDrawSource<'_>>,
+    file_overrides: Option<&std::collections::HashMap<String, String>>,
+    record_command_keys: bool,
+    mut frame: DrawList,
+) -> DrawList {
+    frame.clear_for_rebuild();
     let mut content_for = content_for;
     let mut text_for = text_for;
     // `[lyprop id="!"]`：根图层属性作用于整棵场景树。
@@ -54,10 +86,10 @@ pub fn build_frame_with_content(
     }
     let root_transform = root_props.local_transform();
     let root_opacity = root_props.opacity();
-    for root in scene.roots() {
+    for root in scene.roots_borrowed() {
         visit(
             scene,
-            &root,
+            root,
             now_ms,
             root_transform,
             root_opacity,
@@ -65,12 +97,21 @@ pub fn build_frame_with_content(
             None,
             provider,
             &mut frame,
+            record_command_keys,
             &mut content_for,
             &mut text_for,
             file_overrides,
         );
     }
     frame
+}
+
+fn push_scene_command(
+    frame: &mut DrawList, record_command_keys: bool, id: &str,
+    kind: LayerCommandKind, ordinal: usize, command: DrawCommand,
+) {
+    if record_command_keys { frame.push_layer(id, kind, ordinal, command); }
+    else { frame.push(command); }
 }
 
 /// 递归访问一个节点：合成本地变换，向子节点继承，产出绘制命令。
@@ -85,6 +126,7 @@ fn visit(
     inherited_shader: Option<ShaderEffect>,
     provider: &mut dyn TextureProvider,
     frame: &mut DrawList,
+    record_command_keys: bool,
     content_for: &mut Option<&mut LayerDrawSource<'_>>,
     text_for: &mut Option<&mut LayerDrawSource<'_>>,
     file_overrides: Option<&std::collections::HashMap<String, String>>,
@@ -105,16 +147,20 @@ fn visit(
     let world = parent_transform * local;
     let intermediate_mode = props.intermediate_render.unwrap_or(0);
     let intermediate_render = intermediate_mode != 0;
+    let intermediate_mask = props.custom.get("intermediate_render_mask")
+        .filter(|name| !name.is_empty());
     // 中间渲染层的自身效果必须在子树合成后应用一次。把 alpha 乘到每个子层会让
     // 眼睛/嘴/脸等重叠区域重复透出底层，结果与 Artemis 的组渲染不同。
-    let opacity = parent_opacity
-        * if intermediate_render {
-            1.0
-        } else {
-            props.opacity()
-        };
+    // Inherited alpha belongs to the completed intermediate image too. An
+    // ordinary ancestor (e.g. character fade) must not make overlapping body
+    // and face sprites translucent before they are composed into this group.
+    let opacity = if intermediate_render {
+        1.0
+    } else {
+        parent_opacity * props.opacity()
+    };
     let clip_bounds = subtree_clip_bounds(&props, world, parent_clip, provider);
-    let children = scene.children(id);
+    let children = scene.children_borrowed(id);
     let local_shader = declared_shader(scene, &props, provider);
     let group_shader = local_shader
         .as_ref()
@@ -157,7 +203,7 @@ fn visit(
         } else {
             ClipRect::full(info)
         };
-        frame.push_layer(
+        push_scene_command(frame, record_command_keys,
             id,
             LayerCommandKind::Visual,
             0,
@@ -193,7 +239,7 @@ fn visit(
     {
         // `lyc` 缺省 file 的单色图层：1x1 纯色纹理拉伸到 width×height。
         // 颜色（含 AARRGGBB 的 alpha）烘焙在纹理里，图层 alpha 继续走 opacity。
-        frame.push_layer(
+        push_scene_command(frame, record_command_keys,
             id,
             LayerCommandKind::Visual,
             0,
@@ -237,7 +283,7 @@ fn visit(
             if cmd.shader.is_none() {
                 cmd.shader = command_shader.clone();
             }
-            frame.push_layer(id, LayerCommandKind::Content, ordinal, cmd);
+            push_scene_command(frame, record_command_keys, id, LayerCommandKind::Content, ordinal, cmd);
         }
     }
 
@@ -245,7 +291,7 @@ fn visit(
     for child in children {
         visit(
             scene,
-            &child,
+            child,
             now_ms,
             world,
             opacity,
@@ -253,6 +299,7 @@ fn visit(
             command_shader.clone(),
             provider,
             frame,
+            record_command_keys,
             content_for,
             text_for,
             file_overrides,
@@ -265,7 +312,7 @@ fn visit(
             cmd.transform = world * cmd.transform;
             cmd.opacity *= opacity;
             cmd.clip_bounds = intersect_clip_bounds(cmd.clip_bounds, clip_bounds);
-            frame.push_layer(id, LayerCommandKind::Text, ordinal, cmd);
+            push_scene_command(frame, record_command_keys, id, LayerCommandKind::Text, ordinal, cmd);
         }
     }
 
@@ -291,7 +338,7 @@ fn visit(
         if end > group_start {
             let color = color_filter(&props);
             let uniforms = BTreeMap::from([
-                ("alpha".to_string(), vec![props.opacity()]),
+                ("alpha".to_string(), vec![parent_opacity * props.opacity()]),
                 ("colorMultiply".to_string(), color.multiply.to_vec()),
                 (
                     "grayscale".to_string(),
@@ -303,14 +350,28 @@ fn visit(
                 ),
                 (
                     "opaque".to_string(),
-                    vec![if intermediate_mode == 2 { 1.0 } else { 0.0 }],
+                    // Native otomeriron preserves coverage for mode 2, too.
+                    // The mode selects intermediate rendering, not opaque
+                    // output: forcing alpha=1 blacks out the background behind
+                    // an unmasked grayscale character (ar_gray).
+                    vec![0.0],
                 ),
                 ("blendMode".to_string(), vec![group_blend_uniform(&props)]),
             ]);
-            let mask_texture = props
-                .custom
-                .get("intermediate_render_mask")
-                .and_then(|file| provider.resolve(file).map(|(texture, _)| texture));
+            // intermediate_render_mask is a local grayscale image, not an
+            // RGBA alpha texture stretched across the screen. Reuse the cached
+            // file+gray-mask conversion and rasterize it in the layer's space.
+            let mask_range = intermediate_mask.and_then(|file| {
+                let (texture, size) = provider.resolve_with_mask(file, file)?;
+                let start = frame.mask_commands.len();
+                frame.mask_commands.push(DrawCommand {
+                    texture, size, transform: world, opacity: 1.0,
+                    blend: BlendMode::Alpha, color: ColorFilter::default(),
+                    clip: ClipRect::full(size), clip_bounds,
+                    shader: None, mesh: None, stencil: None, native_emote: None,
+                });
+                Some([start, start + 1])
+            });
             frame.push_shader_group(ShaderGroup {
                 key: Some(ShaderGroupKey::Layer {
                     layer_id: id.to_owned(),
@@ -321,11 +382,11 @@ fn visit(
                 effect: ShaderEffect {
                     name: crate::render_pipeline::shader::GROUP_COMPOSITE_SHADER.to_string(),
                     uniforms,
-                    mask_texture,
+                    mask_texture: None,
                     user_texture: None,
                 },
                 clip_bounds,
-                mask_range: None,
+                mask_range,
             });
         }
     }
@@ -418,9 +479,14 @@ fn shader_uniform_value(props: &LayerProps, name: &str) -> Option<Vec<f32>> {
     (!values.is_empty()).then_some(values)
 }
 
-/// 复制属性并叠加当前时刻的缓动值。
-pub(crate) fn resolved_props(layer: &crate::compositor::scene::Layer, now_ms: u64) -> LayerProps {
-    let mut props = layer.props.clone();
+/// Borrow unchanged properties; copy only when an active tween overlays a value.
+/// Rendering, hit testing and Lua queries share this path, so copying every
+/// layer's strings and custom map here is costly even for a stationary scene.
+pub(crate) fn resolved_props(
+    layer: &crate::compositor::scene::Layer,
+    now_ms: u64,
+) -> Cow<'_, LayerProps> {
+    let mut props = Cow::Borrowed(&layer.props);
     for tween in &layer.tweens {
         // tweenset 组内同参数可排多段：未到启动时刻的成员不参与求值，
         // 否则其 from 值会盖掉正在播放的前一段。
@@ -428,7 +494,9 @@ pub(crate) fn resolved_props(layer: &crate::compositor::scene::Layer, now_ms: u6
             continue;
         }
         let value = tween.value_at(now_ms);
-        props.set_raw(&tween.param, &LayerProps::format_value(&tween.param, value));
+        props
+            .to_mut()
+            .set_raw(&tween.param, &LayerProps::format_value(&tween.param, value));
     }
     props
 }
@@ -522,6 +590,141 @@ mod tests {
     }
 
     #[test]
+    fn recycled_draw_list_preserves_frames_and_reuses_command_storage() {
+        let mut scene = Scene::new();
+        let mut provider = MockProvider::new();
+        scene.create("1", Some("background".into()));
+        scene.create("1.80", Some("face".into()));
+        scene.set_props("1", &raw(&[("intermediate_render", "1"), ("alpha", "160"),
+            ("grayscale", "1"), ("intermediate_render_mask", "mask")]));
+        let command = build_frame(&scene, 0, &mut provider, None).commands[0].clone();
+        let mut recycled = DrawList::new();
+        recycled.commands.reserve(512);
+        recycled.command_keys.reserve(512);
+        let storage = recycled.commands.as_ptr();
+        for tick in 0..240 {
+            // Exercise long/short/empty text, keys, groups and hidden roots.
+            scene.set_root_props(&raw(&[("visible", if tick % 17 == 0 { "0" } else { "1" })]));
+            scene.set_props("1", &raw(&[("rotate", &(tick % 30).to_string())]));
+            let count = (tick % 4) as usize * 100;
+            let mut text = |id: &str| if id == "1.80" { vec![command.clone(); count] } else { vec![] };
+            let keys = tick % 2 == 0;
+            let fresh = build_frame_with_command_keys(&scene, tick, &mut provider, None, Some(&mut text), None, keys);
+            // Simulate a prior stencil pass; stale masks/groups must be removed.
+            recycled.mask_commands.push(command.clone());
+            recycled = build_frame_reusing(&scene, tick, &mut provider, None, Some(&mut text), None, keys, recycled);
+            assert_eq!(fresh, recycled, "tick {tick}");
+            assert_eq!(storage, recycled.commands.as_ptr(), "CPU buffer was replaced");
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in CPU allocation benchmark; not Vita FPS"]
+    fn recycled_draw_list_benchmark() {
+        let mut scene = Scene::new();
+        let mut provider = MockProvider::new();
+        for i in 0..200 { scene.create(&i.to_string(), Some("sprite".into())); }
+        for reuse in [false, true] {
+            let mut frame = build_frame(&scene, 0, &mut provider, None);
+            let mut buffer_changes = 0;
+            let start = std::time::Instant::now();
+            for _ in 0..4000 {
+                let previous = frame.commands.as_ptr();
+                frame = build_frame_reusing(&scene, 0, &mut provider, None, None, None, false,
+                    if reuse { frame } else { DrawList::new() });
+                buffer_changes += usize::from(previous != frame.commands.as_ptr());
+                std::hint::black_box(&frame);
+            }
+            eprintln!("reuse={reuse} ns={} buffer_changes={buffer_changes}", start.elapsed().as_nanos()/4000);
+        }
+    }
+
+    #[test]
+    fn omitting_damage_keys_preserves_commands_groups_masks_and_order() {
+        use crate::render_pipeline::draw::StencilMetadata;
+        let mut provider = MockProvider::new();
+        let mut scene = Scene::new();
+        scene.create("1", Some("background".into()));
+        scene.create("1.80", Some("face".into()));
+        scene.create("1.8", Some("other-face".into()));
+        scene.set_props("1", &raw(&[("intermediate_render", "1"), ("alpha", "160"),
+            ("grayscale", "1"), ("intermediate_render_mask", "mask")]));
+        let command = build_frame(&scene, 0, &mut provider, None).commands[0].clone();
+        for tick in 0..128 {
+            scene.set_props("1", &raw(&[("left", &tick.to_string()), ("rotate", &(tick % 30).to_string())]));
+            let mut text = |id: &str| if id == "1.80" { vec![command.clone(); 80] } else { vec![] };
+            let mut content = |id: &str| {
+                if id != "1.8" { return vec![]; }
+                let mut mask = command.clone();
+                mask.stencil = Some(StencilMetadata { namespace: 1, source_label: "mask".into(), mask_labels: vec![] });
+                let mut sprite = command.clone();
+                sprite.stencil = Some(StencilMetadata { namespace: 1, source_label: "sprite".into(), mask_labels: vec!["mask".into()] });
+                vec![mask, sprite]
+            };
+            let mut keyed = build_frame_with_content(&scene, tick, &mut provider, Some(&mut content), Some(&mut text), None);
+            let mut unkeyed = build_frame_with_command_keys(&scene, tick, &mut provider, Some(&mut content), Some(&mut text), None, false);
+            assert_eq!(unkeyed.command_keys.len(), unkeyed.commands.len());
+            assert!(unkeyed.command_keys.iter().all(Option::is_none));
+            assert!(keyed.command_keys.iter().flatten().any(|k| k.layer_id == "1.80" && k.kind == LayerCommandKind::Text));
+            keyed.materialize_stencil_groups("alpha-mask");
+            unkeyed.materialize_stencil_groups("alpha-mask");
+            assert!(!keyed.mask_commands.is_empty());
+            assert_eq!(keyed.shader_groups.len(), 2);
+            keyed.command_keys.fill(None);
+            // Only stencil identity derives from the optional per-command key.
+            for group in &mut keyed.shader_groups {
+                if matches!(group.key, Some(ShaderGroupKey::Stencil { .. })) { group.key = None; }
+            }
+            assert_eq!(keyed, unkeyed);
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in CPU construction benchmark; not Vita FPS"]
+    fn damage_key_allocation_benchmark() {
+        let mut scene = Scene::new();
+        let id = "__message_overlay_6164763031";
+        scene.create(id, Some("background".into()));
+        let mut provider = MockProvider::new();
+        let command = build_frame(&scene, 0, &mut provider, None).commands[0].clone();
+        for count in [200, 600, 1800] {
+            for keys in [true, false] {
+                let mut source = |_: &str| vec![command.clone(); count];
+                let start = std::time::Instant::now();
+                for _ in 0..2000 {
+                    std::hint::black_box(build_frame_with_command_keys(&scene, 0, &mut provider,
+                        None, Some(&mut source), None, keys));
+                }
+                eprintln!("commands={count} keys={keys} ns={}", start.elapsed().as_nanos()/2000);
+            }
+        }
+    }
+
+    #[test]
+    fn render_snapshot_preserves_draws_without_copying_live_handlers() {
+        let mut scene = Scene::new();
+        scene.set_root_props(&raw(&[("left", "7")]));
+        scene.create("1", Some("background".into()));
+        scene.create("1.2", Some("face".into()));
+        scene.set_props("1", &raw(&[("intermediate_render", "1"), ("alpha", "180")]));
+        scene.set_props("1.2", &raw(&[("left", "25"), ("top", "30")]));
+        scene.get_mut("1.2").unwrap().event_handlers.insert("click".into(),
+            crate::compositor::scene::LayerEventHandler {
+                params: raw(&[("function", "next"), ("long_parameter", "retained in saves")]),
+                ..Default::default()
+            });
+        let full = scene.clone();
+        let snapshot = scene.render_snapshot();
+        let mut provider = MockProvider::new();
+        assert_eq!(build_frame(&full, 100, &mut provider, None), build_frame(&snapshot, 100, &mut provider, None));
+        assert_eq!(full.collect_files(), snapshot.collect_files());
+        assert!(snapshot.get("1.2").unwrap().event_handlers.is_empty());
+        assert!(!scene.get("1.2").unwrap().event_handlers.is_empty());
+        scene.set_props("1.2", &raw(&[("visible", "0")]));
+        assert_eq!(build_frame(&full, 100, &mut provider, None), build_frame(&snapshot, 100, &mut provider, None));
+    }
+
+    #[test]
     fn culls_invisible_layer_and_subtree() {
         let mut scene = Scene::new();
         scene.create("1", Some("bg".into()));
@@ -599,6 +802,69 @@ mod tests {
     }
 
     #[test]
+    fn intermediate_modes_preserve_unmasked_flashback_coverage() {
+        for mode in ["1", "2"] {
+            let mut scene = Scene::new();
+            scene.create("0", Some("background".into()));
+            scene.set_props("0", &raw(&[("grayscale", "1"), ("intermediate_render", mode)]));
+            scene.create("1.body", Some("body".into()));
+            scene.create("1.face", Some("face".into()));
+            scene.set_props("1", &raw(&[("grayscale", "1"), ("intermediate_render", mode),
+                ("alpha", "128")]));
+            scene.create("2", Some("vignette".into()));
+            let mut provider = MockProvider::new();
+            let frame = build_frame(&scene, 0, &mut provider, None);
+            assert_eq!(frame.commands.len(), 4);
+            assert_eq!(frame.shader_groups.len(), 2);
+            let bg = &frame.shader_groups[0];
+            let fg = &frame.shader_groups[1];
+            assert_eq!((bg.start, bg.end), (0, 1));
+            assert_eq!((fg.start, fg.end), (1, 3));
+            for group in &frame.shader_groups {
+                assert_eq!(group.effect.uniforms["opaque"], [0.0], "mode {mode} must retain coverage");
+                assert_eq!(group.effect.uniforms["grayscale"], [1.0]);
+                assert!(group.mask_range.is_none());
+            }
+            assert_eq!(fg.effect.uniforms["alpha"], [128.0 / 255.0]);
+            // Group opacity/color apply once after composing body and face.
+            for command in &frame.commands[1..3] {
+                assert_eq!(command.opacity, 1.0);
+                assert_eq!(command.color, ColorFilter::default());
+            }
+            assert_eq!(provider.name_of(frame.commands[3].texture), "vignette");
+        }
+    }
+
+    #[test]
+    fn masked_portrait_preserves_nested_coverage_and_uses_local_grayscale_mask() {
+        let mut scene = Scene::new();
+        scene.set_props("portrait", &raw(&[
+            ("left", "20"), ("top", "315"), ("xscale", "75"),
+            ("intermediate_render", "2"), ("intermediate_render_mask", "mask"),
+        ]));
+        scene.set_props("portrait.parts", &raw(&[("intermediate_render", "2")]));
+        scene.create("portrait.parts.face", Some("face".into()));
+        let mut provider = MockProvider::new();
+        let frame = build_frame(&scene, 0, &mut provider, None);
+        assert_eq!(frame.shader_groups.len(), 2);
+        for group in &frame.shader_groups {
+            assert_eq!(group.effect.uniforms["opaque"], vec![0.0]);
+        }
+        let outer = frame.shader_groups.last().unwrap();
+        assert_eq!(outer.mask_range, Some([0, 1]));
+        assert!(outer.effect.mask_texture.is_none());
+        let mask = &frame.mask_commands[0];
+        let cached = crate::render_pipeline::draw::masked_texture_name("mask", "mask");
+        assert_eq!(provider.name_of(mask.texture), cached);
+        assert_eq!(mask.transform.transform_point2(Vec2::ZERO), Vec2::new(20.0, 315.0));
+        assert_eq!(mask.transform.transform_point2(Vec2::new(256.0, 256.0)), Vec2::new(212.0, 571.0));
+        assert!(scene.collect_files().contains(&cached));
+        // Rebuilding a frame keeps the mask's cached texture identity.
+        let again = build_frame(&scene, 0, &mut provider, None);
+        assert_eq!(again.mask_commands[0].texture, mask.texture);
+    }
+
+    #[test]
     fn intermediate_render_mask_clips_subtree_to_mask_size() {
         let mut scene = Scene::new();
         scene.set_props(
@@ -656,6 +922,51 @@ mod tests {
             [128.0 / 255.0, 192.0 / 255.0, 1.0]
         );
         assert_eq!(group.effect.uniforms["blendMode"], [0.0]);
+    }
+
+    #[test]
+    fn intermediate_group_defers_ancestor_alpha_until_parts_are_composed() {
+        for mode in ["1", "2"] {
+            let mut scene = Scene::new();
+            scene.set_root_props(&raw(&[("alpha", "200")]));
+            scene.set_props("1", &raw(&[("alpha", "128")]));
+            scene.set_props("1.parts", &raw(&[("intermediate_render", mode), ("alpha", "160")]));
+            scene.create("1.parts.body", Some("body".into()));
+            scene.create("1.parts.face", Some("face".into()));
+            scene.set_props("1.parts.face", &raw(&[("alpha", "192")]));
+            scene.create("1.outside", Some("outside".into()));
+            let mut provider = MockProvider::new();
+            let frame = build_frame(&scene, 0, &mut provider, None);
+            let opacity_of = |name| frame.commands.iter()
+                .find(|cmd| provider.name_of(cmd.texture) == name).unwrap().opacity;
+            let ancestor = (200.0 / 255.0) * (128.0 / 255.0);
+            // The ordinary sibling inherits alpha; only content inside the RT
+            // starts at unit alpha, retaining its own local transparency.
+            assert!((opacity_of("outside") - ancestor).abs() < 0.00001);
+            assert_eq!(opacity_of("body"), 1.0);
+            assert_eq!(opacity_of("face"), 192.0 / 255.0);
+            assert_eq!(frame.shader_groups.len(), 1);
+            assert!((frame.shader_groups[0].effect.uniforms["alpha"][0]
+                - ancestor * (160.0 / 255.0)).abs() < 0.00001);
+        }
+    }
+
+    #[test]
+    fn nested_intermediate_groups_apply_each_ancestor_alpha_once() {
+        let mut scene = Scene::new();
+        scene.set_props("1", &raw(&[("alpha", "128")]));
+        scene.set_props("1.parts", &raw(&[("intermediate_render", "1"), ("alpha", "160")]));
+        scene.set_props("1.parts.middle", &raw(&[("alpha", "192")]));
+        scene.set_props("1.parts.middle.inner", &raw(&[("intermediate_render", "2"), ("alpha", "200")]));
+        scene.create("1.parts.middle.inner.body", Some("body".into()));
+        scene.create("1.parts.middle.inner.face", Some("face".into()));
+        let frame = build_frame(&scene, 0, &mut MockProvider::new(), None);
+        assert!(frame.commands.iter().all(|cmd| cmd.opacity == 1.0));
+        assert_eq!(frame.shader_groups.len(), 2);
+        assert!((frame.shader_groups[0].effect.uniforms["alpha"][0]
+            - (192.0 / 255.0) * (200.0 / 255.0)).abs() < 0.00001);
+        assert!((frame.shader_groups[1].effect.uniforms["alpha"][0]
+            - (128.0 / 255.0) * (160.0 / 255.0)).abs() < 0.00001);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! selection.  Concrete backends compile the selected shaders and execute the
 //! passes.
 
-use crate::compositor::build::build_frame_with_content;
+use crate::compositor::build::build_frame_with_command_keys;
 use crate::compositor::reduce::Compositor;
 use crate::compositor::scene::Scene;
 pub mod draw;
@@ -23,11 +23,19 @@ pub use shader::{BuiltinShaderManager, ShaderManager, ShaderProfile, ShaderProgr
 /// Stateless rendering pipeline view over a [`Compositor`].
 pub struct RenderPipeline<'a> {
     compositor: &'a Compositor,
+    record_command_keys: bool,
 }
 
 impl<'a> RenderPipeline<'a> {
     pub fn new(compositor: &'a Compositor) -> Self {
-        Self { compositor }
+        Self { compositor, record_command_keys: true }
+    }
+
+    /// Disable damage-comparison keys for a backend that redraws its whole target.
+    /// Shader group ranges and all rendering commands are preserved.
+    pub(crate) fn without_command_keys(mut self) -> Self {
+        self.record_command_keys = false;
+        self
     }
 
     /// Builds the final draw list and submits it to the backend.
@@ -58,11 +66,21 @@ impl<'a> RenderPipeline<'a> {
         content_for: Option<&mut LayerDrawSource<'_>>,
         text_for: Option<&mut LayerDrawSource<'_>>,
     ) -> DrawList {
+        self.build_composited_reusing(provider, content_for, text_for, DrawList::new())
+    }
+
+    pub(crate) fn build_composited_reusing(
+        &self,
+        provider: &mut dyn TextureProvider,
+        content_for: Option<&mut LayerDrawSource<'_>>,
+        text_for: Option<&mut LayerDrawSource<'_>>,
+        reusable: DrawList,
+    ) -> DrawList {
         let compositor = self.compositor;
         // [lyedit] 像素加工在进入帧构建前落地（需要 provider 才能读写像素）。
         compositor.process_layer_edits(provider);
         let overrides = compositor.layer_edit_overrides();
-        let mut frame = build_frame_with_content(
+        let mut frame = crate::compositor::build::build_frame_reusing(
             &compositor.scene,
             compositor.clock_ms,
             provider,
@@ -73,6 +91,8 @@ impl<'a> RenderPipeline<'a> {
             } else {
                 Some(&overrides)
             },
+            self.record_command_keys,
+            reusable,
         );
 
         transition::overlay_old_frame(
@@ -118,6 +138,12 @@ impl<'a> RenderPipeline<'a> {
         );
     }
 
+    /// Bind a host snapshot with its actual texture orientation (GXM is top-down).
+    pub fn capture_trans_external_texture(&self, texture: TextureId, info: TextureInfo, flipped_y: bool) {
+        transition::capture_external_texture(&self.compositor.trans_state,
+            self.compositor.clock_ms, texture, info, flipped_y);
+    }
+
     pub fn retained_files(&self) -> Vec<String> {
         let mut files = transition::retained_files(&self.compositor.trans_state);
         // [lyedit] 生成的加工后纹理不在场景 file 列表里，显式保活。
@@ -159,7 +185,7 @@ impl<'a> RenderPipeline<'a> {
         let compositor = self.compositor;
         compositor.process_layer_edits(provider);
         let overrides = compositor.layer_edit_overrides();
-        build_frame_with_content(
+        build_frame_with_command_keys(
             &compositor.scene,
             compositor.clock_ms,
             provider,
@@ -170,6 +196,7 @@ impl<'a> RenderPipeline<'a> {
             } else {
                 Some(&overrides)
             },
+            self.record_command_keys,
         )
     }
 
@@ -188,7 +215,7 @@ impl<'a> RenderPipeline<'a> {
     ) -> DrawList {
         self.compositor.process_layer_edits(provider);
         let overrides = self.compositor.layer_edit_overrides();
-        build_frame_with_content(
+        build_frame_with_command_keys(
             scene,
             clock_ms,
             provider,
@@ -199,6 +226,7 @@ impl<'a> RenderPipeline<'a> {
             } else {
                 Some(&overrides)
             },
+            self.record_command_keys,
         )
     }
 }

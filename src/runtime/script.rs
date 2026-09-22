@@ -59,39 +59,13 @@ impl CoreRuntime {
         }
 
         if self.wait_reason.is_none() {
-            self.maybe_restore_loaded_message_text();
             self.run_until_wait_or_complete(profile);
             // [autosave allow=2]：每次进入用户输入等待时自动保存。
-            // Only click/key waits. Trans/menu `wait input=1` would otherwise
-            // freeze the checkpoint on [adv] with sysbtn_mode=hide and skip the
-            // later `@` wait that actually owns the message window.
-            if wait_reason_is_input_wait(self.wait_reason.as_ref()) {
-                self.capture_gameplay_save_checkpoint();
-            }
             if wait_reason_is_input_wait(self.wait_reason.as_ref()) {
                 self.maybe_autosave_on_input_wait();
             }
         } else {
             self.advance_wait_state(clicked, delta_ms, profile);
-        }
-    }
-
-    pub(super) fn maybe_restore_loaded_message_text(&mut self) {
-        let Some(resume) = self.pending_load_resume.as_ref() else {
-            return;
-        };
-        let stack_len = self.interpreter.call_stack().len();
-        let at_restore = self.interpreter.current_script() == Some(resume.script.as_str())
-            && self.interpreter.current_line() == resume.line
-            && stack_len == resume.stack_len;
-        if at_restore && !self.has_queued_tags() {
-            self.pending_load_resume = None;
-            self.restore_pending_message_text();
-            return;
-        }
-        if stack_len < resume.stack_len || (stack_len == resume.stack_len && !at_restore) {
-            self.pending_load_resume = None;
-            self.restore_pending_message_text();
         }
     }
 
@@ -101,20 +75,19 @@ impl CoreRuntime {
     }
 
     fn run_until_wait_or_complete(&mut self, profile: &mut crate::profiler::FrameProfile) {
+        let mut skip_batch_started = None;
+        let mut skip_batch_waits = 0;
         loop {
-            self.maybe_restore_loaded_message_text();
             match self.interpreter.run() {
                 Ok(ExecutionResult::Wait(event))
                     if super::events::event_requires_state_sync(&event) =>
                 {
                     // A following script expression must observe this command's
                     // effect. Dispatch in order, without spending a display frame.
-                    self.maybe_restore_loaded_message_text();
                     self.interpreter.advance_line();
                     self.flush_host_events(profile);
                 }
                 Ok(ExecutionResult::Wait(Event::Wait { reason })) => {
-                    self.maybe_restore_loaded_message_text();
                     match &reason {
                         WaitReason::Timed { milliseconds, .. } => {
                             self.timed_remaining_ms = *milliseconds;
@@ -124,6 +97,9 @@ impl CoreRuntime {
                     }
                     self.wait_reason = Some(reason);
                     self.reset_control_wait_flags();
+                    if self.batch_debug_wait(profile, &mut skip_batch_started, &mut skip_batch_waits) {
+                        continue;
+                    }
                     break;
                 }
                 Ok(ExecutionResult::Wait(Event::VideoPlay { id: None, .. })) => {
@@ -172,6 +148,54 @@ impl CoreRuntime {
                 }
             }
         }
+    }
+
+    /// Chapter traversal need not spend two display frames on each @/wait 0.
+    /// Yield at real waits, explicit script requests, or a bounded work slice.
+    /// The frame callback and clocks still run only once per host tick.
+    fn batch_debug_wait(
+        &mut self,
+        profile: &mut crate::profiler::FrameProfile,
+        started: &mut Option<crate::profile_clock::Instant>,
+        waits: &mut usize,
+    ) -> bool {
+        let eligible = matches!(self.wait_reason.as_ref(),
+            Some(WaitReason::Generic | WaitReason::Generic0)
+            | Some(WaitReason::Timed { milliseconds: 0, .. }));
+        if !eligible || !self.can_batch_debug_skip() || *waits >= 64 {
+            return false;
+        }
+        let start = started.get_or_insert_with(crate::profile_clock::Instant::now);
+        if start.elapsed() >= std::time::Duration::from_millis(4) {
+            return false;
+        }
+        // Apply commands before the next Lua instruction observes their state.
+        let position = (self.interpreter.current_script().map(str::to_owned), self.interpreter.current_line());
+        self.flush_host_events(profile);
+        self.sync_click_wait_handlers();
+        if !self.can_batch_debug_skip() || self.has_queued_tags()
+            || position.0.as_deref() != self.interpreter.current_script()
+            || position.1 != self.interpreter.current_line()
+            || !matches!(self.wait_reason.as_ref(), Some(WaitReason::Generic | WaitReason::Generic0)
+                | Some(WaitReason::Timed { milliseconds: 0, .. })) {
+            return false;
+        }
+        if matches!(self.wait_reason, Some(WaitReason::Generic | WaitReason::Generic0)) {
+            self.reveal_text_for_skip();
+        }
+        self.advance_wait_line();
+        self.sync_click_wait_handlers();
+        *waits += 1;
+        self.can_batch_debug_skip()
+    }
+
+    fn can_batch_debug_skip(&self) -> bool {
+        self.debug_skip_active.load(Ordering::SeqCst)
+            && self.script_status_request.load(Ordering::SeqCst) == super::NO_SCRIPT_STATUS_REQUEST
+            && !self.script_forced_stop
+            && self.pending_dialog.is_none()
+            && !self.http_request_pending()
+            && !self.is_exit_requested()
     }
 
     fn advance_wait_state(
@@ -233,7 +257,7 @@ impl CoreRuntime {
             is_trans_wait && !RenderPipeline::new(&self.compositor).is_transition_in_progress();
         if video_resume || trans_resume {
             self.wait_reason = None;
-            self.interpreter.release_queued_wait();
+            release_completed_media_wait(&mut self.interpreter, trans_resume);
             return;
         }
 
@@ -275,8 +299,16 @@ impl CoreRuntime {
             // [wait scenario=1|2]：等待场景文本出现/隐藏的 Tween 完成。
             // 本实现里隐藏（mode=2）是瞬时的，等待立即解除；
             // 出现（mode=1）等逐字揭示完成。
-            WaitReason::ScenarioTween { mode } => {
-                self.skip_active() || mode != 1 || self.is_text_reveal_complete()
+            WaitReason::ScenarioTween { mode, input } => {
+                if scenario_reveal_requested(mode, input, advance_requested, self.is_text_reveal_complete()) {
+                    self.reveal_text_now();
+                    // Consume this edge only for revealing. Release the tween
+                    // wait on the next tick, then let the following @ wait for
+                    // a fresh press instead of skipping the newly shown page.
+                    false
+                } else {
+                    self.skip_active() || mode != 1 || self.is_text_reveal_complete()
+                }
             }
             _ => {
                 if advance_requested {
@@ -286,7 +318,10 @@ impl CoreRuntime {
                     } else {
                         true
                     }
-                } else if self.skip_active() {
+                } else if self.skip_active() || self.debug_skip_active.load(Ordering::SeqCst) {
+                    // debugSkip runs with input disabled. Ordinary click/key
+                    // waits must advance until the explicit exskip checkpoint,
+                    // independently of the player's normal Skip permission.
                     self.reveal_text_for_skip();
                     true
                 } else {
@@ -341,7 +376,7 @@ impl CoreRuntime {
             return;
         }
 
-        crate::core_debug!("[runtime] Stop:exskip; firing onDebugSkipOut");
+        crate::core_info!("[debug-skip] checkpoint; firing onDebugSkipOut");
         if let Err(e) = self.fire_named_event_handler("onDebugSkipOut") {
             crate::core_error!("onDebugSkipOut 错误: {e:?}");
             self.wait_reason = Some(stop_reason);
@@ -543,6 +578,16 @@ impl CoreRuntime {
     }
 }
 
+fn release_completed_media_wait(interpreter: &mut asb_interpreter::Interpreter, transition: bool) {
+    if transition {
+        // Direct [trans] is still at the current instruction. advance_line also
+        // knows how to release a queued trans without skipping its continuation.
+        interpreter.advance_line();
+    } else {
+        interpreter.release_queued_wait();
+    }
+}
+
 fn settle_inline_event_frame(
     interpreter: &mut asb_interpreter::Interpreter,
     active_frame: &mut Option<super::InlineEventFrame>,
@@ -600,6 +645,10 @@ fn stop_wait_accepts_scripted_decide(scripted_decide: bool) -> bool {
     scripted_decide
 }
 
+fn scenario_reveal_requested(mode: i32, input: i32, advance_requested: bool, complete: bool) -> bool {
+    mode == 1 && matches!(input, 1 | 2) && advance_requested && !complete
+}
+
 fn wait_advance_requested(
     physical_clicked: bool,
     scripted_decide: bool,
@@ -635,7 +684,7 @@ fn trans_input_skip_requested(
 /// 是否属于"用户输入等待"（[autosave allow=2] 的自动保存触发点）：
 /// 点击等待（Generic/Generic0）与按键等待（exkey）算；
 /// 定时/停止/媒体同步类等待不算。
-pub(crate) fn wait_reason_is_input_wait(reason: Option<&WaitReason>) -> bool {
+fn wait_reason_is_input_wait(reason: Option<&WaitReason>) -> bool {
     matches!(
         reason,
         Some(WaitReason::Generic) | Some(WaitReason::Generic0) | Some(WaitReason::KeyWait { .. })
@@ -653,6 +702,38 @@ mod tests {
     use asb_interpreter::event::WaitReason;
     use asb_interpreter::{CallFrame, CallbackResult, Event, ExecutionResult, InterpreterConfig};
     use std::collections::HashMap;
+
+    #[test]
+    fn completed_direct_and_queued_transitions_reach_the_next_instruction() {
+        for queued in [false, true] {
+            let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
+            it.lua().load("function transition() __engine:enqueueTag{'trans', type=1, time=1000} end").exec().unwrap();
+            let command = if queued { "[calllua function=transition]" } else { "[trans type=1 time=1000]" };
+            it.load_script("native", &format!("{command}\n[var name=continued data=1]\n")).unwrap();
+            it.boot("native").unwrap();
+            it.set_callback(|event| if matches!(event, Event::Trans { .. }) {
+                CallbackResult::Pause
+            } else { CallbackResult::Continue });
+            assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Trans { .. })));
+            super::release_completed_media_wait(&mut it, true);
+            assert!(matches!(it.run().unwrap(), ExecutionResult::Completed));
+            assert_eq!(it.get_variable("continued"), Some(asb_interpreter::Value::Int(1)), "queued={queued}");
+        }
+    }
+
+    #[test]
+    fn scenario_reveal_accepts_game_remapped_decide_but_preserves_input_zero_and_auto_stop() {
+        // Toshiue maps Circle/Enter through its Lua handler to overrideKey 124.
+        let decide = wait_advance_requested(false, true, false);
+        assert!(super::scenario_reveal_requested(1, 1, decide, false));
+        assert!(super::scenario_reveal_requested(1, 2, decide, false));
+        assert!(!super::scenario_reveal_requested(1, 0, decide, false));
+        assert!(!super::scenario_reveal_requested(1, 1, decide, true));
+        assert!(!super::scenario_reveal_requested(2, 1, decide, false));
+        assert!(!super::scenario_reveal_requested(1, 1, false, false));
+        assert!(!super::scenario_reveal_requested(1, 1,
+            wait_advance_requested(true, true, true), false));
+    }
 
     #[test]
     fn timed_wait_only_accepts_click_for_input_one() {
@@ -1238,7 +1319,7 @@ mod tests {
             id: "mv".into()
         })));
         assert!(!wait_reason_is_input_wait(Some(
-            &WaitReason::ScenarioTween { mode: 1 }
+            &WaitReason::ScenarioTween { mode: 1, input: 0 }
         )));
         assert!(!wait_reason_is_input_wait(None));
     }

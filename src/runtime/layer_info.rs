@@ -14,6 +14,17 @@ pub(super) struct LayerQueryState {
 }
 
 impl LayerQueryState {
+    pub fn sync_clock(&mut self, scene: &Compositor, mut cached: impl FnMut(&str) -> Option<TextureInfo>) {
+        let ids = self.scene.sync_query_clock_from(scene);
+        for id in ids {
+            if let Some(file) = self.scene.scene().get(&id).and_then(|layer| layer.file.as_ref())
+                && let Some(info) = cached(file)
+            {
+                self.dimensions.insert(file.clone(), Some((info.width, info.height)));
+            }
+        }
+    }
+
     pub fn sync(
         &mut self,
         scene: &Compositor,
@@ -169,9 +180,11 @@ mod tests {
             input: Default::default(),
             magic_paths: Default::default(),
             layer_info: Arc::clone(&state),
+            png_comments: Default::default(),
             volumes: Default::default(),
             debug_skip_active: Default::default(),
             script_status: Default::default(),
+            script_status_request: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(crate::runtime::NO_SCRIPT_STATUS_REQUEST)),
             emote: Default::default(),
         }));
         interpreter.set_callback(move |event| {

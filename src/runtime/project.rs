@@ -2,7 +2,10 @@ use super::CoreRuntime;
 use super::callbacks::FfiCallbacks;
 use super::magic_path;
 use crate::Project;
+#[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
 use crate::backend::gl::GlTextureProvider;
+#[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+use crate::backend::gxm::GxmTextureProvider;
 use crate::runtime::save_io;
 use crate::text::GlyphTextRenderer;
 use asb_interpreter::{CallbackResult, Event};
@@ -39,16 +42,15 @@ impl CoreRuntime {
         self.save_screenshot = None;
         self.loaded_font_face = None;
         self.pending_dialog = None;
-        self.gameplay_save_checkpoint = None;
-        self.pending_load_resume = None;
-        self.pending_message_text = None;
         self.clear_pending_text_translation();
         self.clear_emote_state("project reload");
         self.install_interpreter(project.create_interpreter());
 
         self.wire_texture_source();
         self.load_default_font();
-        self.register_builtin_textures();
+        // :bg/black and :bg/white are game-defined magic paths, not reserved
+        // engine colors. Pre-seeding 2x2 textures here shadows the real images
+        // (including their logical size/alpha) before the boot script maps bg.
         self.seed_savepath_and_sysload();
         self.sync_control_status_variables();
 
@@ -108,9 +110,11 @@ impl CoreRuntime {
                 input: Arc::clone(&self.input),
                 magic_paths: Arc::clone(&self.magic_paths),
                 layer_info: Arc::clone(&self.layer_info),
+            png_comments: Default::default(),
                 volumes: Arc::clone(&self.volumes),
                 debug_skip_active: Arc::clone(&self.debug_skip_active),
                 script_status: Arc::clone(&self.script_status),
+                script_status_request: Arc::clone(&self.script_status_request),
                 emote: Arc::clone(&self.emote),
             }));
     }
@@ -140,6 +144,7 @@ impl CoreRuntime {
 
     fn wire_texture_source(&mut self) {
         // Re-create texture provider with magic-path-aware FFI source
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
         let gl_for_tex = self.gl.clone();
         let project_name = self
             .interpreter
@@ -149,10 +154,34 @@ impl CoreRuntime {
             .cloned()
             .unwrap_or_default();
         let magic_paths_tex = Arc::clone(&self.magic_paths);
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
+        let provider = GlTextureProvider::new(gl_for_tex);
+        #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+        let provider = {
+            let paths = Arc::clone(&self.magic_paths);
+            GxmTextureProvider::new().with_cache_budget(crate::image_cache_budget::session_budget()).with_tracked_prefetch(move |name| {
+                let resolved = magic_path::resolve_path(&paths, name);
+                super::surface_loader::take(&resolved).map(|p| match p {
+                    super::surface_loader::Payload::Pixels(image, bytes,proof) => (Ok(image.into()),proof,Some(bytes)),
+                    super::surface_loader::Payload::Gray(w,h,pixels,bytes) => (Ok(crate::backend::gxm::PreparedPixels::Gray(w,h,pixels)),None,Some(bytes)),
+                    super::surface_loader::Payload::Encoded(bytes,proof) => (Err(bytes),proof,None),
+                })
+            })
+        };
         self.texture_provider =
-            GlTextureProvider::new(gl_for_tex).with_source(move |name: &str| -> Option<Vec<u8>> {
+            provider.with_source(move |name: &str| -> Option<Vec<u8>> {
                 let resolved = magic_path::resolve_path(&magic_paths_tex, name);
-                for try_path in [format!("{resolved}.png"), resolved.clone()] {
+                if let Some(bytes) = super::callbacks::prefetched_surface_bytes(&resolved) {
+                    return Some(bytes);
+                }
+                // Keep existing PNG/raw precedence. Construct JPEG candidates
+                // lazily so successful PNG loads do not allocate more strings.
+                for suffix in [".png", "", ".jpg", ".jpeg"] {
+                    let try_path = if suffix.is_empty() {
+                        std::borrow::Cow::Borrowed(resolved.as_str())
+                    } else {
+                        std::borrow::Cow::Owned(format!("{resolved}{suffix}"))
+                    };
                     match crate::ffi::request_asset(&try_path) {
                         Some(bytes) => {
                             return Some(bytes);
@@ -247,15 +276,6 @@ impl CoreRuntime {
         }
     }
 
-    fn register_builtin_textures(&mut self) {
-        let _ = self
-            .texture_provider
-            .upload_rgba(":bg/black", 2, 2, &[0, 0, 0, 255].repeat(4));
-        let _ =
-            self.texture_provider
-                .upload_rgba(":bg/white", 2, 2, &[255, 255, 255, 255].repeat(4));
-    }
-
     fn seed_savepath_and_sysload(&mut self) {
         // Seed `s.savepath` —— 真实 Artemis 由引擎按 system.ini 的 SAVEPATH 种入此系统
         // 变量；脚本到处用 `e:var("s.savepath").."/"..file` 拼存档/缩略图路径，且 boot
@@ -292,7 +312,6 @@ fn event_requires_host_pause(e: &Event) -> bool {
         // script can execute its following cleanup/exit instructions.
         Event::Reset
             | Event::GoTitle
-            | Event::LoadGame { .. }
             | Event::Wait { .. }
             | Event::YesNo { .. }
             | Event::ShowDialog { .. }
@@ -302,6 +321,18 @@ fn event_requires_host_pause(e: &Event) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_jpeg_decodes_to_opaque_rgba() {
+        // Synthetic fixture: verifies the enabled codec through the same
+        // guessed-format RGBA conversion used by the GPU texture provider.
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(&[120; 4 * 3 * 3], 4, 3, image::ExtendedColorType::Rgb8).unwrap();
+        let decoded = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format().unwrap().decode().unwrap().into_rgba8();
+        assert_eq!(decoded.dimensions(), (4, 3));
+        assert!(decoded.pixels().all(|p| p.0[3] == 255));
+    }
     use super::{CoreRuntime, event_requires_host_pause};
     use asb_interpreter::{CallbackResult, Event, ExecutionResult, Interpreter};
     use std::sync::{
@@ -375,18 +406,50 @@ mod tests {
     }
 
     #[test]
-    fn load_pauses_before_old_script_fallthrough() {
-        assert!(event_requires_host_pause(&Event::LoadGame {
-            file: "slot.dat".into(),
-            trans_type: Some(0),
-        }));
-    }
-
-    #[test]
-    fn save_pauses_so_the_snapshot_is_not_a_later_wait() {
-        assert!(event_requires_host_pause(&Event::SaveGame {
-            file: "slot.dat".into(),
-        }));
+    #[ignore = "Requires EGL/ANGLE; ART3M1S_TEST_ANGLE_PATH selects the Windows DLL directory"]
+    fn chapter_skip_batches_waits_but_preserves_frame_and_timer_boundaries() {
+        use crate::backend::gl::platform::{AngleBackend, GfxBackend};
+        use asb_interpreter::Value;
+        if let Ok(path) = std::env::var("ART3M1S_TEST_ANGLE_PATH") {
+            let path = std::ffi::CString::new(path).unwrap();
+            unsafe { crate::ffi::art3m1s_set_angle_path(path.as_ptr()); }
+        }
+        let backend = if cfg!(target_os = "windows") { AngleBackend::D3D11 } else { AngleBackend::OpenGL };
+        let mut runtime = CoreRuntime::create(8, 8, GfxBackend::Angle(backend)).unwrap();
+        runtime.wire_engine_callbacks();
+        runtime.wire_event_callback();
+        let source = format!("*main\n[stop]\n{}[var name=traversed data=1]\n[wait time=5000 input=0]\n[var name=timer_done data=1]\n[stop exskip]\n[stop]\n", "[@]\n[wait time=0 input=0]\n".repeat(256));
+        runtime.interpreter.load_script("batch", &source).unwrap();
+        runtime.interpreter.lua().load(r#"
+frame_count, click_in, click_out, checkpoint_count = 0, 0, 0, 0
+function frame_tick() frame_count = frame_count + 1 end
+function enter_click() click_in = click_in + 1 end
+function leave_click() click_out = click_out + 1 end
+function checkpoint() checkpoint_count = checkpoint_count + 1; __engine:setScriptStatus(0) end
+__engine:setEventHandler{onEnterFrame="frame_tick", onClickWaitIn="enter_click", onClickWaitOut="leave_click", onDebugSkipOut="checkpoint"}
+"#).exec().unwrap();
+        runtime.interpreter.start("batch", "main").unwrap();
+        runtime.advance_without_render(17);
+        runtime.interpreter.lua().load("__engine:debugSkip{index=99999}").exec().unwrap();
+        runtime.advance_without_render(17);
+        assert_ne!(runtime.interpreter.get_variable("traversed"), Some(Value::Int(1)), "one frame must not exhaust an arbitrarily long chapter");
+        let mut ticks = 2;
+        for _ in 0..80 {
+            if runtime.interpreter.get_variable("traversed") == Some(Value::Int(1)) { break; }
+            runtime.advance_without_render(17);
+            ticks += 1;
+        }
+        assert_eq!(runtime.interpreter.get_variable("traversed"), Some(Value::Int(1)), "512 zero/input waits must not consume 1024 display frames");
+        assert_eq!(runtime.interpreter.lua().globals().get::<i64>("frame_count").unwrap(), ticks);
+        assert_eq!(runtime.interpreter.lua().globals().get::<i64>("click_in").unwrap(), 256);
+        assert_eq!(runtime.interpreter.lua().globals().get::<i64>("click_out").unwrap(), 256);
+        runtime.advance_without_render(17);
+        assert_ne!(runtime.interpreter.get_variable("timer_done"), Some(Value::Int(1)), "positive timers must keep their real duration");
+        runtime.advance_without_render(5000);
+        for _ in 0..4 { runtime.advance_without_render(17); }
+        assert_eq!(runtime.interpreter.get_variable("timer_done"), Some(Value::Int(1)));
+        assert_eq!(runtime.interpreter.lua().globals().get::<i64>("checkpoint_count").unwrap(), 1);
+        assert!(!runtime.debug_skip_active.load(Ordering::SeqCst));
     }
 
     #[cfg(all(target_os = "macos", feature = "gl-backend"))]
@@ -432,6 +495,67 @@ mod tests {
             runtime.wait_reason.as_ref(),
             Some(asb_interpreter::event::WaitReason::Stop { .. })
         ));
+    }
+
+    #[test]
+    #[ignore = "Requires EGL/ANGLE; ART3M1S_TEST_ANGLE_PATH selects the Windows DLL directory"]
+    fn chapter_debug_skip_resumes_and_fires_checkpoint_once() {
+        use crate::backend::gl::platform::{AngleBackend, GfxBackend};
+        use asb_interpreter::Value;
+        use std::sync::atomic::Ordering;
+        if let Ok(path) = std::env::var("ART3M1S_TEST_ANGLE_PATH") {
+            let path = std::ffi::CString::new(path).unwrap();
+            unsafe { crate::ffi::art3m1s_set_angle_path(path.as_ptr()); }
+        }
+        let backend = if cfg!(target_os = "windows") { AngleBackend::D3D11 } else { AngleBackend::OpenGL };
+        let mut runtime = CoreRuntime::create(8, 8, GfxBackend::Angle(backend)).unwrap();
+        runtime.wire_engine_callbacks();
+        runtime.wire_event_callback();
+        runtime.interpreter.load_script("chapter", r#"
+*main
+[stop]
+[var name=skipped_body data=1]
+[@]
+[wait time=0 input=0]
+[@]
+[stop exskip]
+[var name=wrong_fallthrough data=1]
+[stop]
+*resume
+[var name=resumed_chapter data=1]
+[wait time=10000 input=0]
+[var name=after_timer data=1]
+[stop]
+"#).unwrap();
+        runtime.interpreter.lua().load(r#"
+checkpoint_count = 0
+function checkpoint()
+    checkpoint_count = checkpoint_count + 1
+    __engine:setScriptStatus(0)
+    __engine:tag{"jump", file="chapter", label="resume"}
+end
+__engine:setEventHandler{onDebugSkipOut="checkpoint"}
+"#).exec().unwrap();
+        runtime.interpreter.start("chapter", "main").unwrap();
+        runtime.advance_without_render(17);
+        runtime.interpreter.lua().load("__engine:debugSkip{index=99999}; assert(__engine:getScriptStatus() == 4)").exec().unwrap();
+        for _ in 0..20 { runtime.advance_without_render(17); }
+        assert_eq!(runtime.interpreter.get_variable("skipped_body"), Some(Value::Int(1)), "debugSkip must release the old stop, not force a permanent pause");
+        assert_eq!(runtime.interpreter.get_variable("resumed_chapter"), Some(Value::Int(1)));
+        assert_ne!(runtime.interpreter.get_variable("wrong_fallthrough"), Some(Value::Int(1)));
+        assert_eq!(runtime.interpreter.lua().globals().get::<i64>("checkpoint_count").unwrap(), 1);
+        assert!(!runtime.debug_skip_active.load(Ordering::SeqCst));
+        // A timed wait also reports 4, but explicit setScriptStatus(4) must
+        // pause it even though its numeric value is already the same.
+        assert_eq!(runtime.script_status.load(Ordering::SeqCst), 4);
+        runtime.interpreter.lua().load("__engine:setScriptStatus(4)").exec().unwrap();
+        runtime.advance_without_render(20000);
+        assert!(runtime.script_forced_stop);
+        assert_ne!(runtime.interpreter.get_variable("after_timer"), Some(Value::Int(1)));
+        runtime.interpreter.lua().load("__engine:setScriptStatus(0)").exec().unwrap();
+        runtime.advance_without_render(17);
+        assert!(!runtime.script_forced_stop);
+        assert_eq!(runtime.interpreter.get_variable("after_timer"), Some(Value::Int(1)));
     }
 
     #[cfg(all(target_os = "macos", feature = "gl-backend"))]

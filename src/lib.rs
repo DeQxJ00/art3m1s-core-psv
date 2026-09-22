@@ -15,6 +15,17 @@ pub mod backend;
 pub mod compositor;
 pub mod ffi;
 pub mod host_media;
+mod launcher_font;
+mod profile_clock;
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+mod image_decode;
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+mod image_proof;
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+mod image_cache_budget;
+mod cache_hud;
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+mod resource_ledger;
 #[cfg(any(
     target_os = "android",
     target_os = "ios",
@@ -387,7 +398,8 @@ fn parse_ini(contents: &str) -> HashMap<String, HashMap<String, String>> {
     let mut sections = HashMap::new();
     let mut current: Option<String> = None;
 
-    for raw_line in contents.lines() {
+    // Some converted Artemis projects mix lone CR, LF and CRLF endings.
+    for raw_line in contents.split(['\r', '\n']) {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
             continue;
@@ -665,5 +677,14 @@ mod tests {
             Some("タイトル")
         );
         assert_eq!(config.to_interpreter_config(None).encoding.name(), "UTF-8");
+    }
+
+    #[test]
+    fn system_ini_accepts_mixed_line_endings() {
+        let ini = "[WINDOWS]\r\nWIDTH=960\r; comment\nHEIGHT=540\rBOOT=system/first.iet\rCHARSET=UTF-8";
+        let config = ProjectConfig::from_system_ini_bytes(ini.as_bytes(), "WINDOWS").unwrap();
+        assert_eq!(config.stage_width, 960);
+        assert_eq!(config.stage_height, 540);
+        assert_eq!(config.boot_script, "system/first.iet");
     }
 }

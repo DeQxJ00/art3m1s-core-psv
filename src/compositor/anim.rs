@@ -715,7 +715,8 @@ pub(crate) fn update_anime_frames(
     scene: &mut Scene,
     states: &mut HashMap<String, AnimeState>,
     now: u64,
-) {
+) -> bool {
+    let mut changed = false;
     let mut finished: Vec<String> = Vec::new();
     for (layer_id, state) in states.iter() {
         if state.frames.is_empty() || state.total_duration_ms == 0 {
@@ -751,15 +752,30 @@ pub(crate) fn update_anime_frames(
 
         if let Some(frame) = frame {
             if let Some(layer) = scene.get_mut(layer_id) {
-                layer.file = Some(frame.file.clone());
-                layer.mask = frame.mask.clone();
-                layer.props.merge_raw(&frame.props);
+                if layer.file.as_deref() != Some(frame.file.as_str()) {
+                    layer.file = Some(frame.file.clone());
+                    changed = true;
+                }
+                if layer.mask != frame.mask {
+                    layer.mask.clone_from(&frame.mask);
+                    changed = true;
+                }
+                // Preserve the old behavior when script edits a property during
+                // the same animation frame: animation-owned properties win.
+                // An unchanged frame must not dirty the entire scene, though.
+                if !frame.props.is_empty() {
+                    let before = layer.props.clone();
+                    layer.props.merge_raw(&frame.props);
+                    changed |= layer.props != before;
+                }
             }
         }
     }
+    changed |= !finished.is_empty(); // Export completion to the query snapshot once.
     for id in finished {
         states.remove(&id);
     }
+    changed
 }
 
 fn apply_first_anime_frame(scene: &mut Scene, id: &str, state: &AnimeState) {
@@ -950,6 +966,34 @@ mod tests {
 
     fn layer_file(scene: &Scene, id: &str) -> Option<String> {
         scene.get(id).and_then(|layer| layer.file.clone())
+    }
+
+    #[test]
+    fn unchanged_anime_frames_are_clean_but_script_overrides_are_restored() {
+        let mut scene = Scene::new();
+        scene.ensure("a");
+        let mut state = anime_state(0);
+        state.frames[0].mask = Some("mask0".into());
+        state.frames[0].props.insert("alpha".into(), "128".into());
+        let mut states = HashMap::from([("a".into(), state)]);
+        assert!(update_anime_frames(&mut scene, &mut states, 0));
+        assert!(!update_anime_frames(&mut scene, &mut states, 16));
+        assert!(!update_anime_frames(&mut scene, &mut states, 99));
+        let layer = scene.get_mut("a").unwrap();
+        layer.props.alpha = Some(255);
+        layer.props.left = Some(42.0); // Not owned by this animation frame.
+        layer.mask = None;
+        assert!(update_anime_frames(&mut scene, &mut states, 99));
+        let layer = scene.get("a").unwrap();
+        assert_eq!(layer.props.alpha, Some(128));
+        assert_eq!(layer.props.left, Some(42.0));
+        assert_eq!(layer.mask.as_deref(), Some("mask0"));
+        assert!(update_anime_frames(&mut scene, &mut states, 100));
+        assert_eq!(layer_file(&scene, "a").as_deref(), Some("f1"));
+        assert!(!update_anime_frames(&mut scene, &mut states, 199));
+        assert!(update_anime_frames(&mut scene, &mut states, 200));
+        assert!(states.is_empty());
+        assert!(!update_anime_frames(&mut scene, &mut states, 201));
     }
 
     #[test]

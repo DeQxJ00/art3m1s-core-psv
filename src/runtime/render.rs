@@ -99,9 +99,11 @@ impl CoreRuntime {
         // Backlog and text metrics can only change along the full visual path.
         // Static ticks keep the previous snapshot instead of cloning every
         // message page and reproduction tag at display refresh rate.
+        let backlog_started = profile.mark();
         self.sync_backlog_snapshot();
+        profile.frame_backlog_ns = crate::profiler::FrameProfile::elapsed(backlog_started);
 
-        let (frame, _, _) = self.build_bound_scene(true, None);
+        let (frame, _, _) = self.build_bound_scene(true, None, Some(profile));
         profile.frame_build_ns = crate::profiler::FrameProfile::elapsed(build_started);
         profile.draw_list_commands = (frame.commands.len() + frame.mask_commands.len()) as u64;
         let changed_textures = self
@@ -157,7 +159,9 @@ impl CoreRuntime {
                 }
                 self.last_submitted_frame = Some(frame);
                 self.last_submitted_texture_revision = texture_revision;
-                self.last_rendered_scene = Some(self.compositor.scene_snapshot());
+                let snapshot_started = profile.mark();
+                self.last_rendered_scene = Some(self.compositor.scene().render_snapshot());
+                profile.scene_snapshot_ns = crate::profiler::FrameProfile::elapsed(snapshot_started);
                 self.last_rendered_clock_ms = self.compositor.clock_ms();
                 unsafe {
                     self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -178,7 +182,9 @@ impl CoreRuntime {
         record_render_region(profile, repaint_region, self.stage_w, self.stage_h);
         self.last_submitted_frame = Some(frame);
         self.last_submitted_texture_revision = texture_revision;
-        self.last_rendered_scene = Some(self.compositor.scene_snapshot());
+        let snapshot_started = profile.mark();
+        self.last_rendered_scene = Some(self.compositor.scene().render_snapshot());
+        profile.scene_snapshot_ns = crate::profiler::FrameProfile::elapsed(snapshot_started);
         self.last_rendered_clock_ms = self.compositor.clock_ms();
 
         unsafe {
@@ -221,7 +227,7 @@ impl CoreRuntime {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
         }
         let (frame, text_layers, text_commands) =
-            self.build_bound_scene(false, Some((&scene, self.last_rendered_clock_ms)));
+            self.build_bound_scene(false, Some((&scene, self.last_rendered_clock_ms)), None);
         self.renderer.render(&frame);
         // The FBO now contains a reconstructed transition source rather than
         // the frame represented by `last_submitted_frame`.
@@ -240,11 +246,17 @@ impl CoreRuntime {
         &mut self,
         include_transition: bool,
         scene_snapshot: Option<(&crate::compositor::Scene, u64)>,
+        mut profile: Option<&mut crate::profiler::FrameProfile>,
     ) -> (DrawList, usize, usize) {
+        let text_started = profile.as_ref().and_then(|p| p.mark());
         let text_map = self.build_text_commands();
+        if let Some(p) = profile.as_deref_mut() { p.frame_text_ns = crate::profiler::FrameProfile::elapsed(text_started); }
         let text_layer_count = text_map.len();
         let text_command_count = text_map.values().map(Vec::len).sum();
+        let emote_started = profile.as_ref().and_then(|p| p.mark());
         let (mut emote_map, emote_files) = self.build_emote_commands();
+        if let Some(p) = profile.as_deref_mut() { p.frame_emote_ns = crate::profiler::FrameProfile::elapsed(emote_started); }
+        let scene_started = profile.as_ref().and_then(|p| p.mark());
         let has_emote_commands = !emote_map.is_empty();
         let has_text_commands = !text_map.is_empty();
         let mut content_source = |layer_id: &str| emote_map.remove(layer_id).unwrap_or_default();
@@ -273,6 +285,8 @@ impl CoreRuntime {
             pipeline.build_with_content(&mut self.texture_provider, content_for, text_for)
         };
         frame.materialize_stencil_groups(crate::render_pipeline::shader::ALPHA_MASK_SHADER);
+        if let Some(p) = profile.as_deref_mut() { p.frame_scene_ns = crate::profiler::FrameProfile::elapsed(scene_started); }
+        let retain_started = profile.as_ref().and_then(|p| p.mark());
         let mut used_files = scene_snapshot
             .map(|(scene, _)| scene.collect_files())
             .unwrap_or_else(|| self.compositor.scene().collect_files());
@@ -286,6 +300,7 @@ impl CoreRuntime {
             used_files.insert(f);
         }
         self.texture_provider.retain(&used_files);
+        if let Some(p) = profile.as_deref_mut() { p.frame_retain_ns = crate::profiler::FrameProfile::elapsed(retain_started); }
         (frame, text_layer_count, text_command_count)
     }
 

@@ -3,13 +3,14 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::profile_clock::Instant;
 
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
 const SAMPLE_WINDOW: Duration = Duration::from_secs(10);
 const QUEUE_CAPACITY: usize = 256;
 const MAX_WINDOW_SAMPLES: usize = 4096;
-const TIMING_COUNT: usize = 31;
+const TIMING_COUNT: usize = 37;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct FrameProfile {
@@ -38,6 +39,13 @@ pub(crate) struct FrameProfile {
     pub compositor_ns: u64,
     pub text_ns: u64,
     pub frame_build_ns: u64,
+    pub frame_backlog_ns: u64,
+    pub frame_text_ns: u64,
+    pub frame_emote_ns: u64,
+    pub frame_scene_ns: u64,
+    pub frame_retain_ns: u64,
+    pub scene_snapshot_ns: u64,
+
     pub damage_compute_ns: u64,
     pub transition_capture_ns: u64,
     pub texture_upload_ns: u64,
@@ -121,6 +129,13 @@ pub struct ProfileTimings {
     pub compositor_ms: f64,
     pub text_ms: f64,
     pub frame_build_ms: f64,
+    pub frame_backlog_ms: f64,
+    pub frame_text_ms: f64,
+    pub frame_emote_ms: f64,
+    pub frame_scene_ms: f64,
+    pub frame_retain_ms: f64,
+    pub scene_snapshot_ms: f64,
+
     pub damage_compute_ms: f64,
     pub transition_capture_ms: f64,
     pub texture_upload_ms: f64,
@@ -490,6 +505,12 @@ fn timing_values(frame: &FrameProfile) -> [u64; TIMING_COUNT] {
         frame.present_ns,
         frame.readback_ns,
         frame.host_ffi_ns,
+        frame.frame_backlog_ns,
+        frame.frame_text_ns,
+        frame.frame_emote_ns,
+        frame.frame_scene_ns,
+        frame.frame_retain_ns,
+        frame.scene_snapshot_ns,
     ]
 }
 
@@ -527,6 +548,13 @@ fn timings_from_values(values: [f64; TIMING_COUNT]) -> ProfileTimings {
         present_ms: ms(values[28]),
         readback_ms: ms(values[29]),
         host_ffi_ms: ms(values[30]),
+        frame_backlog_ms: ms(values[31]),
+        frame_text_ms: ms(values[32]),
+        frame_emote_ms: ms(values[33]),
+        frame_scene_ms: ms(values[34]),
+        frame_retain_ms: ms(values[35]),
+        scene_snapshot_ms: ms(values[36]),
+
     }
 }
 

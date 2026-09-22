@@ -56,6 +56,15 @@ unsafe fn build_program_from_bodies(
 ) -> Result<glow::Program, String> {
     unsafe {
         let header = profile.version_header();
+        let (vertex_body, fragment_body) = if profile == ShaderProfile::Vita100 {
+            (vertex_body.replace("layout(location = 0) in", "attribute")
+                .replace("layout(location = 1) in", "attribute")
+                .replace("out vec2", "varying vec2"),
+             fragment_body.replace("in vec2", "varying vec2")
+                .replace("out vec4 frag_color;", "")
+                .replace("frag_color", "gl_FragColor")
+                .replace("texture(", "texture2D("))
+        } else { (vertex_body.to_owned(), fragment_body.to_owned()) };
         let vert_src = format!("{header}{vertex_body}");
         let frag_src = format!("{header}{fragment_body}");
         let program = gl.create_program()?;
@@ -67,6 +76,7 @@ unsafe fn build_program_from_bodies(
         let mut compiled = Vec::with_capacity(2);
         let cleanup = |gl: &glow::Context, compiled: &[glow::Shader]| {
             for &shader in compiled {
+                #[cfg(not(target_os = "vita"))]
                 gl.detach_shader(program, shader);
                 gl.delete_shader(shader);
             }
@@ -86,6 +96,9 @@ unsafe fn build_program_from_bodies(
             compiled.push(shader);
         }
 
+        // vitaGL resolves attributes through the attached vertex shader.
+        gl.bind_attrib_location(program, 0, "a_pos");
+        gl.bind_attrib_location(program, 1, "a_uv");
         gl.link_program(program);
         if !gl.get_program_link_status(program) {
             let log = gl.get_program_info_log(program);
@@ -95,6 +108,7 @@ unsafe fn build_program_from_bodies(
 
         // 链接后即可分离并删除中间 shader 对象。
         for shader in compiled {
+            #[cfg(not(target_os = "vita"))]
             gl.detach_shader(program, shader);
             gl.delete_shader(shader);
         }

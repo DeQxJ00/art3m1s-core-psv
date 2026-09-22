@@ -7,6 +7,8 @@
 /// Shader dialect used by a backend compiler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShaderProfile {
+    /// Conservative GLSL ES 1.00 for vitaGL.
+    Vita100,
     /// OpenGL ES 3.0 (`#version 300 es`) for ANGLE/GLES targets.
     Gles300,
     /// Desktop OpenGL 3.3 Core for offscreen validation.
@@ -16,6 +18,7 @@ pub enum ShaderProfile {
 impl ShaderProfile {
     pub fn version_header(self) -> &'static str {
         match self {
+            ShaderProfile::Vita100 => "#version 100\nprecision highp float;\n",
             ShaderProfile::Gles300 => "#version 300 es\nprecision highp float;\n",
             ShaderProfile::GlCore330 => "#version 330 core\n",
         }
@@ -42,6 +45,11 @@ pub struct BuiltinShaderManager;
 impl ShaderManager for BuiltinShaderManager {
     fn program(&self, name: &str) -> Option<ShaderProgramSource> {
         match name {
+            SIMPLE_SPRITE_SHADER => Some(ShaderProgramSource {
+                name: SIMPLE_SPRITE_SHADER,
+                vertex_body: SPRITE_VERTEX_BODY,
+                fragment_body: SIMPLE_SPRITE_FRAGMENT_BODY,
+            }),
             SPRITE_SHADER => Some(ShaderProgramSource {
                 name: SPRITE_SHADER,
                 vertex_body: SPRITE_VERTEX_BODY,
@@ -68,6 +76,7 @@ impl ShaderManager for BuiltinShaderManager {
 }
 
 pub const SPRITE_SHADER: &str = "sprite";
+pub const SIMPLE_SPRITE_SHADER: &str = "simple-sprite";
 pub const ALPHA_MASK_SHADER: &str = "alpha-mask";
 pub const GROUP_COMPOSITE_SHADER: &str = "group-composite";
 /// `[trans type=2]` 规则图像转场：旧帧按 rule 灰度阈值逐像素溶解。
@@ -93,6 +102,31 @@ void main() {
     gl_Position = vec4(ndc.xy, 0.0, 1.0);
     v_uv = u_uv_offset + a_uv * u_uv_scale;
     v_model_position = a_pos;
+}
+"#;
+
+// Same ordinary sprite math as SPRITE_FRAGMENT_BODY, without E-mote's
+// discard, dynamic branches and extra varyings/uniforms in the GPU program.
+const SIMPLE_SPRITE_FRAGMENT_BODY: &str = r#"
+in vec2 v_uv;
+out vec4 frag_color;
+uniform sampler2D u_sampler;
+uniform float u_opacity;
+uniform vec3 u_multiply;
+uniform int u_grayscale;
+uniform int u_negative;
+void main() {
+    vec4 c = texture(u_sampler, v_uv);
+    c.rgb *= u_multiply;
+    if (u_grayscale != 0) {
+        float g = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+        c.rgb = vec3(g);
+    }
+    if (u_negative != 0) {
+        c.rgb = vec3(1.0) - c.rgb;
+    }
+    c.a *= u_opacity;
+    frag_color = c;
 }
 "#;
 

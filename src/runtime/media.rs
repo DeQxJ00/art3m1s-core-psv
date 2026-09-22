@@ -9,6 +9,13 @@ use asb_interpreter::tags::var_handler::{SoundChannelInfo, SoundInfoSnapshot};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+fn automode_sound_ids_ready(ids: &[String], state: &crate::audio::AudioState) -> bool {
+    !ids.iter().any(|id| {
+        state.voice_channels.get(id).or_else(|| state.se_channels.get(id))
+            .is_some_and(|channel| channel.playing)
+    })
+}
+
 /// 声音播放状态镜像，供 `var system=get_sound_info` 的宿主查询钩子读取。
 ///
 /// 钩子是进程级注册点（var 标签路径拿不到 runtime 实例），因此这里维护一份
@@ -250,33 +257,10 @@ impl CoreRuntime {
         }
     }
 
-    pub(super) fn is_voice_playing(&self) -> bool {
-        let state = self.audio.audio_state();
-        state.voice_channels.values().any(|ch| ch.playing)
-            || state
-                .se_channels
-                .values()
-                .any(|ch| ch.playing && ch.file.contains(":vo/"))
-    }
-
-    /// 指定 ID 的声音（语音或 SE）是否在播放。automode syncse 门控用。
-    pub(super) fn is_sound_playing(&self, id: &str) -> bool {
-        let state = self.audio.audio_state();
-        state
-            .voice_channels
-            .get(id)
-            .or_else(|| state.se_channels.get(id))
-            .is_some_and(|ch| ch.playing)
-    }
-
-    /// automode 自动前进前，syncse 列出的声音是否都已播完（空列表退化为
-    /// "任意语音在播"的通用门控）。
+    /// 只等待 syncse 指定的声音。原版 syncse="" 清除声音门控，
+    /// 即使还有 voice 在播放也不阻止自动前进。
     pub(super) fn automode_sync_ready(&self) -> bool {
-        let sync = self.control.automode_sync_se();
-        if sync.is_empty() {
-            return !self.is_voice_playing();
-        }
-        !sync.iter().any(|id| self.is_sound_playing(id))
+        automode_sound_ids_ready(self.control.automode_sync_se(), self.audio.audio_state())
     }
 
     pub fn notify_video_finished(&mut self, id: Option<&str>) {
@@ -324,6 +308,7 @@ impl CoreRuntime {
     ///
     /// The caller only needs to keep `rgba` alive for this synchronous call.
     /// The provider sends it directly to GL and does not retain a CPU copy.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn upload_video_layer_frame(
         &mut self,
         id: &str,
@@ -350,16 +335,43 @@ impl CoreRuntime {
         uploaded
     }
 
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn upload_video_layer_frame(
+        &mut self,
+        id: &str,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> bool {
+        if !self.video.video_state().video_layers.get(id).is_some_and(|channel| channel.playing) {
+            return false;
+        }
+        self.texture_provider.upload_video_rgba(&video_layer_texture_name(id), width, height, rgba)
+    }
+
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn upload_video_layer_shared_frame(&mut self,id:&str,width:u32,height:u32,rgba:&[u8])->bool {
+        if !self.video.video_state().video_layers.get(id).is_some_and(|channel|channel.playing) {return false;}
+        self.texture_provider.upload_video_shared_rgba(&video_layer_texture_name(id),width,height,rgba)
+    }
+
     /// Resolves GL symbols from the exact implementation used by this
     /// runtime. This matters for ANGLE, where loading system OpenGL symbols
     /// would create an incompatible render context for libmpv.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn video_gl_proc_address(&self, name: &str) -> *const std::ffi::c_void {
         self.gl_ctx.get_proc_address(name)
+    }
+
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn video_gl_proc_address(&self, _name: &str) -> *const std::ffi::c_void {
+        std::ptr::null()
     }
 
     /// Makes the runtime GL context current for a short external render pass.
     /// Calls are intentionally non-nestable; every successful begin must be
     /// paired with `end_video_gl_render` even when the external renderer fails.
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn begin_video_gl_render(&mut self) -> Result<(), String> {
         if self.video_gl_saved_context.is_some() {
             return Err("video GL render lease is already active".into());
@@ -373,6 +385,12 @@ impl CoreRuntime {
         Ok(())
     }
 
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn begin_video_gl_render(&mut self) -> Result<(), String> {
+        Err("GL video rendering is unavailable in the native GXM build".into())
+    }
+
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn video_layer_gl_framebuffer(
         &mut self,
         id: &str,
@@ -396,6 +414,12 @@ impl CoreRuntime {
             .ensure_video_render_target(&texture_name, width, height)
     }
 
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn video_layer_gl_framebuffer(&mut self, _id: &str, _width: u32, _height: u32) -> Result<u32, String> {
+        Err("GL framebuffer is unavailable in the native GXM build".into())
+    }
+
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn commit_video_layer_gl_frame(&mut self, id: &str) -> bool {
         if self.video_gl_saved_context.is_none() {
             return false;
@@ -404,11 +428,18 @@ impl CoreRuntime {
             .commit_video_render_target(&video_layer_texture_name(id))
     }
 
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn commit_video_layer_gl_frame(&mut self, _id: &str) -> bool { false }
+
+    #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
     pub fn end_video_gl_render(&mut self) {
         if let Some(saved) = self.video_gl_saved_context.take() {
             self.gl_ctx.restore(saved);
         }
     }
+
+    #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+    pub fn end_video_gl_render(&mut self) {}
 
     fn bind_video_layer_texture(&mut self, id: &str) {
         self.compositor
@@ -859,6 +890,27 @@ impl CoreRuntime {
 #[cfg(test)]
 mod tests {
     use super::ab_loop_file;
+
+    #[test]
+    fn native_auto_waits_only_for_selected_sound_ids() {
+        use crate::audio::{AudioBackend, AudioStateBackend, SeConfig};
+        let mut audio = AudioStateBackend::new();
+        audio.play_voice("voice", "tone.wav", &SeConfig::default());
+        audio.play_se("effect", "other.wav", &SeConfig::default());
+        let ready = |ids: &[&str], audio: &AudioStateBackend| {
+            super::automode_sound_ids_ready(
+                &ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(), audio.audio_state())
+        };
+        assert!(ready(&[], &audio), "native syncse empty does not wait for voice");
+        assert!(ready(&["absent"], &audio));
+        assert!(!ready(&["voice"], &audio));
+        assert!(!ready(&["effect"], &audio));
+        audio.stop_se("voice", 0);
+        assert!(ready(&["voice"], &audio));
+        assert!(!ready(&["voice", "effect"], &audio));
+        audio.stop_se("effect", 0);
+        assert!(ready(&["voice", "effect"], &audio));
+    }
 
     #[test]
     fn ab_loop_naming_convention_maps_a_segment_to_b_segment() {

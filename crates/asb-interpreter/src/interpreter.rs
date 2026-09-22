@@ -3,7 +3,7 @@
 //! ASB 脚本解释器的核心实现，使用迭代而非递归来避免栈溢出。
 
 use crate::error::{Error, Result};
-use crate::event::{CallbackResult, Event, EventCallback, ScriptLoader, WaitReason, default_callback};
+use crate::event::{CallbackResult, Event, EventCallback, ScriptLoader, default_callback};
 use crate::expression::ExpressionEvaluator;
 use crate::lua_engine::{DefaultEngineCallbacks, EngineContext, TAG_FILTER_REGISTRY_KEY};
 use crate::r#macro::MacroRegistry;
@@ -77,8 +77,6 @@ struct QueuedWaitCheckpoint {
     stack: Vec<CallFrame>,
     deferred: Vec<(String, HashMap<String, String>)>,
     immediate_count: usize,
-    /// When true, onLoad follow-up may run before this wait is re-emitted.
-    allow_queue: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -864,12 +862,7 @@ impl Interpreter {
             // A queued handler may return to a PC that is already the next
             // script instruction. Re-emit the original wait before flushing
             // deferred tags or executing that instruction.
-            //
-            // Load-restored waits set `allow_queue` so onLoad follow-up can
-            // run first; only hold once that queue is empty.
-            if self.queued_wait_blocks_before_flush()
-                && let Some(event) = self.queued_wait_at_current_position()
-            {
+            if let Some(event) = self.queued_wait_at_current_position() {
                 self.last_wait_from_queue = true;
                 self.last_queue_pause_is_wait = true;
                 return Ok(ExecutionResult::Wait(event));
@@ -1411,6 +1404,34 @@ impl Interpreter {
 
     fn pop_call_frame(&mut self) -> Option<CallFrame> {
         let frame = self.call_stack.pop();
+        if frame.is_some() {
+            // A return abandons waits owned by the frame it leaves, including
+            // their deferred tags. Otherwise a later call to the same helper
+            // can accidentally reactivate an old stop at the same script PC.
+            // Waits in callers survive ordinary nested event callbacks.
+            let depth = self.call_stack.len();
+            let old_active = self.active_queued_wait;
+            let mut new_active = None;
+            let mut old_index = 0;
+            let mut new_index = 0;
+            self.queued_wait_checkpoints.retain(|checkpoint| {
+                let keep = checkpoint.stack.len() <= depth;
+                if keep {
+                    if old_active == Some(old_index) {
+                        new_active = Some(new_index);
+                    }
+                    new_index += 1;
+                }
+                old_index += 1;
+                keep
+            });
+            self.active_queued_wait = new_active;
+            if old_active.is_some() && new_active.is_none() && self.last_queue_pause_is_wait {
+                self.last_wait_from_queue = false;
+                self.last_queue_pause_is_wait = false;
+                self.engine_ctx.lock().unwrap().wait_reason_info = None;
+            }
+        }
         self.variables
             .lock()
             .unwrap()
@@ -1535,7 +1556,7 @@ impl Interpreter {
                 info.insert("time".to_string(), deadline.to_string());
             }
             // scenario=1 等待文本出现缓动；2 等待消失缓动。
-            WR::ScenarioTween { mode } => match mode {
+            WR::ScenarioTween { mode, .. } => match mode {
                 1 => {
                     info.insert("textTween".to_string(), "1".to_string());
                 }
@@ -1862,7 +1883,11 @@ impl Interpreter {
                     None => String::new(),
                 };
                 if scenario != 0 {
-                    crate::event::WaitReason::ScenarioTween { mode: scenario }
+                    let input = match instruction.get("input") {
+                        Some(raw) => evaluator.resolve_param(raw)?.as_int().unwrap_or(0) as i32,
+                        None => 0,
+                    };
+                    crate::event::WaitReason::ScenarioTween { mode: scenario, input }
                 } else if !video.is_empty() {
                     crate::event::WaitReason::VideoLayer { id: video }
                 } else if !se.is_empty() {
@@ -1912,20 +1937,7 @@ impl Interpreter {
 
             // 获取 handler 并执行
             if let Some(handler) = self.tag_registry.get(&instruction.tag) {
-                let result = handler.execute(&mut ctx)?;
-                if instruction.get(crate::lua_engine::MESSAGE_LAYER_STATE_PREAPPLIED) != Some("1") {
-                    match &result {
-                        TagResult::Emit(Event::MessageLayerSwitch { id, stack, .. }) => {
-                            ctx.variables
-                                .switch_message_layer(id.clone().unwrap_or_default(), *stack);
-                        }
-                        TagResult::Emit(Event::MessageLayerPop) => {
-                            ctx.variables.pop_message_layer();
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(result)
+                handler.execute(&mut ctx)
             } else {
                 unreachable!()
             }
@@ -2276,7 +2288,6 @@ impl Interpreter {
             stack,
             deferred,
             immediate_count,
-            allow_queue: false,
         });
         self.active_queued_wait = Some(self.queued_wait_checkpoints.len() - 1);
     }
@@ -2286,16 +2297,6 @@ impl Interpreter {
         self.queued_wait_checkpoints
             .retain(|checkpoint| checkpoint.stack.len() < depth);
         self.active_queued_wait = None;
-    }
-
-    fn queued_wait_blocks_before_flush(&self) -> bool {
-        let Some(checkpoint) = self.queued_wait_checkpoints.last() else {
-            return false;
-        };
-        if !checkpoint.allow_queue {
-            return true;
-        }
-        self.engine_ctx.lock().unwrap().tag_queue.is_empty()
     }
 
     fn queued_wait_at_current_position(&mut self) -> Option<Event> {
@@ -2389,18 +2390,6 @@ impl Interpreter {
         self.queued_call_barriers.clear();
         self.queued_wait_checkpoints.clear();
         self.active_queued_wait = None;
-        self.last_wait_from_queue = false;
-        self.last_queue_pause_is_wait = false;
-        self.last_flush_saw_return = false;
-        self.last_flush_saw_call = false;
-        self.last_flush_saw_jump = false;
-        {
-            let mut ctx = self.engine_ctx.lock().unwrap();
-            ctx.tag_queue.clear();
-            ctx.immediate_tag_count = 0;
-            ctx.pending_stack_override = None;
-            ctx.wait_reason_info = None;
-        }
         self.variables
             .lock()
             .unwrap()
@@ -2409,79 +2398,6 @@ impl Interpreter {
         // 重新加载目标脚本并定位到当前行
         self.load_external_script(script)?;
         Ok(())
-    }
-
-    /// Split off `enqueueTag` commands, leaving only the current `e:tag()` prefix.
-    ///
-    /// `[load]` onLoad uses immediate tags as a cover on the outgoing scene and
-    /// deferred tags as follow-up on the restored scene. The two prefixes have
-    /// to be flushed on either side of `restore_scene`.
-    pub fn take_deferred_queued_tags(
-        &mut self,
-    ) -> Vec<(String, std::collections::HashMap<String, String>)> {
-        let mut ctx = self.engine_ctx.lock().unwrap();
-        let split = ctx.immediate_tag_count.min(ctx.tag_queue.len());
-        ctx.tag_queue.split_off(split)
-    }
-
-    /// Append previously parked deferred tags to the back of the queue.
-    pub fn append_queued_tags(
-        &mut self,
-        tags: Vec<(String, std::collections::HashMap<String, String>)>,
-    ) {
-        let mut ctx = self.engine_ctx.lock().unwrap();
-        ctx.tag_queue.extend(tags);
-    }
-
-    /// Restore a click/key wait whose script PC already points at the next line.
-    ///
-    /// Queued `@` / `[wait]` waits advance the PC before pausing. Loading that
-    /// checkpoint must not increment the line again when the host acknowledges
-    /// the wait.
-    pub fn mark_queued_input_wait(&mut self) {
-        self.last_wait_from_queue = true;
-        self.last_queue_pause_is_wait = true;
-    }
-
-    /// Hold a restored click/key wait after onLoad follow-up has been queued.
-    ///
-    /// Saved click-waits snapshot the PC *after* the queued `@` / `[wait]`.
-    /// The follow-up `enqueueTag` commands still have to run, but once they
-    /// return to this position the next script instruction must not execute.
-    pub fn hold_queued_input_wait(&mut self) {
-        let Some(script) = self.current_script.clone() else {
-            return;
-        };
-        let line = self.current_line;
-        let stack = self.call_stack.clone();
-        if self
-            .queued_wait_checkpoints
-            .last()
-            .is_some_and(|checkpoint| {
-                checkpoint.script == script
-                    && checkpoint.line == line
-                    && same_call_stack(&checkpoint.stack, &stack)
-            })
-        {
-            let index = self.queued_wait_checkpoints.len() - 1;
-            self.queued_wait_checkpoints[index].allow_queue = true;
-            self.active_queued_wait = Some(index);
-            self.mark_queued_input_wait();
-            return;
-        }
-        self.queued_wait_checkpoints.push(QueuedWaitCheckpoint {
-            event: Event::Wait {
-                reason: WaitReason::Generic,
-            },
-            script,
-            line,
-            stack,
-            deferred: Vec::new(),
-            immediate_count: 0,
-            allow_queue: true,
-        });
-        self.active_queued_wait = Some(self.queued_wait_checkpoints.len() - 1);
-        self.mark_queued_input_wait();
     }
 
     /// Push the synthetic return frame used by a host-dispatched inline event.
@@ -2690,110 +2606,58 @@ mod tests {
     }
 
     #[test]
-    fn restore_position_discards_the_previous_execution_queue() {
+    fn unwound_queued_stop_does_not_rearm_when_ui_helper_is_reused() {
         let mut it = Interpreter::new(InterpreterConfig::default());
-        it.load_script("story", "*main\n[stop]\n").unwrap();
-        it.start("story", "main").unwrap();
-        it.lua()
-            .load(
-                r#"
-                __engine:tag{"lydel", id="old-immediate"}
-                __engine:enqueueTag{"lydel", id="old-deferred"}
-                "#,
-            )
-            .exec()
-            .unwrap();
-        {
-            let context = it.engine_context().lock().unwrap();
-            assert_eq!(context.tag_queue.len(), 2);
-            assert_eq!(context.immediate_tag_count, 1);
-        }
-
-        it.restore_position("story", 0, Vec::new()).unwrap();
-
-        let context = it.engine_context().lock().unwrap();
-        assert!(context.tag_queue.is_empty());
-        assert_eq!(context.immediate_tag_count, 0);
-    }
-
-    #[test]
-    fn take_deferred_queued_tags_leaves_the_immediate_prefix() {
-        let mut it = Interpreter::new(InterpreterConfig::default());
-        it.load_script("story", "*main\n[stop]\n").unwrap();
-        it.start("story", "main").unwrap();
-        it.lua()
-            .load(
-                r#"
-                __engine:tag{"lydel", id="cover"}
-                __engine:enqueueTag{"lydel", id="followup"}
-                "#,
-            )
-            .exec()
-            .unwrap();
-
-        let deferred = it.take_deferred_queued_tags();
-        {
-            let context = it.engine_context().lock().unwrap();
-            assert_eq!(context.tag_queue.len(), 1);
-            assert_eq!(
-                context.tag_queue[0].1.get("id").map(String::as_str),
-                Some("cover")
-            );
-            assert_eq!(context.immediate_tag_count, 1);
-        }
-        assert_eq!(deferred.len(), 1);
-        assert_eq!(
-            deferred[0].1.get("id").map(String::as_str),
-            Some("followup")
-        );
-
-        it.append_queued_tags(deferred);
-        let context = it.engine_context().lock().unwrap();
-        assert_eq!(context.tag_queue.len(), 2);
-        assert_eq!(context.immediate_tag_count, 1);
-    }
-
-    #[test]
-    fn mark_queued_input_wait_keeps_advance_line_from_skipping_the_next_tag() {
-        let mut it = Interpreter::new(InterpreterConfig::default());
-        it.load_script("story", "*main\n[wait]\n[call label=next]\n")
-            .unwrap();
-        it.start("story", "main").unwrap();
-        it.restore_position("story", 1, Vec::new()).unwrap();
-        it.mark_queued_input_wait();
-        it.advance_line();
-        assert_eq!(it.current_line(), 1);
-    }
-
-    #[test]
-    fn load_restored_click_wait_runs_onload_follow_up_then_holds() {
-        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            visits = 0
+            function maybe_stop()
+                visits = visits + 1
+                if visits == 1 then
+                    __engine:tag{'stop'}
+                    __engine:enqueueTag{'var', name='abandoned', data='1'}
+                end
+            end
+        "#).exec().unwrap();
         it.load_script(
-            "macro.iet",
-            "*main\n[wait input=1]\n[@]\n[var name=after_wait data=1]\n[stop]\n*onload\n[var name=onload data=1]\n[return]\n",
-        )
-        .unwrap();
-        it.start("macro.iet", "main").unwrap();
-        it.restore_position("macro.iet", 2, Vec::new()).unwrap();
-        it.lua()
-            .load("__engine:enqueueTag{'call', file='macro.iet', label='onload'}")
-            .exec()
+            "main",
+            "[call file=helper target=entry]\n[var name=resumed data=1]\n[stop]",
+        ).unwrap();
+        it.load_script("helper", "*entry\n[calllua function=maybe_stop]\n[return]")
             .unwrap();
-        it.hold_queued_input_wait();
-
-        assert!(matches!(
-            it.run().unwrap(),
-            ExecutionResult::Wait(Event::Wait {
-                reason: WaitReason::Generic
-            })
-        ));
-        assert_eq!(it.get_variable("onload"), Some(Value::Int(1)));
-        assert!(it.get_variable("after_wait").is_none());
-        assert_eq!(it.current_line(), 2);
-
-        it.advance_line();
-        it.run().unwrap();
-        assert_eq!(it.get_variable("after_wait"), Some(Value::Int(1)));
+        it.set_callback(|event| match event {
+            Event::Wait { .. } => CallbackResult::Pause,
+            _ => CallbackResult::Continue,
+        });
+        it.boot("main").unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait {
+            reason: WaitReason::Stop { .. }
+        })));
+        assert_eq!(it.current_script(), Some("helper"));
+        let old_pc = it.current_line();
+        // A callback that returns only itself must preserve this helper's wait.
+        it.push_inline_event_frame().unwrap();
+        it.lua().load("__engine:tag{'return'}").exec().unwrap();
+        assert!(it.drain_queued_tags_only().unwrap().saw_return);
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait {
+            reason: WaitReason::Stop { .. }
+        })));
+        assert_eq!(it.current_script(), Some("helper"));
+        assert_eq!(it.current_line(), old_pc);
+        assert!(it.get_variable("abandoned").is_none());
+        // Input callback's ResetStack unwinds its synthetic frame and the
+        // stopped UI helper; the closing transition calls the same helper.
+        it.push_inline_event_frame().unwrap();
+        it.lua().load("__engine:tag{'return'}; __engine:tag{'return'}; __engine:tag{'call', file='helper', target='entry'}")
+            .exec().unwrap();
+        let drain = it.drain_queued_tags_only().unwrap();
+        assert!(drain.saw_return && drain.saw_call);
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait {
+            reason: WaitReason::Stop { .. }
+        })));
+        assert_eq!(it.current_script(), Some("main"),
+            "old helper stop at {} must not rearm", old_pc);
+        assert_eq!(it.get_variable("resumed"), Some(Value::Int(1)));
+        assert!(it.get_variable("abandoned").is_none());
     }
 
     #[test]
@@ -3788,16 +3652,37 @@ mod tests {
     }
 
     #[test]
+    fn scenario_wait_preserves_input_policy_in_direct_and_queued_tags() {
+        for input in [0, 1, 2] {
+            for queued in [false, true] {
+                let mut it = Interpreter::new(InterpreterConfig::default());
+                it.lua().load(format!("function queue_wait() __engine:enqueueTag{{'wait', scenario=1, input={input}}} end")).exec().unwrap();
+                let command = if queued { "[calllua function=queue_wait]".to_owned() }
+                    else { format!("[wait scenario=1 input={input}]") };
+                it.load_script("probe", &format!("{command}\n[@]\n[var name=next_sentence data=1]")).unwrap();
+                it.boot("probe").unwrap();
+                it.set_callback(|event| if matches!(event, Event::Wait { .. }) { CallbackResult::Pause } else { CallbackResult::Continue });
+                assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait {
+                    reason: WaitReason::ScenarioTween { mode: 1, input: policy }
+                }) if policy == input), "queued={queued}, input={input}");
+                it.advance_line();
+                assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait { reason: WaitReason::Generic })));
+                assert!(it.get_variable("next_sentence").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn wait_scenario_produces_scenario_tween_wait_reason() {
         // scenario=1 等待场景文本出现的 Tween；2 等待隐藏的 Tween；
         // 0（显式指定）不等待 → 回退普通计时等待。
         assert!(matches!(
             run_wait_reason("scenario=\"1\""),
-            WaitReason::ScenarioTween { mode: 1 }
+            WaitReason::ScenarioTween { mode: 1, input: 0 }
         ));
         assert!(matches!(
             run_wait_reason("scenario=\"2\""),
-            WaitReason::ScenarioTween { mode: 2 }
+            WaitReason::ScenarioTween { mode: 2, input: 0 }
         ));
         assert!(matches!(
             run_wait_reason("scenario=\"0\" time=\"100\" input=\"1\""),

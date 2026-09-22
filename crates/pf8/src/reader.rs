@@ -21,7 +21,7 @@ impl<T: Read + Seek + Send> ReadSeek for T {}
 /// 条目查找键：统一小写（大小写不敏感，与引擎历史行为一致）。
 /// （art3m1s 本地改动：上游是区分大小写的精确匹配。）
 fn entry_key(path: &str) -> String {
-    path.to_lowercase()
+    path.replace('\\', "/").to_lowercase()
 }
 
 /// Optimized reader for PF6/PF8 archives with minimal memory usage

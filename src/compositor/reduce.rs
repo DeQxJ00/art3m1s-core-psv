@@ -182,6 +182,33 @@ impl Compositor {
             .clone_from(&other.default_message_layer);
     }
 
+    /// Clock ticks can only change animated layers. Script/structural changes
+    /// still use the full synchronization path. Include previously animated
+    /// layers so completed tweens and deleted subtrees are exported as well.
+    pub(crate) fn sync_query_clock_from(&mut self, other: &Self) -> HashSet<String> {
+        let ids: HashSet<String> = self.scene.all_layers()
+            .chain(other.scene.all_layers())
+            .filter(|layer| !layer.tweens.is_empty())
+            .map(|layer| layer.id.clone())
+            .chain(self.anime_states.keys().cloned())
+            .chain(other.anime_states.keys().cloned())
+            .collect();
+        self.clock_ms = other.clock_ms;
+        for id in &ids {
+            if let Some(layer) = other.scene.get(id) {
+                self.scene.ensure(id);
+                self.scene.get_mut(id).unwrap().clone_from(layer);
+            } else {
+                self.scene.delete(id);
+            }
+        }
+        self.anime_states.retain(|id, _| other.anime_states.contains_key(id));
+        for (id, state) in &other.anime_states {
+            self.anime_states.entry(id.clone()).or_insert_with(|| state.clone());
+        }
+        ids
+    }
+
     pub fn ensure_layer(&mut self, id: &str) {
         self.scene.ensure(id);
     }
@@ -285,21 +312,26 @@ impl Compositor {
     pub fn advance(&mut self, delta_ms: u64) -> bool {
         // Capture this before garbage collection so the final tween/anime
         // state is exported once on the tick where it finishes.
-        let layer_info_clock_changed = !self.anime_states.is_empty()
-            || self
-                .scene
-                .all_layers()
-                .any(|layer| !layer.tweens.is_empty());
+        let has_tweens = self.scene.all_layers().any(|layer| !layer.tweens.is_empty());
+        let next_clock = self.clock_ms.saturating_add(delta_ms);
+        let tween_changed = self.scene.all_layers().any(|layer| {
+            layer.tweens.iter().any(|tween| {
+                tween.is_finished(next_clock)
+                    || tween.value_at(self.clock_ms) != tween.value_at(next_clock)
+            })
+        });
         self.clock_ms = self.clock_ms.saturating_add(delta_ms);
 
         transition::clear_finished(&self.trans_state, self.clock_ms);
-        anim::gc_finished_tweens(
-            &mut self.scene,
-            self.clock_ms,
-            &mut self.pending_tween_events,
-        );
-        anim::update_anime_frames(&mut self.scene, &mut self.anime_states, self.clock_ms);
-        layer_info_clock_changed
+        if has_tweens {
+            anim::gc_finished_tweens(
+                &mut self.scene,
+                self.clock_ms,
+                &mut self.pending_tween_events,
+            );
+        }
+        let anime_changed = anim::update_anime_frames(&mut self.scene, &mut self.anime_states, self.clock_ms);
+        tween_changed || anime_changed
     }
     ///
     /// 宿主在每帧 `advance` 之后调用，将返回到的 [`TweenHandler`] 交回解释器
@@ -1100,6 +1132,37 @@ mod tests {
         assert!(c.scene().get("1").unwrap().tweens.is_empty());
         assert_eq!(c.scene().get("1").unwrap().props.alpha, Some(255));
         assert!(!c.advance(16), "finished tweens return to the static path");
+    }
+
+    #[test]
+    fn clock_query_sync_matches_full_sync_through_tween_subtree_deletion() {
+        let mut source = Compositor::new();
+        source.apply_event(&create("1", "moving"));
+        source.apply_event(&create("1.0", "child"));
+        source.apply_event(&create("2", "static"));
+        source.apply_event(&Event::LayerTween {
+            id: "1".into(), param: "left".into(), from: Some("0".into()), to: Some("100".into()),
+            ease: None, time: Some(1000), delay: Some(100), loop_count: None,
+            yoyo: None, loop_delay: None, sync: false, delete: true,
+            handler_file: None, handler_label: None, handler_handler: Some("finished".into()),
+            extra_params: HashMap::new(),
+        });
+        let mut incremental = Compositor::new();
+        incremental.sync_query_scene_from(&source);
+        // Waiting for the tween does not change its value or lose completion.
+        assert!(!source.advance(50));
+        for step in [100, 500, 600] {
+            source.advance(step);
+            incremental.sync_query_clock_from(&source);
+            let mut full = Compositor::new();
+            full.sync_query_scene_from(&source);
+            assert_eq!(serde_json::to_value(incremental.scene()).unwrap(), serde_json::to_value(full.scene()).unwrap());
+            assert_eq!(incremental.clock_ms(), full.clock_ms());
+        }
+        assert!(incremental.scene().get("1").is_none());
+        assert!(incremental.scene().get("1.0").is_none());
+        assert!(incremental.scene().get("2").is_some());
+        assert_eq!(source.poll_tween_events().len(), 1);
     }
 
     #[test]

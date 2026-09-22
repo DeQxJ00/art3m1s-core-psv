@@ -1029,12 +1029,15 @@ fn draw_mesh(points: Option<&[f32]>, width: f32, height: f32) -> Option<DrawMesh
 impl CoreRuntime {
     pub(crate) fn set_emote_backend(&mut self, backend: EmoteBackend) {
         let cleared = self.emote.lock().unwrap().set_backend(backend);
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
         let textures = if self.gl_ctx.make_current() {
             self.texture_provider.evict_prefix(":emote/")
         } else {
             crate::core_warn!("[E-Mote] GL context unavailable while changing backend");
             0
         };
+        #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+        let textures = self.texture_provider.evict_prefix(":emote/");
         crate::core_info!(
             "[E-Mote] backend={backend:?}; cleared {cleared} layer(s) and {textures} texture(s)"
         );
@@ -1043,12 +1046,15 @@ impl CoreRuntime {
 
     pub(super) fn clear_emote_state(&mut self, reason: &str) {
         let layers = self.emote.lock().unwrap().clear();
+        #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
         let textures = if self.gl_ctx.make_current() {
             self.texture_provider.evict_prefix(":emote/")
         } else {
             crate::core_warn!("[E-Mote] GL context unavailable while clearing {reason}");
             0
         };
+        #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+        let textures = self.texture_provider.evict_prefix(":emote/");
         if layers != 0 || textures != 0 {
             crate::core_info!(
                 "[E-Mote] cleared {layers} layer(s) and {textures} GPU texture(s): {reason}"

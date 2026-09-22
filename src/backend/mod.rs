@@ -6,3 +6,6 @@
 
 #[cfg(feature = "gl-backend")]
 pub mod gl;
+
+#[cfg(feature = "gxm-backend")]
+pub mod gxm;
