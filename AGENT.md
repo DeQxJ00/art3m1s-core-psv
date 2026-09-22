@@ -12,7 +12,7 @@
 ## 生产入口与边界
 
 - 先读 `README.md`、`tests/README.md` 和相关模块代码。
-- 本仓库生产路径是 `host-direct` 宿主 → `src/ffi.rs` → `CoreRuntime` → 原生 GXM 后端。核心源码统一为根目录 `core/`，旧 `backup/legacy-build/heap-audit/controls-source` 仅作历史回溯。core 不负责创建窗口或音视频解码。
+- 配套 PSV 主项目的生产路径是 `host-direct` 宿主 → `src/ffi.rs` → `CoreRuntime` → 原生 GXM 后端。本仓库独立维护，配套主项目通过根目录 `core/` 子模块固定提交。core 不负责创建窗口或音视频解码。
 - 编译所需文件和 VPK 放根目录 `build/`；可删除的临时结果放 `temp/`；旧工作区、存档及部署前备份放 `backup/`。后两者不加入 Git，不能把唯一备份放进 `temp/`。
 - 宿主提供帧时钟与输入；脚本注册的事件队列以及 `onEnterFrame`/vsync 是运行时行为的一部分。
 - 图层 ID 是字符串，必须保留 `1.80` 等原始身份，不能转成数值再格式化。
@@ -27,13 +27,13 @@
 
 ## 检查与测试
 
-Windows 可从仓库根目录运行 `scripts/check-direct-effects-core.ps1`，同时覆盖默认 core、生产 GXM feature 组合及子 crate。
-PSV 交付运行 `scripts/build.ps1`，必须生成并校验 VPK。
+Windows 可从配套主项目根目录运行 `scripts/check-direct-effects-core.ps1`，同时覆盖默认 core、生产 GXM feature 组合及子 crate。
+在配套主项目中，PSV 交付运行 `scripts/build.ps1`，必须生成并校验 VPK。
 
 ```sh
 cargo check --all-features
 cargo fmt --check
-./scripts/test-all.sh
+bash scripts/test-all.sh
 ```
 
 `test-all.sh` 覆盖 core、Lua 5.1/Luau、两个 E-Mote crate 和 PFS crate。子 crate 不要仅靠顶层 `cargo test` 代替验证。
@@ -41,7 +41,7 @@ cargo fmt --check
 macOS 硬件 CGL 测试应按脚本单独运行：
 
 ```sh
-ART3M1S_RUN_CGL_TESTS=1 ./scripts/test-all.sh
+ART3M1S_RUN_CGL_TESTS=1 bash scripts/test-all.sh
 ```
 
 遇到 `CGLChoosePixelFormat failed`，先区分 context/环境失败和代码回归。外部游戏测试使用 `ART3M1S_FIXTURES_DIR` 或 `ART3M1S_FIXTURE_NEKOMIKO_DIR` 等配置，具体命令以 `tests/README.md` 为准。不要把本机绝对游戏路径写入测试。
