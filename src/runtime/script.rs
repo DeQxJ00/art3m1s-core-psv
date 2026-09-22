@@ -288,8 +288,9 @@ impl CoreRuntime {
             WaitReason::Timed { input, .. } => {
                 // input=0 is a pure timer: neither Skip nor an input edge may
                 // shorten it. input=1 is released by actual user input only;
-                // input=2 additionally permits the engine's Skip state.
-                if timed_wait_accepts_user_input(input, tick.user_input) {
+                // input=2 permits only the engine's Skip state. A click that
+                // just stopped automode is already consumed for this frame.
+                if timed_wait_accepts_user_input(input, tick.user_input, stopped_automode_by_click) {
                     self.timed_remaining_ms = 0;
                     true
                 } else if input == 2 && self.skip_active() {
@@ -659,8 +660,8 @@ fn settle_inline_event_frame(
     Ok(())
 }
 
-fn timed_wait_accepts_user_input(input: i32, user_input: bool) -> bool {
-    input == 1 && user_input
+fn timed_wait_accepts_user_input(input: i32, user_input: bool, stopped_automode: bool) -> bool {
+    input == 1 && user_input && !stopped_automode
 }
 
 fn scenario_reveal_requested(mode: i32, input: i32, advance_requested: bool, complete: bool) -> bool {
@@ -750,10 +751,11 @@ mod tests {
 
     #[test]
     fn timed_wait_only_accepts_click_for_input_one() {
-        assert!(!timed_wait_accepts_user_input(0, true));
-        assert!(timed_wait_accepts_user_input(1, true));
-        assert!(!timed_wait_accepts_user_input(2, true));
-        assert!(!timed_wait_accepts_user_input(1, false));
+        assert!(!timed_wait_accepts_user_input(0, true, false));
+        assert!(timed_wait_accepts_user_input(1, true, false));
+        assert!(!timed_wait_accepts_user_input(2, true, false));
+        assert!(!timed_wait_accepts_user_input(1, false, false));
+        assert!(!timed_wait_accepts_user_input(1, true, true));
     }
 
     #[test]
