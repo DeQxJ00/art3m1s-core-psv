@@ -3,7 +3,7 @@
 //! ASB 脚本解释器的核心实现，使用迭代而非递归来避免栈溢出。
 
 use crate::error::{Error, Result};
-use crate::event::{CallbackResult, Event, EventCallback, ScriptLoader, default_callback};
+use crate::event::{CallbackResult, Event, EventCallback, ScriptLoader, WaitReason, default_callback};
 use crate::expression::ExpressionEvaluator;
 use crate::lua_engine::{DefaultEngineCallbacks, EngineContext, TAG_FILTER_REGISTRY_KEY};
 use crate::r#macro::MacroRegistry;
@@ -77,6 +77,10 @@ struct QueuedWaitCheckpoint {
     stack: Vec<CallFrame>,
     deferred: Vec<(String, HashMap<String, String>)>,
     immediate_count: usize,
+    /// When true, onLoad follow-up may run before this wait is re-emitted.
+    allow_queue: bool,
+    /// Inline waits still own the current instruction; queued waits already advanced.
+    advance_on_release: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -862,7 +866,12 @@ impl Interpreter {
             // A queued handler may return to a PC that is already the next
             // script instruction. Re-emit the original wait before flushing
             // deferred tags or executing that instruction.
-            if let Some(event) = self.queued_wait_at_current_position() {
+            //
+            // Load-restored waits set `allow_queue` so onLoad follow-up can
+            // run first; only hold once that queue is empty.
+            if self.queued_wait_blocks_before_flush()
+                && let Some(event) = self.queued_wait_at_current_position()
+            {
                 self.last_wait_from_queue = true;
                 self.last_queue_pause_is_wait = true;
                 return Ok(ExecutionResult::Wait(event));
@@ -2231,6 +2240,9 @@ impl Interpreter {
             && index < self.queued_wait_checkpoints.len()
         {
             let mut checkpoint = self.queued_wait_checkpoints.remove(index);
+            if checkpoint.advance_on_release {
+                self.current_line = self.current_line.saturating_add(1);
+            }
             self.queued_wait_checkpoints.truncate(index);
             let mut ctx = self.engine_ctx.lock().unwrap();
             let current = std::mem::take(&mut ctx.tag_queue);
@@ -2288,6 +2300,8 @@ impl Interpreter {
             stack,
             deferred,
             immediate_count,
+            allow_queue: false,
+            advance_on_release: false,
         });
         self.active_queued_wait = Some(self.queued_wait_checkpoints.len() - 1);
     }
@@ -2295,8 +2309,21 @@ impl Interpreter {
     fn prune_queued_wait_checkpoints_for_jump(&mut self) {
         let depth = self.call_stack.len();
         self.queued_wait_checkpoints
-            .retain(|checkpoint| checkpoint.stack.len() < depth);
+            // onLoad helpers may jump at the restored wait's own depth before
+            // returning to its saved PC. Ordinary waits still leave with the
+            // current frame; pop_call_frame retains its separate return cleanup.
+            .retain(|checkpoint| checkpoint.allow_queue || checkpoint.stack.len() < depth);
         self.active_queued_wait = None;
+    }
+
+    fn queued_wait_blocks_before_flush(&self) -> bool {
+        let Some(checkpoint) = self.queued_wait_checkpoints.last() else {
+            return false;
+        };
+        if !checkpoint.allow_queue {
+            return true;
+        }
+        self.engine_ctx.lock().unwrap().tag_queue.is_empty()
     }
 
     fn queued_wait_at_current_position(&mut self) -> Option<Event> {
@@ -2390,6 +2417,18 @@ impl Interpreter {
         self.queued_call_barriers.clear();
         self.queued_wait_checkpoints.clear();
         self.active_queued_wait = None;
+        self.last_wait_from_queue = false;
+        self.last_queue_pause_is_wait = false;
+        self.last_flush_saw_return = false;
+        self.last_flush_saw_call = false;
+        self.last_flush_saw_jump = false;
+        {
+            let mut ctx = self.engine_ctx.lock().unwrap();
+            ctx.tag_queue.clear();
+            ctx.immediate_tag_count = 0;
+            ctx.pending_stack_override = None;
+            ctx.wait_reason_info = None;
+        }
         self.variables
             .lock()
             .unwrap()
@@ -2398,6 +2437,96 @@ impl Interpreter {
         // 重新加载目标脚本并定位到当前行
         self.load_external_script(script)?;
         Ok(())
+    }
+
+    /// Split off `enqueueTag` commands, leaving only the current `e:tag()` prefix.
+    ///
+    /// `[load]` onLoad uses immediate tags as a cover on the outgoing scene and
+    /// deferred tags as follow-up on the restored scene. The two prefixes have
+    /// to be flushed on either side of `restore_scene`.
+    pub fn take_deferred_queued_tags(
+        &mut self,
+    ) -> Vec<(String, std::collections::HashMap<String, String>)> {
+        let mut ctx = self.engine_ctx.lock().unwrap();
+        let split = ctx.immediate_tag_count.min(ctx.tag_queue.len());
+        ctx.tag_queue.split_off(split)
+    }
+
+    /// Append previously parked deferred tags to the back of the queue.
+    pub fn append_queued_tags(
+        &mut self,
+        tags: Vec<(String, std::collections::HashMap<String, String>)>,
+    ) {
+        let mut ctx = self.engine_ctx.lock().unwrap();
+        ctx.tag_queue.extend(tags);
+    }
+
+    /// Restore a click/key wait whose script PC already points at the next line.
+    ///
+    /// Queued `@` / `[wait]` waits advance the PC before pausing. Loading that
+    /// checkpoint must not increment the line again when the host acknowledges
+    /// the wait.
+    pub fn mark_queued_input_wait(&mut self) {
+        self.last_wait_from_queue = true;
+        self.last_queue_pause_is_wait = true;
+    }
+
+    /// Hold a restored click/key wait after onLoad follow-up has been queued.
+    ///
+    /// Saved click-waits snapshot the PC *after* the queued `@` / `[wait]`.
+    /// The follow-up `enqueueTag` commands still have to run, but once they
+    /// return to this position the next script instruction must not execute.
+    pub fn hold_queued_input_wait(&mut self) {
+        self.hold_restored_input_wait(true);
+    }
+
+    pub fn input_wait_is_queued(&self) -> bool {
+        self.last_wait_from_queue && self.last_queue_pause_is_wait
+            && self.active_queued_wait
+                .and_then(|index| self.queued_wait_checkpoints.get(index))
+                .is_none_or(|checkpoint| !checkpoint.advance_on_release)
+    }
+
+    /// Preserve the saved wait without conflating inline and queued PCs.
+    pub fn hold_restored_input_wait(&mut self, from_queue: bool) {
+        self.hold_restored_wait(from_queue, WaitReason::Generic);
+    }
+
+    pub fn hold_restored_wait(&mut self, from_queue: bool, reason: WaitReason) {
+        let Some(script) = self.current_script.clone() else {
+            return;
+        };
+        let line = self.current_line;
+        let stack = self.call_stack.clone();
+        if self
+            .queued_wait_checkpoints
+            .last()
+            .is_some_and(|checkpoint| {
+                checkpoint.script == script
+                    && checkpoint.line == line
+                    && same_call_stack(&checkpoint.stack, &stack)
+            })
+        {
+            let index = self.queued_wait_checkpoints.len() - 1;
+            self.queued_wait_checkpoints[index].event = Event::Wait { reason };
+            self.queued_wait_checkpoints[index].allow_queue = true;
+            self.queued_wait_checkpoints[index].advance_on_release = !from_queue;
+            self.active_queued_wait = Some(index);
+            self.mark_queued_input_wait();
+            return;
+        }
+        self.queued_wait_checkpoints.push(QueuedWaitCheckpoint {
+            event: Event::Wait { reason },
+            script,
+            line,
+            stack,
+            deferred: Vec::new(),
+            immediate_count: 0,
+            allow_queue: true,
+            advance_on_release: !from_queue,
+        });
+        self.active_queued_wait = Some(self.queued_wait_checkpoints.len() - 1);
+        self.mark_queued_input_wait();
     }
 
     /// Push the synthetic return frame used by a host-dispatched inline event.
@@ -4301,4 +4430,209 @@ mod tests {
             0
         }
     }
+    #[test]
+    fn restore_position_discards_the_previous_execution_queue() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "*main\n[stop]\n").unwrap();
+        it.start("story", "main").unwrap();
+        it.lua()
+            .load(
+                r#"
+                __engine:tag{"lydel", id="old-immediate"}
+                __engine:enqueueTag{"lydel", id="old-deferred"}
+                "#,
+            )
+            .exec()
+            .unwrap();
+        {
+            let context = it.engine_context().lock().unwrap();
+            assert_eq!(context.tag_queue.len(), 2);
+            assert_eq!(context.immediate_tag_count, 1);
+        }
+
+        it.restore_position("story", 0, Vec::new()).unwrap();
+
+        let context = it.engine_context().lock().unwrap();
+        assert!(context.tag_queue.is_empty());
+        assert_eq!(context.immediate_tag_count, 0);
+    }
+
+    #[test]
+    fn take_deferred_queued_tags_leaves_the_immediate_prefix() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "*main\n[stop]\n").unwrap();
+        it.start("story", "main").unwrap();
+        it.lua()
+            .load(
+                r#"
+                __engine:tag{"lydel", id="cover"}
+                __engine:enqueueTag{"lydel", id="followup"}
+                "#,
+            )
+            .exec()
+            .unwrap();
+
+        let deferred = it.take_deferred_queued_tags();
+        {
+            let context = it.engine_context().lock().unwrap();
+            assert_eq!(context.tag_queue.len(), 1);
+            assert_eq!(
+                context.tag_queue[0].1.get("id").map(String::as_str),
+                Some("cover")
+            );
+            assert_eq!(context.immediate_tag_count, 1);
+        }
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(
+            deferred[0].1.get("id").map(String::as_str),
+            Some("followup")
+        );
+
+        it.append_queued_tags(deferred);
+        let context = it.engine_context().lock().unwrap();
+        assert_eq!(context.tag_queue.len(), 2);
+        assert_eq!(context.immediate_tag_count, 1);
+    }
+
+    #[test]
+    fn mark_queued_input_wait_keeps_advance_line_from_skipping_the_next_tag() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "*main\n[wait]\n[call label=next]\n")
+            .unwrap();
+        it.start("story", "main").unwrap();
+        it.restore_position("story", 1, Vec::new()).unwrap();
+        it.mark_queued_input_wait();
+        it.advance_line();
+        assert_eq!(it.current_line(), 1);
+    }
+
+    #[test]
+    fn load_restored_click_wait_runs_onload_follow_up_then_holds() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script(
+            "macro.iet",
+            "*main\n[wait input=1]\n[@]\n[var name=after_wait data=1]\n[stop]\n*onload\n[var name=onload data=1]\n[return]\n",
+        )
+        .unwrap();
+        it.start("macro.iet", "main").unwrap();
+        it.restore_position("macro.iet", 2, Vec::new()).unwrap();
+        it.lua()
+            .load("__engine:enqueueTag{'call', file='macro.iet', label='onload'}")
+            .exec()
+            .unwrap();
+        it.hold_queued_input_wait();
+
+        assert!(matches!(
+            it.run().unwrap(),
+            ExecutionResult::Wait(Event::Wait {
+                reason: WaitReason::Generic
+            })
+        ));
+        assert_eq!(it.get_variable("onload"), Some(Value::Int(1)));
+        assert!(it.get_variable("after_wait").is_none());
+        assert_eq!(it.current_line(), 2);
+
+        it.advance_line();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("after_wait"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn load_restored_click_wait_survives_onload_helper_jump() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script(
+            "story",
+            "*main\n[wait input=1]\n[@]\n[var name=after_wait data=1]\n[stop]\n",
+        )
+        .unwrap();
+        it.load_script(
+            "helper",
+            "*main\n[var name=onload_helper data=1]\n[return]\n",
+        )
+        .unwrap();
+        it.start("story", "main").unwrap();
+        it.restore_position("story", 2, Vec::new()).unwrap();
+        it.hold_queued_input_wait();
+        it.push_inline_event_frame().unwrap();
+        it.lua()
+            .load("__engine:enqueueTag{'jump', file='helper', label='main'}")
+            .exec()
+            .unwrap();
+
+        assert!(matches!(
+            it.run().unwrap(),
+            ExecutionResult::Wait(Event::Wait {
+                reason: WaitReason::Generic
+            })
+        ));
+        assert_eq!(it.get_variable("onload_helper"), Some(Value::Int(1)));
+        assert!(it.get_variable("after_wait").is_none());
+
+        it.advance_line();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("after_wait"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn restored_wait_survives_same_depth_helper_jump_chain() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "*main\n[@]\n*resume\n[var name=after_wait data=1]\n[stop]\n").unwrap();
+        it.load_script("helper", "*main\n[var name=helper_done data=1]\n[jump file=story label=resume]\n").unwrap();
+        it.start("story", "main").unwrap();
+        let resume = it.get_script("story").unwrap().get_label_line("resume").unwrap();
+        it.restore_position("story", resume, Vec::new()).unwrap();
+        it.hold_queued_input_wait();
+        it.lua().load("__engine:enqueueTag{'jump', file='helper', label='main'}").exec().unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait { reason: WaitReason::Generic })));
+        assert_eq!(it.get_variable("helper_done"), Some(Value::Int(1)));
+        assert!(it.get_variable("after_wait").is_none());
+        it.advance_line();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("after_wait"), Some(Value::Int(1)));
+        assert!(it.queued_wait_checkpoints.is_empty());
+    }
+
+    #[test]
+    fn restored_inline_wait_advances_exactly_once_after_helper_return() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.set_callback(|event| if matches!(event, Event::Wait { .. }) { CallbackResult::Pause } else { CallbackResult::Continue });
+        it.load_script("story", "*main\n[@]\n[var name=after_wait data=1]\n[stop]\n").unwrap();
+        it.load_script("helper", "*main\n[var name=helper_done data=1]\n[return]\n").unwrap();
+        it.start("story", "main").unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(_)));
+        assert!(!it.input_wait_is_queued());
+        let line = it.current_line();
+        it.restore_position("story", line, Vec::new()).unwrap();
+        it.hold_restored_input_wait(false);
+        it.lua().load("__engine:enqueueTag{'call', file='helper', label='main'}").exec().unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait { reason: WaitReason::Generic })));
+        assert_eq!(it.get_variable("helper_done"), Some(Value::Int(1)));
+        assert!(it.get_variable("after_wait").is_none());
+        assert!(!it.input_wait_is_queued());
+        it.advance_line();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("after_wait"), Some(Value::Int(1)));
+        assert!(it.queued_wait_checkpoints.is_empty());
+    }
+
+    #[test]
+    fn returning_out_of_restored_wait_discards_it_before_next_call() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.set_callback(|event| if matches!(event, Event::Wait { .. }) { CallbackResult::Pause } else { CallbackResult::Continue });
+        it.load_script("story", "*main\n[call file=helper label=main]\n[stop]\n").unwrap();
+        it.load_script("helper", "*main\n[@]\n[return]\n").unwrap();
+        it.start("story", "main").unwrap();
+        it.run().unwrap();
+        it.hold_restored_input_wait(false);
+        assert_eq!(it.queued_wait_checkpoints.len(), 1);
+        it.lua().load("__engine:enqueueTag{'return'}").exec().unwrap();
+        it.drain_queued_tags_only().unwrap();
+        assert!(it.queued_wait_checkpoints.is_empty());
+        assert!(!it.input_wait_is_queued());
+        it.lua().load("__engine:enqueueTag{'call', file='helper', label='main'}").exec().unwrap();
+        it.run().unwrap();
+        assert_eq!(it.current_script(), Some("helper"));
+        assert!(it.queued_wait_checkpoints.is_empty());
+    }
+
 }

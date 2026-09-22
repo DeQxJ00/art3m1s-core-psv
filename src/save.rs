@@ -136,13 +136,115 @@ pub struct SaveData {
     /// 引擎侧音频播放状态。旧存档没有该字段时读档保持静音，等待脚本后续事件。
     #[serde(default)]
     pub audio: Option<AudioSnapshot>,
+    /// 存档是否停在点击/按键等待。旧存档缺省为 None，读档时按前一条指令推断。
+    #[serde(default)]
+    pub waiting_for_input: Option<bool>,
+    /// Whether the saved input wait already advanced the script PC.
+    #[serde(default)]
+    pub input_wait_from_queue: Option<bool>,
+    #[serde(default)]
+    pub input_wait_reason: Option<InputWaitSnapshot>,
+    /// 点击等待时各消息层的再现标签。字形图集不可序列化，读档后重放这些标签。
+    #[serde(default)]
+    pub message_text: Option<MessageTextSnapshot>,
+}
+
+/// Only user-input waits are resumable checkpoints, never media/timer waits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum InputWaitSnapshot {
+    Generic,
+    Generic0,
+    Key { buttons: Vec<String> },
+}
+
+impl InputWaitSnapshot {
+    pub fn capture(reason: Option<&asb_interpreter::event::WaitReason>) -> Option<Self> {
+        use asb_interpreter::event::WaitReason;
+        match reason? {
+            WaitReason::Generic => Some(Self::Generic),
+            WaitReason::Generic0 => Some(Self::Generic0),
+            WaitReason::KeyWait { buttons } => Some(Self::Key { buttons: buttons.clone() }),
+            _ => None,
+        }
+    }
+
+    pub fn restore(&self) -> asb_interpreter::event::WaitReason {
+        use asb_interpreter::event::WaitReason;
+        match self {
+            Self::Generic => WaitReason::Generic,
+            Self::Generic0 => WaitReason::Generic0,
+            Self::Key { buttons } => WaitReason::KeyWait { buttons: buttons.clone() },
+        }
+    }
+}
+
+/// 一个消息层在存档时刻的当前页文本。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MessageTextSnapshot {
+    #[serde(default)]
+    pub active_layer: Option<String>,
+    #[serde(default)]
+    pub layers: Vec<MessageLayerTextSnapshot>,
+}
+
+/// 单个消息层的页首字体与再现标签。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MessageLayerTextSnapshot {
+    pub id: String,
+    #[serde(default)]
+    pub page_font: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub tags: Vec<crate::text::BacklogTag>,
 }
 
 /// 调用栈帧快照（不依赖 asb-interpreter 的 CallFrame）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallFrameSnapshot {
     pub script: String,
     pub return_line: usize,
+}
+
+/// 点击/按键等待处的可恢复游戏状态。
+///
+/// 编号 `[save]` 经常发生在菜单/对话框里。`t.*` 按规定不写入存档，所以把 PC
+/// 停在菜单里再读档时，脚本无法看见当时的 `t.saveslot` 等临时量，onLoad 的
+/// `sysbtn_rewrite` 也会读到菜单留下的 `sysbtn_mode`。当调用栈是从这个等待
+/// 嵌套出去的，编号存档改写回这个等待的 PC/栈/局部变量。
+#[derive(Debug, Clone)]
+pub struct GameplayCheckpoint {
+    pub script: String,
+    pub line: usize,
+    pub call_stack: Vec<CallFrameSnapshot>,
+    pub variables: VariableStore,
+    pub waiting_for_input: bool,
+    pub input_wait_from_queue: bool,
+    pub input_wait_reason: Option<InputWaitSnapshot>,
+}
+
+impl GameplayCheckpoint {
+    /// `stack` 是该等待的栈，外加一帧返回到 `script`，以及零个或多个菜单/对话框
+    /// 被调方。这就是“从点击等待 call 进菜单”的形状。
+    pub fn is_ancestor_of(&self, _current_script: &str, stack: &[CallFrameSnapshot]) -> bool {
+        if stack.len() <= self.call_stack.len() {
+            return false;
+        }
+        if !stack
+            .iter()
+            .take(self.call_stack.len())
+            .eq(self.call_stack.iter())
+        {
+            return false;
+        }
+        stack[self.call_stack.len()].script == self.script
+    }
+}
+
+fn memsave_entries(variables: &VariableStore) -> Vec<(String, asb_interpreter::Value)> {
+    variables
+        .iter_local()
+        .filter(|(name, _)| *name == "memsave" || name.starts_with("memsave."))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
 }
 
 impl From<&CallFrame> for CallFrameSnapshot {
@@ -178,6 +280,10 @@ impl SaveData {
                 .collect(),
             scene: None,
             audio: None,
+            input_wait_from_queue: None,
+            input_wait_reason: None,
+            waiting_for_input: None,
+            message_text: None,
         }
     }
 
@@ -188,6 +294,29 @@ impl SaveData {
 
     pub fn with_audio(mut self, audio: AudioSnapshot) -> Self {
         self.audio = Some(audio);
+        self
+    }
+
+    /// 用点击等待检查点替换菜单里的 PC/局部变量。
+    ///
+    /// onSave 可能已经把 `memsave.*` 写进当前局部变量；这些键要保留。
+    pub fn with_gameplay_checkpoint(mut self, checkpoint: &GameplayCheckpoint) -> Self {
+        let memsave = memsave_entries(&self.variables);
+        self.current_script.clone_from(&checkpoint.script);
+        self.current_line = checkpoint.line;
+        self.call_stack.clone_from(&checkpoint.call_stack);
+        self.variables = checkpoint.variables.clone();
+        for (name, value) in memsave {
+            self.variables.set(&name, value);
+        }
+        self.waiting_for_input = Some(checkpoint.waiting_for_input);
+        self.input_wait_from_queue = Some(checkpoint.input_wait_from_queue);
+        self.input_wait_reason = checkpoint.input_wait_reason.clone();
+        self
+    }
+
+    pub fn with_message_text(mut self, message_text: MessageTextSnapshot) -> Self {
+        self.message_text = Some(message_text);
         self
     }
 
@@ -235,6 +364,10 @@ mod tests {
             current_line: 38,
             call_stack: Vec::new(),
             scene: Some(scene),
+            input_wait_from_queue: None,
+            input_wait_reason: None,
+            waiting_for_input: None,
+            message_text: None,
             audio: Some(AudioSnapshot {
                 bgm: Some(AudioChannelSnapshot {
                     id: "bgm".to_string(),
@@ -270,6 +403,127 @@ mod tests {
         let restored: SaveData = serde_json::from_str(json).unwrap();
         assert!(restored.scene.is_none());
         assert!(restored.audio.is_none());
+        assert!(restored.waiting_for_input.is_none());
+        assert!(restored.message_text.is_none());
+    }
+
+    fn wait_checkpoint() -> GameplayCheckpoint {
+        let mut variables = VariableStore::new();
+        variables.set("sysbtn_mode", "set".into());
+        variables.set("status", "adv".into());
+        GameplayCheckpoint {
+            script: "macro.iet".into(),
+            line: 1626,
+            input_wait_from_queue: true,
+            input_wait_reason: Some(InputWaitSnapshot::Generic),
+            waiting_for_input: true,
+            call_stack: vec![
+                CallFrameSnapshot {
+                    script: "main.iet".into(),
+                    return_line: 13,
+                },
+                CallFrameSnapshot {
+                    script: "story.txt".into(),
+                    return_line: 31,
+                },
+            ],
+            variables,
+        }
+    }
+
+    #[test]
+    fn nested_menu_save_uses_click_wait_checkpoint() {
+        let checkpoint = wait_checkpoint();
+        let mut live = VariableStore::new();
+        live.set("sysbtn_mode", "del".into());
+        live.set("status", "save".into());
+        live.set("memsave.size", "1".into());
+        let data = SaveData {
+            version: SAVE_FORMAT_VERSION,
+            variables: live,
+            current_script: "dialog.iet".into(),
+            current_line: 459,
+            call_stack: vec![
+                CallFrameSnapshot {
+                    script: "main.iet".into(),
+                    return_line: 13,
+                },
+                CallFrameSnapshot {
+                    script: "story.txt".into(),
+                    return_line: 31,
+                },
+                CallFrameSnapshot {
+                    script: "macro.iet".into(),
+                    return_line: 1627,
+                },
+                CallFrameSnapshot {
+                    script: "save.iet".into(),
+                    return_line: 657,
+                },
+            ],
+            scene: None,
+            audio: None,
+            input_wait_from_queue: None,
+            input_wait_reason: None,
+            waiting_for_input: None,
+            message_text: None,
+        };
+
+        assert!(checkpoint.is_ancestor_of(&data.current_script, &data.call_stack));
+        let data = data.with_gameplay_checkpoint(&checkpoint);
+        assert_eq!(data.current_script, "macro.iet");
+        assert_eq!(data.current_line, 1626);
+        assert_eq!(data.call_stack.len(), 2);
+        assert_eq!(
+            data.variables.get("sysbtn_mode").unwrap().as_string(),
+            "set"
+        );
+        assert_eq!(data.variables.get("status").unwrap().as_string(), "adv");
+        assert_eq!(data.variables.get("memsave.size").unwrap().as_string(), "1");
+        assert_eq!(data.waiting_for_input, Some(true));
+    }
+
+    #[test]
+    fn click_wait_save_keeps_live_interpreter_state() {
+        let checkpoint = wait_checkpoint();
+        let data = SaveData {
+            version: SAVE_FORMAT_VERSION,
+            variables: VariableStore::new(),
+            current_script: "macro.iet".into(),
+            current_line: 1626,
+            call_stack: checkpoint.call_stack.clone(),
+            scene: None,
+            audio: None,
+            input_wait_from_queue: None,
+            input_wait_reason: None,
+            waiting_for_input: None,
+            message_text: None,
+        };
+        assert!(!checkpoint.is_ancestor_of(&data.current_script, &data.call_stack));
+    }
+
+    #[test]
+    fn nested_menu_wait_does_not_replace_click_wait_checkpoint() {
+        let checkpoint = wait_checkpoint();
+        let nested_stack = vec![
+            CallFrameSnapshot {
+                script: "main.iet".into(),
+                return_line: 13,
+            },
+            CallFrameSnapshot {
+                script: "story.txt".into(),
+                return_line: 31,
+            },
+            CallFrameSnapshot {
+                script: "macro.iet".into(),
+                return_line: 1627,
+            },
+            CallFrameSnapshot {
+                script: "menu.iet".into(),
+                return_line: 107,
+            },
+        ];
+        assert!(checkpoint.is_ancestor_of("menu.iet", &nested_stack));
     }
 
     #[test]
@@ -311,6 +565,10 @@ mod tests {
             call_stack: Vec::new(),
             scene: None,
             audio: None,
+            input_wait_from_queue: None,
+            input_wait_reason: None,
+            waiting_for_input: None,
+            message_text: None,
         };
 
         data.restore(&mut interpreter)
@@ -383,4 +641,39 @@ mod tests {
         assert!(se.skippable);
         assert!(se.fade.is_none());
     }
+    #[test]
+    fn input_wait_metadata_roundtrips_and_legacy_saves_remain_readable() {
+        let it = Interpreter::new(InterpreterConfig::default());
+        let mut data = SaveData::from_interpreter(&it);
+        data.waiting_for_input = Some(true);
+        data.input_wait_from_queue = Some(false);
+        data.input_wait_reason = Some(InputWaitSnapshot::Key { buttons: vec!["circle".into()] });
+        data.message_text = Some(MessageTextSnapshot {
+            active_layer: Some("dialogue".into()),
+            layers: vec![MessageLayerTextSnapshot { id: "dialogue".into(), page_font: Default::default(),
+                tags: vec![crate::text::BacklogTag::IndentModify(1), crate::text::BacklogTag::Text("Restored text".into())] }],
+        });
+        let mut json = serde_json::to_value(&data).unwrap();
+        let restored: SaveData = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored.input_wait_from_queue, Some(false));
+        assert_eq!(restored.input_wait_reason, data.input_wait_reason);
+        assert_eq!(restored.message_text, data.message_text);
+        for key in ["waiting_for_input", "input_wait_from_queue", "input_wait_reason", "message_text"] {
+            json.as_object_mut().unwrap().remove(key);
+        }
+        let legacy: SaveData = serde_json::from_value(json).unwrap();
+        assert!(legacy.waiting_for_input.is_none());
+        assert!(legacy.message_text.is_none());
+        assert!(legacy.input_wait_reason.is_none());
+    }
+
+    #[test]
+    fn media_and_timed_waits_do_not_become_input_checkpoints() {
+        use asb_interpreter::event::WaitReason;
+        assert!(InputWaitSnapshot::capture(Some(&WaitReason::Timed { milliseconds: 0, input: 1 })).is_none());
+        assert!(InputWaitSnapshot::capture(Some(&WaitReason::VideoLayer { id: "video".into() })).is_none());
+        let snapshot = InputWaitSnapshot::capture(Some(&WaitReason::KeyWait { buttons: vec!["circle".into()] })).unwrap();
+        assert!(matches!(snapshot.restore(), WaitReason::KeyWait { buttons } if buttons == ["circle"]));
+    }
+
 }
