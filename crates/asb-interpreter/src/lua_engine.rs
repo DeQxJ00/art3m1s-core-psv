@@ -577,10 +577,14 @@ impl UserData for EngineApi {
                         };
                         let val_str = match v {
                             // Native UI scripts use `isFile(...) and path` for an
-                            // optional lyc mask. Boolean false means no mask,
+                            // optional image/frame mask. Boolean false means no mask,
                             // not a resource literally named "false".
                             Value::Boolean(false)
-                                if tag_name == "lyc" && key_str.as_deref() == Some("mask") => None,
+                                if matches!(tag_name.as_str(), "lyc" | "anime") && key_str.as_deref() == Some("mask") => None,
+                            // Create helpers also forward the same Lua table
+                            // through lyprop. Preserve an explicit clear there.
+                            Value::Boolean(false)
+                                if tag_name == "lyprop" && key_str.as_deref() == Some("mask") => Some(String::new()),
                             Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                             Value::Integer(i) => Some(i.to_string()),
                             Value::Number(n) => Some(n.to_string()),
@@ -652,7 +656,9 @@ impl UserData for EngineApi {
                                 _ => {
                                     let val_str = match v {
                                         Value::Boolean(false)
-                                            if tag_name == "lyc" && ks == "mask" => None,
+                                            if matches!(tag_name.as_str(), "lyc" | "anime") && ks == "mask" => None,
+                                        Value::Boolean(false)
+                                            if tag_name == "lyprop" && ks == "mask" => Some(String::new()),
                                         Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                                         Value::Integer(i) => Some(i.to_string()),
                                         Value::Number(n) => Some(n.to_string()),
@@ -2114,7 +2120,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn optional_anime_mask_false_is_absent_in_frame_events() {
+        use crate::event::Event;
+        use crate::script::Instruction;
+        use crate::tags::{ExecutionContext, TagHandler, TagResult};
+        use crate::tags::AnimeHandler;
+        use crate::variable::VariableStore;
+
+        for method in ["tag", "enqueueTag"] {
+            let lua = Lua::new();
+            let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(ShellProbe::default()))));
+            init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
+            lua.load(format!(r#"
+                for _, mode in ipairs({{"init", "add"}}) do
+                    __engine:{method}{{"anime", id="plain", mode=mode, file="frame.png", mask=false, visible=false}}
+                    __engine:{method}{{"anime", id="masked", mode=mode, file="frame.png", mask="frame-mask.png"}}
+                    __engine:{method}{{"anime", id="literal", mode=mode, file="frame.png", mask="false"}}
+                end
+            "#)).exec().unwrap();
+            let queue = ctx.lock().unwrap().tag_queue.clone();
+            assert_eq!(queue.len(), 6, "{method}");
+            for (tag, params) in queue {
+                let instruction = Instruction { tag, params, line: 1 };
+                let mut variables = VariableStore::new();
+                let get_script = |_name: &str| None;
+                let mut execution = ExecutionContext {
+                    variables: &mut variables,
+                    lua: &lua,
+                    current_script: "test",
+                    current_line: 0,
+                    instruction: &instruction,
+                    get_script: &get_script,
+                };
+                let TagResult::Emit(Event::Anime { id, file, mask, props, .. }) =
+                    AnimeHandler.execute(&mut execution).unwrap()
+                else { panic!("anime should emit a frame event"); };
+                assert_eq!(file.as_deref(), Some("frame.png"));
+                match id.as_str() {
+                    "plain" => {
+                        assert_eq!(mask, None, "{method}");
+                        assert_eq!(props.get("visible").map(String::as_str), Some("false"));
+                    }
+                    "masked" => assert_eq!(mask.as_deref(), Some("frame-mask.png")),
+                    "literal" => assert_eq!(mask.as_deref(), Some("false")),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
     /// A missing optional mask must not suppress the otherwise valid image.
+    #[test]
+    fn optional_mask_survives_lua_create_then_property_wrapper() {
+        for method in ["tag", "enqueueTag"] {
+            let lua = Lua::new();
+            let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(ShellProbe::default()))));
+            init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
+            lua.load(format!(r#"
+                local function create(p)
+                    __engine:{method}{{"lyc", id=p.id, file=p.file, mask=p.mask}}
+                    p[1] = "lyprop"
+                    __engine:{method}(p)
+                end
+                create{{id="thumb", file="savedata/slot", mask=false, left=20}}
+                __engine:{method}{{"lyprop", id="thumb", mask="ui/mask.png"}}
+                __engine:{method}{{"lyprop", id="thumb", mask=false}}
+                __engine:{method}{{"lyprop", id="literal", mask="false", visible=false}}
+            "#)).exec().unwrap();
+            let ctx = ctx.lock().unwrap();
+            let queue = &ctx.tag_queue;
+            assert_eq!(queue.len(), 5, "{method}");
+            assert!(!queue[0].1.contains_key("mask"));
+            assert_eq!(queue[1].1.get("mask").map(String::as_str), Some(""), "{method}");
+            assert_eq!(queue[1].1.get("left").map(String::as_str), Some("20"));
+            assert_eq!(queue[2].1.get("mask").map(String::as_str), Some("ui/mask.png"));
+            assert_eq!(queue[3].1.get("mask").map(String::as_str), Some(""));
+            assert_eq!(queue[4].1.get("mask").map(String::as_str), Some("false"));
+            assert_eq!(queue[4].1.get("visible").map(String::as_str), Some("false"));
+        }
+    }
+
     #[test]
     fn optional_lyc_mask_false_is_absent_in_both_lua_queues() {
         for method in ["tag", "enqueueTag"] {
