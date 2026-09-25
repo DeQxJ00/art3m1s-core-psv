@@ -182,6 +182,7 @@ impl CoreRuntime {
                         match self.save_path_for(t) {
                             Ok(path) => match crate::ffi::request_delete(&path) {
                                 Ok(()) => {
+                                    self.invalidate_saved_image(&path);
                                     crate::core_info!("[runtime] 已删除 {}", path);
                                 }
                                 Err(e) => {

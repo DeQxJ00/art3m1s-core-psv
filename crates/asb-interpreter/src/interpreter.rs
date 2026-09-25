@@ -2112,6 +2112,17 @@ impl Interpreter {
         self.fire_save_handler_and_flush_with_params(&HashMap::new())
     }
 
+    /// Capture local variables serialized by onSave, independently of their
+    /// names or whether their values changed since the previous save.
+    pub fn fire_save_handler_and_capture_with_params(
+        &mut self, params: &HashMap<String, String>,
+    ) -> Result<HashMap<String, Option<crate::variable::Value>>> {
+        self.variables.lock().unwrap().begin_save_writes();
+        let result = self.fire_save_handler_and_flush_with_params(params);
+        let writes = self.variables.lock().unwrap().finish_save_writes();
+        result.map(|()| writes)
+    }
+
     /// Preserve the save command's file/memory context for script callbacks.
     pub fn fire_save_handler_and_flush_with_params(
         &mut self,
@@ -2901,6 +2912,20 @@ mod tests {
             )
             .exec()
             .unwrap();
+    }
+
+    #[test]
+    fn save_write_capture_excludes_other_domains_and_cleans_up_after_failure() {
+        let mut it=Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            function failed_save(e,p)
+                e:tag{'var',name='local_data',data='payload'}
+                error('deliberate failure')
+            end
+            __engine:setEventHandler{onSave='failed_save'}
+        "#).exec().unwrap();
+        assert!(it.fire_save_handler_and_capture_with_params(&Default::default()).is_err());
+        assert!(it.variables.lock().unwrap().finish_save_writes().is_empty());
     }
 
     #[test]

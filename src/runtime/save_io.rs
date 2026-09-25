@@ -74,7 +74,7 @@ impl CoreRuntime {
     /// 存档目录内的文件复制/移动（fileio 的 copy/move 命令）。
     /// 全部经宿主读写回调完成，core 不直接碰文件系统。
     pub(super) fn copy_save_file(
-        &self,
+        &mut self,
         src: &str,
         dst: &str,
         delete_src: bool,
@@ -83,10 +83,19 @@ impl CoreRuntime {
         let dst_path = self.save_path_for(dst)?;
         let data = crate::ffi::request_file(&src_path)?;
         crate::ffi::request_write(&dst_path, &data)?;
+        self.invalidate_saved_image(&dst_path);
         if delete_src {
             crate::ffi::request_delete(&src_path)?;
+            self.invalidate_saved_image(&src_path);
         }
         Ok(())
+    }
+
+    pub(super) fn invalidate_saved_image(&mut self, path: &str) {
+        if path.to_ascii_lowercase().ends_with(".png") {
+            // Includes extensionless aliases and derived masked thumbnails.
+            self.texture_provider.evict_prefix(&path[..path.len()-4]);
+        }
     }
 
     /// 处理 [save]：触发 onSave 序列化 `sys` 等 Lua 表 → 抽干其 [var] 队列 →
@@ -95,8 +104,8 @@ impl CoreRuntime {
         // onSave（store）把 sys/gscr/conf 经 pluto 序列化进 Artemis 变量，
         // 这些 [var] 标签必须在快照前执行，但保存 UI 当时已有的返回/跳转队列
         // 必须原样保留，否则会在 Event::SaveGame 回调中重入并破坏剧情恢复位置。
-        self.interpreter
-            .fire_save_handler_and_flush_with_params(&HashMap::from([("file".into(), file.into())]))
+        let save_writes = self.interpreter
+            .fire_save_handler_and_capture_with_params(&HashMap::from([("file".into(), file.into())]))
             .map_err(|e| format!("onSave 处理器失败: {e:?}"))?;
 
         let mut data = crate::save::SaveData::from_interpreter(&self.interpreter);
@@ -111,7 +120,7 @@ impl CoreRuntime {
                     data.call_stack.len(),
                     checkpoint.call_stack.len()
                 );
-                data = data.with_gameplay_checkpoint(checkpoint);
+                data = data.with_gameplay_checkpoint(checkpoint, &save_writes);
             }
         }
         if let Some(snapshot) = &self.save_screenshot {
@@ -326,6 +335,9 @@ impl CoreRuntime {
         self.wait_reason = None;
         data.restore(&mut self.interpreter)
             .map_err(|e| format!("恢复存档状态失败: {e:?}"))?;
+        // Bind the wait to the saved PC before onLoad can call/jump into a
+        // reconstruction helper. Binding afterwards blocks the helper itself.
+        let waiting = prepare_loaded_wait(&mut self.interpreter, &data);
 
         // onLoad（restore）把恢复的变量经 pluto 反序列化回 sys/gscr/scr/log 等表，
         // 否则承载游戏态与存档槽位的 Lua 表仍是旧的。
@@ -360,22 +372,8 @@ impl CoreRuntime {
             self.compositor.apply_event(&event);
         }
 
-        let waiting = match data.waiting_for_input {
-            Some(value) => value,
-            None => saved_position_resumes_input_wait(&self.interpreter),
-        };
         self.pending_message_text = data.message_text.clone();
         if waiting {
-            // Saved click-waits snapshot the PC after the queued `@`/`[wait]`.
-            // Hold that wait so onLoad follow-up can run, then stop before the
-            // message macro's post-wait cleanup (rp / text_erase) executes.
-            let from_queue = data.input_wait_from_queue.unwrap_or_else(|| {
-                self.interpreter.get_script(&data.current_script)
-                    .is_none_or(|script| !instruction_is_input_wait(script.get_instruction(data.current_line)))
-            });
-            let reason = data.input_wait_reason.as_ref().map(crate::save::InputWaitSnapshot::restore)
-                .unwrap_or(asb_interpreter::event::WaitReason::Generic);
-            self.interpreter.hold_restored_wait(from_queue, reason);
             self.pending_load_resume = Some(super::PendingLoadResume {
                 script: data.current_script.clone(),
                 line: data.current_line,
@@ -546,6 +544,7 @@ impl CoreRuntime {
         let (resource_name, path) = self.screenshot_paths_for(file)?;
 
         crate::ffi::request_write(&path, &png)?;
+        self.invalidate_saved_image(&path);
         let _ = self.texture_provider.upload_rgba_render_only(
             &resource_name,
             target_width,
@@ -588,6 +587,20 @@ impl CoreRuntime {
 /// 文档：type 0..2 与 trans 标签 type 同值（0=瞬切、1=交叉淡化、2=规则图转场，
 /// load 无 rule 参数故 2 退化为淡化）；缺省不执行转场。时长/输入用 trans 的
 /// 缺省值（time 缺省由合成器决定，input=1 允许输入跳过）。
+fn prepare_loaded_wait(interpreter: &mut asb_interpreter::Interpreter, data: &crate::save::SaveData) -> bool {
+    let waiting = data.waiting_for_input.unwrap_or_else(||saved_position_resumes_input_wait(interpreter));
+    if waiting {
+        let from_queue = data.input_wait_from_queue.unwrap_or_else(|| {
+            interpreter.get_script(&data.current_script)
+                .is_none_or(|script| !instruction_is_input_wait(script.get_instruction(data.current_line)))
+        });
+        let reason = data.input_wait_reason.as_ref().map(crate::save::InputWaitSnapshot::restore)
+            .unwrap_or(asb_interpreter::event::WaitReason::Generic);
+        interpreter.hold_restored_wait(from_queue, reason);
+    }
+    waiting
+}
+
 fn saved_position_resumes_input_wait(interpreter: &asb_interpreter::Interpreter) -> bool {
     let Some(name) = interpreter.current_script() else {
         return false;
@@ -743,6 +756,38 @@ mod tests {
         saved_position_resumes_input_wait,
     };
     use asb_interpreter::{Interpreter, InterpreterConfig};
+
+    #[test]
+    fn load_wait_stays_on_story_when_immediate_callback_enters_rebuild_helper() {
+        use asb_interpreter::{CallbackResult,Event,ExecutionResult,Value};
+        for queued in [false,true] {
+            let mut it=Interpreter::new(InterpreterConfig::default());
+            it.set_callback(|event|if matches!(event,Event::Wait{..}) {CallbackResult::Pause} else {CallbackResult::Continue});
+            it.load_script("story","*main\n[@]\n[var name=advanced data=1]\n[stop]\n").unwrap();
+            it.load_script("rebuild","*main\n[var name=rebuilt data=1]\n[return]\n").unwrap();
+            it.start("story","main").unwrap();
+            assert!(matches!(it.run().unwrap(),ExecutionResult::Wait(_)));
+            let mut data=crate::save::SaveData::from_interpreter(&it);
+            if queued {data.current_line+=1;}
+            data.waiting_for_input=Some(true);data.input_wait_from_queue=Some(queued);
+            data.restore(&mut it).unwrap();
+            assert!(super::prepare_loaded_wait(&mut it,&data));
+            it.lua().load(r#"
+                function rebuild_on_load(e,p) e:tag{'call',file='rebuild',label='main'} end
+                __engine:setEventHandler{onLoad='rebuild_on_load'}
+            "#).exec().unwrap();
+            it.fire_load_handler().unwrap();
+            it.flush_pending_tags().unwrap();
+            assert_eq!(it.current_script(),Some("rebuild"));
+            assert!(matches!(it.run().unwrap(),ExecutionResult::Wait(Event::Wait{..})));
+            assert_eq!(it.get_variable("rebuilt"),Some(Value::Int(1)));
+            assert_eq!(it.current_script(),Some("story"));
+            assert_eq!(it.current_line(),data.current_line);
+            assert!(it.get_variable("advanced").is_none());
+            it.advance_line();it.run().unwrap();
+            assert_eq!(it.get_variable("advanced"),Some(Value::Int(1)));
+        }
+    }
 
     #[test]
     fn legacy_saves_resume_wait_when_pc_is_after_a_queued_click_wait() {
