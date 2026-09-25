@@ -230,8 +230,8 @@ impl CoreRuntime {
         }
         self.texture_provider.set_save_image_directory(&self.savepath);
         self.texture_provider.retain(&used_files);
-        let menu_paths=used_files.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect();
-        super::surface_loader::retain_menu_images(&menu_paths);
+        super::surface_loader::retain_menu_images_resolving(||
+            used_files.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect());
         if let Some(p) = profile.as_deref_mut() {
             p.frame_retain_ns = crate::profiler::FrameProfile::elapsed(retain_started);
         }
