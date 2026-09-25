@@ -1,6 +1,15 @@
 //! Standard Artemis menu artwork is loaded on demand, not pinned
 //! by the startup system-cache list. Unknown layouts keep their old policy.
 pub(crate) fn transient_menu_image(path: &str) -> bool {
+    menu_section(path, &["conf", "config", "blog", "backlog", "save", "load", "saveload"])
+}
+
+/// Save/load art is demand-loaded, then retained at lowest idle priority.
+pub(crate) fn save_load_menu_image(path: &str) -> bool {
+    menu_section(path, &["save", "load", "saveload"])
+}
+
+fn menu_section(path: &str, sections: &[&str]) -> bool {
     let mut parts = path.split(['/', '\\']);
     let Some(root) = parts.next() else { return false; };
     let section = if root.eq_ignore_ascii_case(":ui") || root.eq_ignore_ascii_case("ui") {
@@ -10,7 +19,7 @@ pub(crate) fn transient_menu_image(path: &str) -> bool {
         parts.next();
         parts.next()
     } else { return false; };
-    section.is_some_and(|s| ["conf", "config", "blog", "backlog", "save", "load", "saveload"].iter().any(|p| s.eq_ignore_ascii_case(p)))
+    section.is_some_and(|s| sections.iter().any(|p| s.eq_ignore_ascii_case(p)))
         && parts.next().is_some_and(|s| !s.is_empty())
 }
 

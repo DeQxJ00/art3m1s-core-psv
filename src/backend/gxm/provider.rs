@@ -149,6 +149,11 @@ pub struct GxmTextureProvider {
 }
 
 impl GxmTextureProvider {
+    fn low_priority_idle(&self, name: &str) -> bool {
+        crate::ui_image_lifetime::save_load_menu_image(name)
+            || self.transient_save_directory.as_deref().is_some_and(|p|
+                crate::ui_image_lifetime::image_in_save_directory(name,p))
+    }
     pub fn set_save_image_directory(&mut self,path:&str) {
         if self.transient_save_directory.as_deref()!=Some(path) {
             self.transient_save_directory=Some(path.to_owned());
@@ -179,7 +184,9 @@ impl GxmTextureProvider {
         if requested==0{return 0;}
         let cache=self.cache_budget.clone();let mut account=cache.as_ref().map(|b|b.lock().unwrap());
         let mut idle:Vec<_>=self.entries.iter().filter(|(_,e)|e.cacheable&&e.reclaimable)
-            .map(|(n,e)|(e.last_used,n.clone())).collect();idle.sort_unstable();
+            .map(|(n,e)|(e.last_used,n.clone())).collect();
+        idle.sort_unstable_by(|a,b|(!self.low_priority_idle(&a.1),a.0,&a.1)
+            .cmp(&(!self.low_priority_idle(&b.1),b.0,&b.1)));
         let mut released=0usize;let mut count=0;
         for (_,name) in idle {
             if released>=requested{break;}
@@ -187,7 +194,9 @@ impl GxmTextureProvider {
             unsafe{art3m1s_gxm_delete_texture(e.id.0)};
             let gpu=((e.info.width as usize+7)&!7).saturating_mul(e.info.height as usize).saturating_mul(if e.gray||e.alpha_only{1}else{4});
             released=released.saturating_add((gpu+0x3ffff)&!0x3ffff);count+=1;
-            if !e.rgba.is_empty(){
+            if self.low_priority_idle(&name) {
+                self.decoded.remove(&name);self.encoded.remove(&name);self.cache_evictions+=1;
+            } else if !e.rgba.is_empty(){
                 self.decoded.insert(name,DecodedEntry { gray:e.gray, info:e.info,rgba:e.rgba,last_used:e.last_used});self.gpu_demotions+=1;
             }else{self.cache_evictions+=1;}
         }
@@ -433,7 +442,8 @@ impl GxmTextureProvider {
         self.encoded.remove(name);
         let mut used=self.encoded.values().map(EncodedEntry::capacity).sum::<usize>();
         while used+cost>cap{
-            let oldest=self.encoded.iter().min_by_key(|(_,e)|e.last_used).map(|(name,_)|name.clone()).unwrap();
+            let oldest=self.encoded.iter().min_by_key(|(n,e)|(!self.low_priority_idle(n),e.last_used))
+                .map(|(name,_)|name.clone()).unwrap();
             used-=self.encoded.remove(&oldest).unwrap().capacity();
         }
         bytes.transfer(Owner::Provider);if let Some(p)=proof.as_mut(){p.transfer(Owner::Provider);}
@@ -774,11 +784,11 @@ impl TextureProvider for GxmTextureProvider {
                 wall_us, t.reads, t.missing, t.decoded, t.decode_errors, t.uploads, t.upload_errors, t.upload_bytes, t.read_us, t.decode_us, t.upload_us, t.upload_max_us);
         }
         // Transition/current-scene names are already included by the caller.
-        // Once no longer referenced, menu art must leave every cache tier,
-        // even when there is plenty of shared retention budget available.
+        // Settings/backlog close immediately. Save/load art may reuse unused
+        // shared space, but is never pinned and is reclaimed before story art.
         let menu_stale:HashSet<_>=self.entries.keys().chain(self.decoded.keys()).chain(self.encoded.keys())
-            .filter(|n|!names.contains(*n)&&(crate::ui_image_lifetime::transient_menu_image(n)
-                ||self.transient_save_directory.as_deref().is_some_and(|p|crate::ui_image_lifetime::image_in_save_directory(n,p))))
+            .filter(|n|!names.contains(*n)&&crate::ui_image_lifetime::transient_menu_image(n)
+                && !self.low_priority_idle(n))
             .cloned().collect();
         if !menu_stale.is_empty(){
             let before=self.idle_parts().total();
@@ -814,12 +824,26 @@ impl TextureProvider for GxmTextureProvider {
         // Preserve the small last-resort sources when dropping costly surfaces.
         // GPU and decoded copies retain their existing shared recency order.
         // Sources cannot occupy more than 1/4 of this same total budget.
-        reclaim.sort_unstable_by(|a,b|(a.2==2,a.0,&a.1,a.2).cmp(&(b.2==2,b.0,&b.1,b.2)));
+        reclaim.sort_unstable_by(|a,b|(!self.low_priority_idle(&a.1),a.2==2,a.0,&a.1,a.2)
+            .cmp(&(!self.low_priority_idle(&b.1),b.2==2,b.0,&b.1,b.2)));
         let mut idle_gpu=self.warm.parts().gpu+self.entries.values().filter(|e|e.reclaimable)
             .map(|e|e.cache_bytes()-e.rgba.capacity()).sum::<usize>();
         let gpu_limit=IDLE_GPU_BUDGET.min(idle_limit);
         for (_,name,tier,gpu_bytes) in reclaim {
             if idle_bytes<=idle_limit&&idle_gpu<=gpu_limit {break;}
+            if !names.contains(&name)&&self.low_priority_idle(&name) {
+                // Discard all idle tiers together instead of demoting menu
+                // pixels while another scene is asking for memory.
+                if let Some(e)=self.entries.get(&name) {
+                    let bytes=e.cache_bytes();
+                    idle_gpu=idle_gpu.saturating_sub(bytes-e.rgba.capacity());
+                    idle_bytes=idle_bytes.saturating_sub(bytes);
+                    self.remove(&name);self.cache_evictions+=1;
+                }
+                if let Some(e)=self.decoded.remove(&name){idle_bytes=idle_bytes.saturating_sub(e.rgba.capacity());}
+                if let Some(e)=self.encoded.remove(&name){idle_bytes=idle_bytes.saturating_sub(e.capacity());}
+                continue;
+            }
             if tier!=0&&idle_bytes<=idle_limit {continue;}
             let before=idle_bytes;
             if tier==3{
@@ -1532,26 +1556,38 @@ mod tests {
     }
 
     #[test]
-    fn save_load_art_and_thumbnails_release_then_reload_after_menu_closes() {
+    fn save_load_idle_reuses_then_yields_before_story_cache() {
         let _guard=LOCK.lock().unwrap();
         let (mut p,reads)=provider();p.set_save_image_directory("profile/data");
-        let images=[":ui/save/bg_save.png",":ui/save/bg_load.png","profile/data/slot01.png"];
-        let mut held=HashSet::new();
-        for n in images {p.resolve(n).unwrap();held.insert(n.to_owned());
-            p.encoded.insert(n.into(),EncodedEntry{bytes:vec![2;32].into(),proof:None,last_used:0});}
+        p.resolve("image/bg/room").unwrap();p.retain(&HashSet::new());
+        let story_bytes=p.idle_parts().total();
+        let images=[":ui/save/bg_save.png",":ui/load/bg_load.png","profile/data/slot01.png"];
+        for n in images {p.resolve(n).unwrap();}
         let combined=masked_texture_name(images[2],":ui/save/mask");
         p.resolve_with_mask(images[2],":ui/save/mask").unwrap();
-        held.insert(combined.clone());held.insert(":ui/save/mask".into());
-        p.retain(&held);assert!(p.entries.contains_key(&combined));
-        assert!(p.entries.contains_key(images[2]));
-        // Close/finish transition. This only releases textures, never save files
-        // or the separate gameplay capture held by the save subsystem.
         p.retain(&HashSet::new());
+        let before=reads.get();
+        for n in images {assert!(p.entries[n].reclaimable);p.resolve(n).unwrap();}
+        assert_eq!(reads.get(),before,"reopening should not reread static menu art");
+        p.retain(&HashSet::new());
+        // Older story pixels win over even recently used save/load assets.
+        p.idle_budget=story_bytes;p.retain(&HashSet::new());
         for n in images {assert!(!p.entries.contains_key(n));assert!(!p.encoded.contains_key(n));assert!(!p.decoded.contains_key(n));}
         assert!(!p.entries.contains_key(&combined));
-        let before=reads.get();
-        for n in images {let (id,_)=p.resolve(n).unwrap();assert_eq!(p.pixel_alpha(id,0,0),Some(128));}
-        assert_eq!(reads.get(),before+3);
+        assert!(p.entries.contains_key("image/bg/room"));
+        assert!(p.idle_parts().total()<=story_bytes);
+    }
+
+    #[test]
+    fn physical_gpu_pressure_reclaims_closed_save_menu_first_and_keeps_active() {
+        let _guard=LOCK.lock().unwrap();
+        let (mut p,_)=provider();
+        let story="image/bg/room";let menu=":ui/save/bg";let active=":ui/load/button";
+        for n in [story,menu,active] {p.resolve(n).unwrap();}
+        p.retain(&HashSet::from([active.into()]));
+        assert!(p.reclaim_idle_gpu_cache(1,"test")>0);
+        assert!(!p.entries.contains_key(menu)&&!p.decoded.contains_key(menu)&&!p.encoded.contains_key(menu));
+        assert!(p.entries.contains_key(story)&&p.entries.contains_key(active));
     }
 
     #[test] fn split_idle_account_excludes_active_and_counts_backups_separately(){
