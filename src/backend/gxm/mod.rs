@@ -93,7 +93,10 @@ impl GxmRenderer {
         self.retained_group=Default::default();
         Ok(())
     }
-    pub fn set_profile_enabled(&self, _enabled: bool) {}
+    pub fn set_profile_enabled(&self, _enabled: bool) {
+        #[cfg(feature="gxm-builtin-effects")]
+        native_effects::set_profile_enabled(_enabled);
+    }
 
     pub fn take_profile_stats(&self) -> crate::backend::gl::RenderProfile {
         crate::backend::gl::RenderProfile::default()
