@@ -504,13 +504,27 @@ impl Loader {
         state.update_reservation(&mut account);
         Some(result)
     }
+    #[cfg(test)]
     pub fn retain_menu_images(&self, paths:&std::collections::HashSet<String>) {
+        self.retain_menu_images_resolving(||paths);
+    }
+    // The resolver only expands magic paths: it must not call back into the
+    // loader. Keep its snapshot and cancellation under the same state lock so
+    // a pending worker cannot publish a closed menu after this cleanup.
+    pub fn retain_menu_images_resolving<P:std::borrow::Borrow<std::collections::HashSet<String>>>(
+        &self, resolve:impl FnOnce()->P,
+    ) {
         let mut state=self.shared.state.lock().unwrap();
-        let stale:Vec<_>=state.entries.iter().filter(|(p,e)|
-            crate::ui_image_lifetime::transient_menu_image(p)&&!e.demanded
-            &&!paths.contains(*p)&&!paths.contains(p.strip_suffix(".png").unwrap_or(p))
-            &&(e.pending||e.payload.is_some()||e.retry_bytes>0))
+        // Lazy startup bindings have no storage or pending work to release.
+        // In a video scene they must not trigger path expansion at 30/60 Hz.
+        let candidates:Vec<_>=state.entries.iter().filter(|(p,e)|
+            !e.demanded&&(e.pending||e.payload.is_some()||e.retry_bytes>0)
+            &&crate::ui_image_lifetime::transient_menu_image(p))
             .map(|(p,_)|p.clone()).collect();
+        if candidates.is_empty(){return;}
+        let paths=resolve();let paths=paths.borrow();
+        let stale:Vec<_>=candidates.into_iter().filter(|p|
+            !paths.contains(p)&&!paths.contains(p.strip_suffix(".png").unwrap_or(p))).collect();
         if stale.is_empty(){return;}
         let mut released=0;
         for path in &stale {
@@ -761,7 +775,7 @@ pub(super) fn preload(paths:&[String],kind:Kind,chapter:Option<&str>,comments:su
 pub(super) fn take(path:&str)->Option<Payload>{handle()?.take(path)}
 pub(super) fn take_warm_pixels(path:&str,max:usize)->Option<Payload>{handle()?.take_warm_pixels(path,max)}
 pub(super) fn update_story_plan(future:&[String],current:&[String]){if let Some(l)=handle(){l.update_story_plan(future,current);}}
-pub(super) fn retain_menu_images(paths:&std::collections::HashSet<String>){if let Some(l)=handle(){l.retain_menu_images(paths);}}
+pub(super) fn retain_menu_images_resolving(paths:impl FnOnce()->std::collections::HashSet<String>){if let Some(l)=handle(){l.retain_menu_images_resolving(paths);}}
 pub(super) fn prioritize_scene(paths:&[String]){
     if let Some(loader)=handle(){
         let count=loader.prioritize_scene(paths);
@@ -834,6 +848,25 @@ mod tests {
         assert!(!loader.loading(None));
         assert!(loader.take("image/bg/room").is_some());
         assert!(loader.take(path).is_some());
+    }
+    #[test]
+    fn menu_release_does_not_expand_scene_paths_without_releasable_menu_data() {
+        let loader=Loader::with_policy(|_,_|Some(Payload::encoded(vec![7;32])),1024,None).unwrap();
+        for p in ["pc/en/conf/bg.png","pc/en/blog/page.png","vita/ja/save/bg.png"] {loader.bind(p,true);}
+        loader.bind("image/bg/title",false);
+        loader.retain_menu_images_resolving(||->std::collections::HashSet<String>{panic!("unused scene path expansion")});
+        let path="pc/en/conf/bg.png";
+        for _ in 0..2 {
+            loader.bind(path,false);
+            let mut calls=0;
+            loader.retain_menu_images_resolving(||{calls+=1;std::collections::HashSet::from(["pc/en/conf/bg".into()])});
+            assert_eq!(calls,1);assert!(loader.shared.state.lock().unwrap().entries[path].payload.is_some());
+            loader.retain_menu_images_resolving(std::collections::HashSet::new);
+            let state=loader.shared.state.lock().unwrap();
+            assert!(state.entries[path].payload.is_none());assert!(!state.entries[path].pending);
+            assert!(state.entries["image/bg/title"].payload.is_some());
+        }
+        loader.retain_menu_images_resolving(||->std::collections::HashSet<String>{panic!("cleared menus must remain lazy")});
     }
     #[test]
     fn closing_menu_cancels_inflight_warmup_without_republishing_old_pixels() {
