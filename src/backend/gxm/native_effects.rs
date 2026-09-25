@@ -255,6 +255,16 @@ fn passthrough_group_inner(frame: &DrawList, index: usize, width: u32, height: u
     if frame.commands[g.start..g.end].iter().any(|c| c.blend!=BlendMode::Alpha
         || c.stencil.is_some() || c.native_emote.is_some()) { return false; }
     let nested=|i:usize,n:&ShaderGroup| i<index && n.start>=g.start && n.end<=g.end;
+    // Screen depends on the destination. A certified, ungrouped opaque prefix
+    // replaces that destination before the light is drawn, making it identical
+    // inside and outside this neutral wrapper. Keep the Screen child isolated.
+    let screen_prefix=frame.shader_groups.iter().enumerate().any(|(i,n)|nested(i,n)
+        && n.effect.name==GROUP_COMPOSITE_SHADER && scalar(&n.effect,"blendMode",0.0)==2.0)
+        .then(||frame.commands[g.start..g.end].iter().enumerate().find_map(|(offset,c)|{
+            let pos=g.start+offset;
+            (opaque_cover(c,width,height) && !frame.shader_groups.iter().enumerate()
+                .any(|(i,n)|nested(i,n)&&n.start<=pos&&pos<n.end)).then_some(pos)
+        })).flatten();
     if frame.shader_groups.iter().enumerate().any(|(i,n)| nested(i,n)
         && !(identity_blur_fallback(n,width,height) || n.effect.name==ALPHA_MASK_SHADER || n.effect.name==RULE_TRANS_SHADER
             // A source-verified gray pass keeps premultiplied source-over
@@ -263,7 +273,8 @@ fn passthrough_group_inner(frame: &DrawList, index: usize, width: u32, height: u
             // keep the outer retained result and its existing slot policy.
             || (rebuilding && (super::external_effects::premultiplied_gray(&n.effect)
                 || super::external_effects::premultiplied_spatial_filter(&n.effect)))
-            || (n.effect.name==GROUP_COMPOSITE_SHADER && scalar(&n.effect,"blendMode",0.0)==0.0))) { return false; }
+            || (n.effect.name==GROUP_COMPOSITE_SHADER && (scalar(&n.effect,"blendMode",0.0)==0.0
+                || (scalar(&n.effect,"blendMode",0.0)==2.0 && screen_prefix.is_some_and(|p|p<n.start)))))) { return false; }
     if identity_blur || scalar(e,"opaque",0.0)==0.0 { return true; }
     // Forced opacity is redundant only with a certified opaque, full-stage
     // source. A source inside nested groups is also valid only when every
@@ -521,7 +532,7 @@ fn retainable_group(frame:&DrawList,index:usize,width:u32,height:u32)->Option<&S
     let g=frame.shader_groups.get(index)?;let e=&g.effect;
     if g.start>=g.end || g.end>frame.commands.len() || e.name!=GROUP_COMPOSITE_SHADER
         || super::stage_clip(g.clip_bounds,width,height).is_err()
-        || scalar(e,"blendMode",0.)!=0.
+        || !matches!(scalar(e,"blendMode",0.),0.0|2.0)
         || frame.commands[g.start..g.end].iter().any(|c|c.mesh.is_some()||c.native_emote.is_some()||c.stencil.is_some())
         // Fused draws still run a nontrivial fragment program over the screen.
         // Let stable groups bake once; changing groups keep their direct route.
@@ -1812,6 +1823,36 @@ mod tests {
     }
 
     #[test]
+    fn screen_source_caches_without_freezing_the_background_and_invalidates_on_change(){
+        let mut f=neutral_frame();
+        f.commands[0].clip.quad_size[0]=1000.;
+        let outer=f.shader_groups[0].clone();
+        let mut light=test_group(GROUP_COMPOSITE_SHADER,1,2);
+        light.effect.uniforms.insert("blendMode".into(),vec![2.]);
+        f.commands[1].opacity=200./255.;
+        f.shader_groups=vec![light,outer];
+        assert!(retainable_group(&f,0,960,544).is_some());
+        assert_eq!(encode(&group_command(&f.shader_groups[0],960,544),960,544).unwrap().blend,3);
+        let mut caches=RetainedGroups::default();
+        for tick in 0..5 {
+            f.commands[0].transform.translation.x=-(tick as f32);
+            EVENTS.with(|e|e.borrow_mut().clear());render_cached(&f,960,544,&mut caches);
+            EVENTS.with(|e|{
+                let events=e.borrow();assert!(events.iter().any(|v|v=="draw:42"));
+                if tick==1 {assert!(events.iter().any(|v|v=="bake"));}
+                if tick>=2 {assert!(events.iter().any(|v|v=="cached"));}
+            });
+        }
+        f.commands[1].opacity=0.4;
+        EVENTS.with(|e|e.borrow_mut().clear());render_cached(&f,960,544,&mut caches);
+        EVENTS.with(|e|assert!(!e.borrow().iter().any(|v|v=="cached")));
+        // A blend change is also part of the retained key.
+        let cached=caches.slots.iter().find(|c|c.group.is_some()).unwrap();
+        f.shader_groups[0].effect.uniforms.insert("blendMode".into(),vec![0.]);
+        assert!(!cached.matches(&f,&f.shader_groups[0],(960,544),1));
+    }
+
+    #[test]
     fn local_opaque_base_keeps_overlap_and_rejects_effect_distribution(){
         let mut f=neutral_frame();f.commands[0].clip.quad_size=[2.,2.];
         f.shader_groups[0].effect.uniforms.insert("opaque".into(),vec![1.]);
@@ -1872,6 +1913,33 @@ mod tests {
         let f=neutral_frame();assert!(passthrough_group(&f,0,960,544));
         EVENTS.with(|v|v.borrow_mut().clear());render(&f,960,544);
         EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","draw:42","draw:43","end-frame"]));
+    }
+    #[test]
+    fn opaque_prefix_allows_screen_child_without_rebuilding_the_whole_moving_scene() {
+        let mut f=neutral_frame();
+        let outer=f.shader_groups[0].clone();
+        let mut light=test_group(GROUP_COMPOSITE_SHADER,1,2);
+        light.effect.uniforms.insert("blendMode".into(),vec![2.]);
+        light.effect.uniforms.insert("alpha".into(),vec![0.78]);
+        f.shader_groups=vec![light,outer];
+        assert!(passthrough_group(&f,1,960,544));
+        // The light stays isolated and Screen-blended; only its neutral parent
+        // disappears. Motion must never force a whole-scene input capture.
+        let mut caches=RetainedGroups::default();
+        for tick in 0..12 {
+            f.commands[1].transform.translation.x=tick as f32;
+            EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut caches);
+            EVENTS.with(|v|assert!(!v.borrow().iter().any(|e|e=="node-source-build")));
+        }
+        f.commands[0].opacity=0.5;assert!(!passthrough_group(&f,1,960,544));
+        f.commands[0].opacity=1.;f.commands[0].clip.quad_size[0]=959.;
+        assert!(!passthrough_group(&f,1,960,544));
+        f.commands[0].clip.quad_size[0]=960.;f.commands[0].texture=TextureId(41);
+        assert!(!passthrough_group(&f,1,960,544));
+        f.commands[0].texture=TextureId(42);f.shader_groups[0].start=0;
+        assert!(!passthrough_group(&f,1,960,544)); // cover inside Screen is not a prefix
+        f.shader_groups[0].start=1;f.shader_groups[1].effect.uniforms.insert("alpha".into(),vec![0.5]);
+        assert!(!passthrough_group(&f,1,960,544));
     }
     #[test]
     fn opacity_filters_masks_clips_and_destination_dependent_blends_keep_isolation() {
