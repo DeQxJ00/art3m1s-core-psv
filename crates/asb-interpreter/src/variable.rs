@@ -152,6 +152,10 @@ pub struct VariableStore {
     macro_scopes: Vec<MacroScope>,
     #[serde(skip)]
     write_macro_local: bool,
+    // Scoped save-callback journal. Equal-value writes matter too: the
+    // gameplay checkpoint may predate the previous serialization.
+    #[serde(skip)]
+    save_writes: Option<HashMap<String, Option<Value>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +229,9 @@ impl VariableStore {
         } else if let Some(stripped) = name.strip_prefix("s.") {
             self.system.insert(stripped.to_string(), value);
         } else {
+            if let Some(writes) = &mut self.save_writes {
+                writes.insert(name.to_owned(), Some(value.clone()));
+            }
             self.local.insert(name.to_string(), value);
         }
     }
@@ -243,8 +250,19 @@ impl VariableStore {
         } else if let Some(stripped) = name.strip_prefix("s.") {
             self.system.remove(stripped)
         } else {
+            if let Some(writes) = &mut self.save_writes {
+                writes.insert(name.to_owned(), None);
+            }
             self.local.remove(name)
         }
+    }
+
+    pub(crate) fn begin_save_writes(&mut self) {
+        self.save_writes = Some(HashMap::new());
+    }
+
+    pub(crate) fn finish_save_writes(&mut self) -> HashMap<String, Option<Value>> {
+        self.save_writes.take().unwrap_or_default()
     }
 
     /// `var system=delete`: remove an existing value first. Only when that
@@ -252,6 +270,14 @@ impl VariableStore {
     pub(crate) fn delete_group(&mut self, name: &str) {
         if self.remove(name).is_some() {
             return;
+        }
+        if !(self.write_macro_local && !self.macro_scopes.is_empty())
+            && !["g.", "t.", "s."].iter().any(|p|name.starts_with(p)) {
+            if let Some(writes) = &mut self.save_writes {
+                for key in self.local.keys().filter(|key|key.strip_prefix(name).is_some_and(|s|s.starts_with('.'))) {
+                    writes.insert(key.clone(), None);
+                }
+            }
         }
         let (map, key) = if self.write_macro_local && !self.macro_scopes.is_empty() {
             (&mut self.macro_scopes.last_mut().unwrap().values, name)
@@ -336,6 +362,7 @@ impl VariableStore {
 
     /// 清除所有变量（包括全局和系统变量）
     pub fn clear_all(&mut self) {
+        self.record_save_clear();
         self.macro_scopes.clear();
         self.local.clear();
         self.global.clear();
@@ -345,9 +372,16 @@ impl VariableStore {
 
     /// 清除局部和临时变量（用于 reset）
     pub fn reset(&mut self) {
+        self.record_save_clear();
         self.macro_scopes.clear();
         self.local.clear();
         self.temp.clear();
+    }
+
+    fn record_save_clear(&mut self) {
+        if let Some(writes) = &mut self.save_writes {
+            for key in self.local.keys() { writes.insert(key.clone(), None); }
+        }
     }
 
     /// Numbered-save state, including suspended macro arguments but no global/system data.
@@ -399,6 +433,20 @@ impl VariableStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn save_journal_tracks_equal_writes_deletions_and_stays_out_of_json() {
+        let mut v=super::VariableStore::new();
+        v.set("custom", "same".into());v.set("obsolete.child",1.into());
+        v.begin_save_writes();
+        v.set("custom", "same".into());v.set("g.persistent",1.into());v.set("t.menu",1.into());
+        v.delete_group("obsolete");
+        let json=String::from_utf8(v.save().unwrap()).unwrap();assert!(!json.contains("save_writes"));
+        let writes=v.finish_save_writes();
+        assert_eq!(writes["custom"],Some("same".into()));assert_eq!(writes["obsolete.child"],None);
+        assert!(!writes.contains_key("g.persistent")&&!writes.contains_key("t.menu"));
+        v.set("later",2.into());assert!(v.finish_save_writes().is_empty());
+    }
+
     use super::*;
 
     #[test]

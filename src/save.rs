@@ -239,14 +239,6 @@ impl GameplayCheckpoint {
     }
 }
 
-fn memsave_entries(variables: &VariableStore) -> Vec<(String, asb_interpreter::Value)> {
-    variables
-        .iter_local()
-        .filter(|(name, _)| *name == "memsave" || name.starts_with("memsave."))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect()
-}
-
 impl From<&CallFrame> for CallFrameSnapshot {
     fn from(f: &CallFrame) -> Self {
         Self {
@@ -299,15 +291,17 @@ impl SaveData {
 
     /// 用点击等待检查点替换菜单里的 PC/局部变量。
     ///
-    /// onSave 可能已经把 `memsave.*` 写进当前局部变量；这些键要保留。
-    pub fn with_gameplay_checkpoint(mut self, checkpoint: &GameplayCheckpoint) -> Self {
-        let memsave = memsave_entries(&self.variables);
+    /// Preserve every local write made by onSave, without retaining unrelated
+    /// menu variables or depending on a script's serialization key names.
+    pub fn with_gameplay_checkpoint(mut self, checkpoint: &GameplayCheckpoint,
+        save_writes: &std::collections::HashMap<String, Option<asb_interpreter::Value>>) -> Self {
         self.current_script.clone_from(&checkpoint.script);
         self.current_line = checkpoint.line;
         self.call_stack.clone_from(&checkpoint.call_stack);
         self.variables = checkpoint.variables.clone();
-        for (name, value) in memsave {
-            self.variables.set(&name, value);
+        for (name, value) in save_writes {
+            if let Some(value) = value { self.variables.set(name, value.clone()); }
+            else { self.variables.remove(name); }
         }
         self.waiting_for_input = Some(checkpoint.waiting_for_input);
         self.input_wait_from_queue = Some(checkpoint.input_wait_from_queue);
@@ -470,7 +464,8 @@ mod tests {
         };
 
         assert!(checkpoint.is_ancestor_of(&data.current_script, &data.call_stack));
-        let data = data.with_gameplay_checkpoint(&checkpoint);
+        let data = data.with_gameplay_checkpoint(&checkpoint,
+            &std::collections::HashMap::from([("memsave.size".into(), Some("1".into()))]));
         assert_eq!(data.current_script, "macro.iet");
         assert_eq!(data.current_line, 1626);
         assert_eq!(data.call_stack.len(), 2);
@@ -481,6 +476,41 @@ mod tests {
         assert_eq!(data.variables.get("status").unwrap().as_string(), "adv");
         assert_eq!(data.variables.get("memsave.size").unwrap().as_string(), "1");
         assert_eq!(data.waiting_for_input, Some(true));
+    }
+
+    #[test]
+    fn save_callback_serialization_survives_checkpoint_for_arbitrary_keys() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            scr = { ip = {file='chapter', block='003'}, score=42 }
+            function save_state(e,p)
+                e:tag{'var', name='scr', data=pluto.persist({},scr)}
+                e:tag{'var', name='custom.backlog', data='saved-history'}
+                e:tag{'var', name='g.system', data='current-index'}
+            end
+            function load_state(e,p)
+                scr = pluto.unpersist({},e:var('scr'))
+                assert(scr.ip.block == '003' and scr.score == 42)
+                assert(e:var('custom.backlog') == 'saved-history')
+            end
+            __engine:setEventHandler{onSave='save_state',onLoad='load_state'}
+        "#).exec().unwrap();
+        let checkpoint = wait_checkpoint();
+        for _ in 0..2 {
+            // The second onSave writes equal values; a before/after diff loses
+            // them when the checkpoint still predates the first serialization.
+            it.set_variable("menu_only", "discard".into());
+            let writes=it.fire_save_handler_and_capture_with_params(&Default::default()).unwrap();
+            assert!(writes.contains_key("scr"));
+            assert!(!writes.contains_key("g.system"));
+            let data=SaveData::from_interpreter(&it).with_gameplay_checkpoint(&checkpoint,&writes);
+            let data:SaveData=serde_json::from_slice(&serde_json::to_vec(&data).unwrap()).unwrap();
+            assert!(data.variables.get("menu_only").is_none());
+            assert_eq!(data.variables.get("status").unwrap().as_string(),"adv");
+            let mut vars=it.variables();vars.restore_local_snapshot(&data.variables);it.restore_variables(vars);
+            it.lua().load("scr=nil").exec().unwrap();
+            it.fire_load_handler().unwrap();
+        }
     }
 
     #[test]
