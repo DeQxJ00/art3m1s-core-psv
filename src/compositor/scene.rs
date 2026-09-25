@@ -23,6 +23,9 @@ pub const MESSAGE_LAYER_OVERLAY_PREFIX: &str = "@art3m1s-message-";
 /// （只设了属性、没有 `file`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Layer {
+    // Local mutation serial, never part of a save or script-visible property.
+    #[serde(skip)]
+    pub(crate) query_revision: u64,
     /// 完整点分 ID，如 `"1.0.-1"`。
     pub id: String,
     /// 绑定的逻辑资源名；`None` 表示纯分组节点。
@@ -139,6 +142,8 @@ fn compare_id_part(a: &str, b: &str) -> Ordering {
 /// 单独记录。根节点集合是没有父级的顶层 ID，按插入顺序排列。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scene {
+    #[serde(skip)]
+    query_serial: u64,
     nodes: HashMap<String, Layer>,
     /// 顶层节点 ID，按插入顺序——决定根层之间的绘制先后。
     roots: Vec<String>,
@@ -158,9 +163,11 @@ impl Scene {
     /// copying their script parameter maps at every rendered frame.
     pub fn render_snapshot(&self) -> Self {
         Self {
+            query_serial: self.query_serial,
             roots: self.roots.clone(),
             root_props: self.root_props.clone(),
             nodes: self.nodes.iter().map(|(id, layer)| (id.clone(), Layer {
+                query_revision: layer.query_revision,
                 id: layer.id.clone(), file: layer.file.clone(), mask: layer.mask.clone(),
                 solid_color: layer.solid_color, props: layer.props.clone(),
                 tweens: layer.tweens.clone(), children: layer.children.clone(),
@@ -170,7 +177,13 @@ impl Scene {
     }
 
     pub fn replace_with(&mut self, other: Scene) {
+        let serial = self.query_serial.max(other.query_serial);
         *self = other;
+        self.query_serial = serial;
+        for layer in self.nodes.values_mut() {
+            self.query_serial = self.query_serial.wrapping_add(1).max(1);
+            layer.query_revision = self.query_serial;
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<&Layer> {
@@ -178,18 +191,41 @@ impl Scene {
     }
 
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Layer> {
-        self.nodes.get_mut(id)
+        let layer = self.nodes.get_mut(id)?;
+        self.query_serial = self.query_serial.wrapping_add(1).max(1);
+        layer.query_revision = self.query_serial;
+        Some(layer)
+    }
+
+    /// Refresh a query projection without re-cloning unchanged properties and
+    /// handler maps. Accepted serials are separate from the projection itself:
+    /// synchronous Lua callbacks can already have mutated that projection.
+    pub(crate) fn sync_query_changes_from(&mut self, source: &Self, accepted: &mut HashMap<String, (u64, u64)>) -> usize {
+        let mut copied=0;
+        self.nodes.retain(|id, _| source.nodes.contains_key(id));
+        accepted.retain(|id, _| source.nodes.contains_key(id));
+        for (id, layer) in &source.nodes {
+            if self.nodes.get(id).is_none_or(|old| accepted.get(id) != Some(&(layer.query_revision, old.query_revision))) {
+                self.nodes.insert(id.clone(), layer.clone());
+                accepted.insert(id.clone(), (layer.query_revision, layer.query_revision));
+                copied+=1;
+            }
+        }
+        self.roots.clone_from(&source.roots);
+        self.root_props.clone_from(&source.root_props);
+        self.query_serial = source.query_serial;
+        copied
     }
 
     pub fn set_file(&mut self, id: &str, file: Option<String>) {
         self.ensure_path(id);
-        if let Some(layer) = self.nodes.get_mut(id) {
+        if let Some(layer) = self.get_mut(id) {
             layer.file = file;
         }
     }
 
     pub fn clear_file_if_matches(&mut self, id: &str, expected: &str) {
-        if let Some(layer) = self.nodes.get_mut(id)
+        if let Some(layer) = self.get_mut(id)
             && layer.file.as_deref() == Some(expected)
         {
             layer.file = None;
@@ -199,7 +235,7 @@ impl Scene {
     /// 设置图层的蒙版图路径（`lyc` mask 参数）。空字符串/None 表示清除。
     pub fn set_mask(&mut self, id: &str, mask: Option<String>) {
         self.ensure_path(id);
-        if let Some(layer) = self.nodes.get_mut(id) {
+        if let Some(layer) = self.get_mut(id) {
             layer.mask = mask.filter(|m| !m.is_empty());
         }
     }
@@ -208,7 +244,7 @@ impl Scene {
     /// 宽高由调用方通过 props 的 width/height 设置。
     pub fn set_solid_color(&mut self, id: &str, rgba: Option<[u8; 4]>) {
         self.ensure_path(id);
-        if let Some(layer) = self.nodes.get_mut(id) {
+        if let Some(layer) = self.get_mut(id) {
             layer.solid_color = rgba;
             if rgba.is_some() {
                 layer.file = None;
@@ -385,7 +421,7 @@ impl Scene {
     /// `set_mask` 重新指定）。
     pub fn create(&mut self, id: &str, file: Option<String>) {
         self.ensure_path(id);
-        if let Some(layer) = self.nodes.get_mut(id) {
+        if let Some(layer) = self.get_mut(id) {
             if file.as_deref().is_some_and(|f| !f.is_empty()) {
                 layer.solid_color = None;
             }
@@ -405,7 +441,6 @@ impl Scene {
                 self.nodes
                     .insert(id.to_string(), Layer::new(id.to_string()));
                 let parent_node = self
-                    .nodes
                     .get_mut(parent)
                     .expect("父节点应已由 ensure_path 创建");
                 if !parent_node.children.iter().any(|c| c == id) {
@@ -420,12 +455,14 @@ impl Scene {
                 }
             }
         }
+        // Stamp new nodes too: delete/recreate must not reuse revision zero.
+        let _ = self.get_mut(id);
     }
 
     /// 设置（合并）某图层的属性，会按需创建该节点。增量语义：只改动传入的键。
     pub fn set_props(&mut self, id: &str, raw: &HashMap<String, String>) {
         self.ensure_path(id);
-        if let Some(layer) = self.nodes.get_mut(id) {
+        if let Some(layer) = self.get_mut(id) {
             layer.props.merge_raw(raw);
         }
     }
@@ -440,7 +477,7 @@ impl Scene {
         // 先从父节点的子列表（或根列表）里摘除自身。
         match parent_id(id) {
             Some(parent) => {
-                if let Some(parent_node) = self.nodes.get_mut(parent) {
+                if let Some(parent_node) = self.get_mut(parent) {
                     parent_node.children.retain(|c| c != id);
                 }
             }
@@ -476,7 +513,7 @@ impl Scene {
         // 从旧父节点摘除。
         match parent_id(from) {
             Some(parent) => {
-                if let Some(p) = self.nodes.get_mut(parent) {
+                if let Some(p) = self.get_mut(parent) {
                     p.children.retain(|c| c != from);
                 }
             }
@@ -509,6 +546,7 @@ impl Scene {
             .collect();
         node.children = new_children;
         self.nodes.insert(to.to_string(), node);
+        let _ = self.get_mut(to);
 
         for child in children {
             let suffix = &child[from.len()..];
@@ -521,7 +559,7 @@ impl Scene {
     fn ensure_parent_link(&mut self, id: &str) {
         match parent_id(id) {
             Some(parent) => {
-                if let Some(p) = self.nodes.get_mut(parent) {
+                if let Some(p) = self.get_mut(parent) {
                     if !p.children.iter().any(|c| c == id) {
                         p.children.push(id.to_string());
                     }
@@ -566,6 +604,32 @@ fn parent_id(id: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_query_matches_full_scene_through_structural_and_direct_mutations() {
+        let mut source=Scene::new();let mut query=Scene::new();let mut accepted=HashMap::new();
+        let sync=|query:&mut Scene, source:&Scene, accepted:&mut HashMap<String,(u64,u64)>| {
+            query.sync_query_changes_from(source,accepted);
+            assert_eq!(serde_json::to_value(&*query).unwrap(),serde_json::to_value(source).unwrap());
+        };
+        source.create("1.2.face",Some("first".into()));source.create("2.menu",Some("menu".into()));
+        sync(&mut query,&source,&mut accepted);
+        let unchanged=query.get("2.menu").unwrap().file.as_ref().unwrap().as_ptr();
+        source.set_props("1.2.face",&raw(&[("alpha","128"),("shader","gray")]));
+        sync(&mut query,&source,&mut accepted);
+        assert_eq!(unchanged,query.get("2.menu").unwrap().file.as_ref().unwrap().as_ptr());
+        source.rename("1.2","3");sync(&mut query,&source,&mut accepted);
+        source.delete("3");source.create("3.face",Some("replacement".into()));sync(&mut query,&source,&mut accepted);
+        source.get_mut("3.face").unwrap().file=Some("direct".into());sync(&mut query,&source,&mut accepted);
+        source.set_root_props(&raw(&[("alpha","99")]));sync(&mut query,&source,&mut accepted);
+        // A queued/aborted script observation must not survive reconciliation.
+        query.set_file("3.face",Some("not-dispatched".into()));query.create("temporary",None);
+        sync(&mut query,&source,&mut accepted);
+        let restored:Scene=serde_json::from_value(serde_json::to_value(&source).unwrap()).unwrap();
+        source.replace_with(restored);sync(&mut query,&source,&mut accepted);
+        source.clear_file_if_matches("3.face","direct");sync(&mut query,&source,&mut accepted);
+        source.replace_with(Scene::new());sync(&mut query,&source,&mut accepted);
+    }
 
     fn raw(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

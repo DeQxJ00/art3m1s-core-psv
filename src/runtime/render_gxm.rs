@@ -15,6 +15,41 @@ impl CoreRuntime {
         self.texture_provider.reclaim_video_gpu_cache(bytes)
     }
     pub fn prepare_gxm_textures(&mut self) {
+        let timeline_started=std::time::Instant::now();
+        if let Some(future)=self.interpreter.query_surface_timeline(&mut self.surface_timeline_cursor) {
+            self.texture_provider.set_warm_plan(&future);
+            let scan_us=timeline_started.elapsed().as_micros();
+            let future:Vec<_>=future.into_iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,&p)).collect();
+            let mut files=self.compositor.scene().collect_files();
+            files.extend(RenderPipeline::new(&self.compositor).retained_files());
+            let current:Vec<_>=files.into_iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,&p)).collect();
+            super::surface_loader::update_story_plan(&future,&current);
+            crate::core_info!("[surface-timeline] paths={} scan_us={} total_us={}",future.len(),scan_us,timeline_started.elapsed().as_micros());
+        }
+        if self.frame_visual_dirty || self.last_submitted_frame.is_none() || self.texture_provider.needs_upload_retry() {
+            // Publish the whole scene before the first blocking resolve(). A
+            // body and its face must not be separated by speculative BG reads.
+            // Existing bindings own all jobs; generated/unknown names are ignored.
+            let mut files=self.compositor.scene().collect_files();
+            files.extend(RenderPipeline::new(&self.compositor).retained_files());
+            let mut paths:Vec<_>=files.into_iter().map(|file|super::magic_path::resolve_path(&self.magic_paths,&file)).collect();
+            paths.sort_unstable();
+            super::surface_loader::prioritize_scene(&paths);
+        }
+        let can_warm = matches!(self.wait_reason, Some(WaitReason::Generic | WaitReason::Generic0))
+            && self.is_text_reveal_complete() && !self.frame_visual_dirty
+            && !self.video.is_fullscreen_playing()
+            && !RenderPipeline::new(&self.compositor).is_transition_in_progress()
+            && self.video.video_state().video_layers.is_empty();
+        if can_warm {
+            let before = self.texture_provider.content_revision();
+            self.texture_provider.warm_step();
+            // Only new, unused names are published here; the visible draw list
+            // does not need rebuilding merely because a future texture arrived.
+            if self.last_submitted_texture_revision == before {
+                self.last_submitted_texture_revision = self.texture_provider.content_revision();
+            }
+        }
         if let Some(renderer) = self.text_renderer.as_mut() {
             renderer.prepare_textures(&mut self.texture_provider);
         }
@@ -193,7 +228,10 @@ impl CoreRuntime {
         for file in RenderPipeline::new(&self.compositor).retained_files() {
             used_files.insert(file);
         }
+        self.texture_provider.set_save_image_directory(&self.savepath);
         self.texture_provider.retain(&used_files);
+        let menu_paths=used_files.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect();
+        super::surface_loader::retain_menu_images(&menu_paths);
         if let Some(p) = profile.as_deref_mut() {
             p.frame_retain_ns = crate::profiler::FrameProfile::elapsed(retain_started);
         }

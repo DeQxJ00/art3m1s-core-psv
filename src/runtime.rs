@@ -81,6 +81,7 @@ pub struct CoreRuntime {
 
     renderer: RuntimeRenderer,
     texture_provider: RuntimeTextureProvider,
+    surface_timeline_cursor: asb_interpreter::SurfaceTimelineCursor,
     compositor: Compositor,
     /// 上一帧已经提交的逻辑场景。转场源帧需保留旧图像层，同时按当前状态
     /// 剔除刚隐藏或删除的消息文字，不能直接复用已经烘入文字的 FBO。
@@ -257,6 +258,7 @@ impl CoreRuntime {
             fbo_tex,
             renderer,
             texture_provider,
+            surface_timeline_cursor: Default::default(),
             compositor,
             last_rendered_scene: None,
             last_rendered_clock_ms: 0,
@@ -758,6 +760,30 @@ impl CoreRuntime {
         profile.emote_mesh_sprites = emote_stats.mesh_sprites;
         profile.emote_mesh_vertices = emote_stats.mesh_vertices;
         profile.finish();
+        #[cfg(all(target_os = "vita", feature = "gxm-native-renderer"))]
+        if profile.logic_ns >= 20_000_000 {
+            // Window averages cannot attribute a single sentence-entry stall.
+            // Bound diagnostics so fast-forward cannot flood the logging queue.
+            static WINDOW: std::sync::Mutex<Option<(std::time::Instant, u32)>> = std::sync::Mutex::new(None);
+            let emit = {
+                let mut window = WINDOW.lock().unwrap();
+                let now = std::time::Instant::now();
+                let (start, count) = window.get_or_insert((now, 0));
+                if now.duration_since(*start).as_secs() >= 1 { *start = now; *count = 0; }
+                let emit = *count < 8;
+                *count = count.saturating_add(1);
+                emit
+            };
+            if emit {
+                crate::core_info!("[logic-frame-spike] logic_us={} input_us={} script_us={} events_us={} runtime_us={} media_us={} text_event_us={} transition_us={} compositor_event_us={} layer_sync_us={} text_tick_us={} compositor_tick_us={} audio_tick_us={} io_us={} io_bytes={}",
+                    profile.logic_ns/1000, profile.input_ns/1000, profile.interpreter_ns/1000,
+                    profile.events_ns/1000, profile.event_runtime_ns/1000, profile.event_media_ns/1000,
+                    profile.event_text_ns/1000, profile.event_transition_ns/1000,
+                    profile.event_compositor_ns/1000, profile.event_layer_sync_ns/1000,
+                    profile.text_ns/1000, profile.compositor_ns/1000, profile.audio_media_ns/1000,
+                    profile.host_ffi_ns/1000, profile.host_ffi_bytes);
+            }
+        }
         self.profiler.submit(*profile);
     }
 

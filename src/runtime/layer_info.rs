@@ -10,6 +10,8 @@ use crate::compositor::{Compositor, TextureInfo};
 #[derive(Default)]
 pub(super) struct LayerQueryState {
     scene: Compositor,
+    accepted_revisions: HashMap<String, (u64, u64)>,
+    sync_reports: usize,
     dimensions: HashMap<String, Option<(u32, u32)>>,
 }
 
@@ -30,7 +32,8 @@ impl LayerQueryState {
         scene: &Compositor,
         mut cached: impl FnMut(&str) -> Option<TextureInfo>,
     ) {
-        self.scene.sync_query_scene_from(scene);
+        let started=std::time::Instant::now();
+        let copied=self.scene.sync_query_changes_from(scene, &mut self.accepted_revisions);
         let mut live = HashSet::new();
         for layer in scene.scene().all_layers() {
             if let Some(file) = &layer.file {
@@ -43,6 +46,11 @@ impl LayerQueryState {
         }
         self.dimensions
             .retain(|file, _| live.contains(file.as_str()));
+        let us=started.elapsed().as_micros();
+        if us>=2000 && self.sync_reports<24 {
+            self.sync_reports+=1;
+            crate::core_info!("[layer-query-sync] copied={} total={} sync_us={} sample={}/24",copied,scene.scene().len(),us,self.sync_reports);
+        }
     }
 
     pub fn observes(event: &Event) -> bool {
