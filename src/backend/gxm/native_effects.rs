@@ -1,5 +1,7 @@
 //! Direct GXM built-in effects bridge. Opt-in so the legacy host ABI is intact.
 use crate::render_pipeline::{draw::*, shader::*};
+thread_local! { static INPUT_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub(super) fn set_profile_enabled(enabled:bool){INPUT_TRACE.with(|v|v.set(enabled));}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -375,6 +377,7 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
                         }
                         nodes.invalidate(slot);
                     }
+                    nodes.trace_miss(frame,group_index,(width,height));
                     let ready=nodes.ready_to_build(frame,group_index,(width,height));
                     if admit && !ready {nodes.observe_change(frame,group_index,(width,height));}
                     if admit && ready && let Some(slot)=nodes.reserve(frame,group_index) {
@@ -544,7 +547,11 @@ impl RetainedGroups {
 }
 // Only an ungrouped, normal-alpha tail can be isolated without distributing
 // effects across layers. Texture stamps and exact commands invalidate the bake.
+#[cfg(test)]
 fn overlay_tail(frame:&DrawList,width:u32,height:u32)->Option<ShaderGroup>{
+    overlay_span(frame,width,height,None)
+}
+fn overlay_span(frame:&DrawList,width:u32,height:u32,previous:Option<&RetainedGroup>)->Option<ShaderGroup>{
     let floor=frame.shader_groups.iter().map(|g|g.end).max().unwrap_or(0);
     let mut start=frame.commands.len();
     for i in (floor..frame.commands.len()).rev(){
@@ -553,9 +560,24 @@ fn overlay_tail(frame:&DrawList,width:u32,height:u32)->Option<ShaderGroup>{
             ||c.color.grayscale||c.color.negative||!c.transform.is_finite(){break;}
         start=i;
     }
-    if frame.commands.len()-start<32{return None;}
+    let mut end=frame.commands.len();
+    if end-start<32{return None;}
+    // A wait icon or one fading button must not invalidate all finished text.
+    // Reuse only an exactly unchanged contiguous run inside the eligible tail.
+    // Keep the original order on either side; never cross an effect boundary.
+    if let Some(old)=previous.filter(|c|c.group.is_some()) {
+        let g=old.group.as_ref().unwrap();
+        let (lo,hi)=(start.max(g.start),end.min(g.end));
+        let (mut run,mut best)=(lo,lo..lo);
+        for i in lo..hi {
+            if old.commands.get(i-g.start)==Some(&frame.commands[i]) {
+                if i+1-run>best.len(){best=run..i+1;}
+            }else{run=i+1;}
+        }
+        if best.len()>=32 {start=best.start;end=best.end;}
+    }
     let mut bounds=[width as f32,height as f32,0f32,0f32];
-    for c in &frame.commands[start..] {
+    for c in &frame.commands[start..end] {
         let [w,h]=c.clip.quad_size;
         if !w.is_finite()||!h.is_finite(){return None;}
         for p in [glam::Vec2::ZERO,glam::vec2(w,0.),glam::vec2(0.,h),glam::vec2(w,h)]{
@@ -568,7 +590,7 @@ fn overlay_tail(frame:&DrawList,width:u32,height:u32)->Option<ShaderGroup>{
     bounds[0]=bounds[0].max(0.);bounds[1]=bounds[1].max(0.);
     bounds[2]=bounds[2].min(width as f32)-bounds[0];bounds[3]=bounds[3].min(height as f32)-bounds[1];
     if bounds[2]<=0.||bounds[3]<=0.{return None;}
-    Some(ShaderGroup{key:None,start,end:frame.commands.len(),effect:ShaderEffect{name:GROUP_COMPOSITE_SHADER.into(),uniforms:Default::default(),mask_texture:None,user_texture:None},clip_bounds:Some(bounds),mask_range:None})
+    Some(ShaderGroup{key:None,start,end,effect:ShaderEffect{name:GROUP_COMPOSITE_SHADER.into(),uniforms:Default::default(),mask_texture:None,user_texture:None},clip_bounds:Some(bounds),mask_range:None})
 }
 pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&mut RetainedGroups) {
     unsafe { super::art3m1s_gxm_frame_begin(width, height) };
@@ -586,7 +608,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
             caches.nodes.claim_final(slot);
         }
     }
-    let candidate=if enabled && unsafe{art3m1s_gxm_overlay_cache_enabled()!=0}{overlay_tail(frame,width,height)}else{None};
+    let candidate=if enabled && unsafe{art3m1s_gxm_overlay_cache_enabled()!=0}{overlay_span(frame,width,height,Some(&caches.overlay))}else{None};
     if !caches.overlay_layout.iter().copied().eq(frame.shader_groups.iter().map(|g|(g.start,g.end))) || candidate.is_none(){
         caches.overlay_layout.clear();caches.overlay_layout.extend(frame.shader_groups.iter().map(|g|(g.start,g.end)));
         caches.overlay_pressure=0;caches.overlay_blocked=false;
@@ -693,6 +715,10 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
                 cache.pool_revision=unsafe{art3m1s_gxm_cache_slot_revision(slot as u32)};
                 stats[0]+=1;
             }else{
+                // No final image is submitted or captured in this branch.
+                // Let stable child inputs use this slot immediately instead of
+                // reserving empty storage throughout an animated transition.
+                caches.nodes.release_final(slot);
                 render_range(frame,g.start,g.end,gi+1,width,height,&mut stats,enabled,&mut caches.nodes,true);
             }
             cache.store(frame,g,(width,height),revision);cache.baked=false;
@@ -702,6 +728,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
             // a final target on the second frame adds another full GPU fence,
             // only to discard it at the next step. The same applies to any
             // observed output-only animation. Other settled scenes bake early.
+            if !cache.input_cached {caches.nodes.release_final(slot);}
             render_range(frame,g.start,g.end,gi+1,width,height,&mut stats,enabled,&mut caches.nodes,true);
         }else if !hit {
             caches.nodes.use_slot(slot);
@@ -764,6 +791,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
             cache.pool_revision=unsafe{art3m1s_gxm_cache_slot_revision(3)};
             cache.store(frame,&g,(width,height),revision);
         }
+        render_range(frame,g.end,frame.commands.len(),0,width,height,&mut stats,enabled,&mut caches.nodes,true);
     }else{caches.overlay.group=None;caches.overlay.baked=false;}
     // Keep unused versions until LRU replacement; exact dependencies guard reuse.
     unsafe { art3m1s_gxm_report_groups(stats[0],stats[1]); }
@@ -872,6 +900,56 @@ mod tests {
         EVENTS.with(|v|assert!(v.borrow().iter().any(|s|s=="bake")));
     }
     #[test]
+    fn nested_filter_animation_keeps_static_blur_inputs_under_final_cache_pressure() {
+        use super::super::external_effects as ex;
+        let mut frame=mosaic_frame();let mosaic=frame.shader_groups[1].clone();
+        let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
+        for name in ["test-blur-h","test-blur-v"] {ex::register_source(name,src).unwrap();ex::mark_test_builtin_blur(name);}
+        frame.commands=frame.commands.iter().cloned().cycle().take(6).collect();frame.shader_groups.clear();
+        for i in 0..3 {
+            for name in ["test-blur-h","test-blur-v",GROUP_COMPOSITE_SHADER] {
+                let mut g=test_group(name,i*2,i*2+2);
+                if name!=GROUP_COMPOSITE_SHADER {g.effect.uniforms.insert("weights".into(),vec![0.1;8]);}
+                frame.shader_groups.push(g);
+            }
+        }
+        let mut mosaic=mosaic;mosaic.end=6;frame.shader_groups.push(mosaic);
+        frame.shader_groups.push(test_group(GROUP_COMPOSITE_SHADER,0,6));
+        for (i,g) in frame.shader_groups.iter_mut().enumerate() {
+            g.key=Some(crate::render_pipeline::draw::ShaderGroupKey::Layer {
+                layer_id:format!("filter{i}"),kind:crate::render_pipeline::draw::LayerShaderGroupKind::Intermediate,
+            });
+        }
+        let mut caches=RetainedGroups::default();
+        let mut previous=frame.clone();previous.shader_groups.remove(9);
+        // Old scene results occupy all four final targets before the transition.
+        for i in 0..4 {previous.commands[0].transform.translation.x=i as f32;
+            let g=previous.shader_groups.last().unwrap();
+            caches.slots[i].store(&previous,g,(960,544),1);caches.slots[i].baked=true;
+            caches.slots[i].pool_revision=unsafe{art3m1s_gxm_cache_slot_revision(i as u32)};
+        }
+        for step in 0..8 {
+            frame.shader_groups[9].effect.uniforms.insert("size".into(),vec![20.+step as f32*10.]);
+            // A separate group's output fades while its expensive child passes stay fixed.
+            frame.shader_groups[8].effect.uniforms.insert("alpha".into(),vec![0.2+step as f32*0.1]);
+            EVENTS.with(|v|v.borrow_mut().clear());render_cached(&frame,960,544,&mut caches);
+            let events=EVENTS.with(|v|v.borrow().clone());
+            if step>=2 {assert!(!events.iter().any(|e|e.starts_with("draw:")),"step {step}: {events:?}");}
+        }
+        // Borrowing storage must never reuse a stale face or altered geometry.
+        CHANGED_TEXTURE.with(|v|v.set(43));
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&frame,960,544,&mut caches);
+        EVENTS.with(|v|assert!(v.borrow().iter().any(|e|e=="draw:43")));
+        CHANGED_TEXTURE.with(|v|v.set(0));
+        frame.commands[0].transform.translation.x+=10.;
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&frame,960,544,&mut caches);
+        EVENTS.with(|v|assert!(v.borrow().iter().any(|e|e=="draw:42")));
+        // A settled scene still acquires a final picture and stops rerunning filters.
+        for _ in 0..30 {render_cached(&frame,960,544,&mut caches);}
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&frame,960,544,&mut caches);
+        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","cached","end-frame"]));
+    }
+    #[test]
     fn input_cache_cannot_evict_live_or_reserved_final_composites() {
         let f=mosaic_frame();let mut cache=NodeCache::default();cache.begin();
         for slot in 0..4 {cache.claim_final(slot);}
@@ -916,6 +994,26 @@ mod tests {
         assert!(src.matches(&f,1,(960,544)));
         f.commands[2].transform.translation.x+=1.;
         assert!(!src.matches(&f,1,(960,544)));
+    }
+    #[test]
+    fn effect_input_tracks_only_referenced_masks_and_survives_mask_prefix_changes() {
+        let mut f=mosaic_frame();let mut src=InputSnapshot::default();src.valid=true;
+        let mut portrait=f.commands[1].clone();portrait.texture=TextureId(77);
+        f.mask_commands.push(portrait.clone());src.store(&f,1,(960,544));
+        // An unrelated UI portrait must not invalidate a filtered scene input.
+        f.mask_commands[0].opacity=0.25;
+        assert!(src.matches(&f,1,(960,544)));
+        CHANGED_TEXTURE.with(|c|c.set(77));
+        assert!(src.matches(&f,1,(960,544)));CHANGED_TEXTURE.with(|c|c.set(0));
+        f.shader_groups[0].mask_range=Some([0,1]);
+        assert!(!src.matches(&f,1,(960,544)));src.store(&f,1,(960,544));
+        // Absolute indices can shift when an earlier, unrelated mask appears.
+        f.mask_commands.insert(0,portrait);f.shader_groups[0].mask_range=Some([1,2]);
+        assert!(src.matches(&f,1,(960,544)));
+        f.mask_commands[1].opacity=0.5;assert!(!src.matches(&f,1,(960,544)));
+        src.store(&f,1,(960,544));CHANGED_TEXTURE.with(|c|c.set(77));
+        assert!(!src.matches(&f,1,(960,544)));CHANGED_TEXTURE.with(|c|c.set(0));
+        f.shader_groups[0].mask_range=Some([1,3]);assert!(!src.matches(&f,1,(960,544)));
     }
     #[test]
     fn shared_pool_generation_and_reservations_prevent_stale_input_reuse() {
@@ -981,6 +1079,7 @@ mod tests {
         f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
         assert!(!src.matches(&f,1,(960,544)));src.store(&f,1,(960,544));
         f.mask_commands.push(f.commands[0].clone());
+        f.shader_groups[0].mask_range=Some([0,1]);
         assert!(!src.matches(&f,1,(960,544)));src.store(&f,1,(960,544));
         CHANGED_TEXTURE.with(|v|v.set(f.commands[1].texture.0));
         assert!(!src.matches(&f,1,(960,544)));CHANGED_TEXTURE.with(|v|v.set(0));
@@ -1078,6 +1177,55 @@ mod tests {
         // an effect spanning the full list must reserve all of its children.
         f.shader_groups.push(ShaderGroup{key:None,start:0,end:100,effect:ShaderEffect{name:GROUP_COMPOSITE_SHADER.into(),uniforms:Default::default(),mask_texture:None,user_texture:None},clip_bounds:None,mask_range:None});
         assert!(overlay_tail(&f,960,544).is_none());
+    }
+    #[test]
+    fn overlay_reuses_static_run_without_freezing_surrounding_animation(){
+        for moving in [0,40,80] {
+            let mut f=neutral_frame();let mut c=f.commands[1].clone();
+            c.texture=TextureId(41);c.shader=None;
+            f.shader_groups.clear();f.commands=vec![c;81];
+            let mut caches=RetainedGroups::default();
+            for tick in 0..14 {
+                f.commands[moving].transform.translation.x=tick as f32;
+                render_cached(&f,960,544,&mut caches);
+            }
+            assert!(caches.overlay.baked,"moving={moving}");
+            let g=caches.overlay.group.as_ref().unwrap().clone();
+            assert!(!(g.start..g.end).contains(&moving));
+            EVENTS.with(|v|v.borrow_mut().clear());
+            f.commands[moving].transform.translation.x+=1.;
+            render_cached(&f,960,544,&mut caches);
+            let expected:Vec<_>=std::iter::once("frame".to_string())
+                .chain((0..g.start).map(|_|"draw:41".to_string()))
+                .chain(std::iter::once("cached".to_string()))
+                .chain((g.end..81).map(|_|"draw:41".to_string()))
+                .chain(std::iter::once("end-frame".to_string())).collect();
+            EVENTS.with(|v|assert_eq!(*v.borrow(),expected));
+            // New pixels in an atlas invalidate the baked run even when the
+            // draw commands have not changed. Empty text must not replay it.
+            CHANGED_TEXTURE.with(|v|v.set(41));
+            render_cached(&f,960,544,&mut caches);assert!(!caches.overlay.baked);
+            CHANGED_TEXTURE.with(|v|v.set(0));
+            f.commands.clear();render_cached(&f,960,544,&mut caches);
+            assert!(caches.overlay.group.is_none());
+        }
+    }
+    #[test]
+    fn overlay_static_run_stays_outside_new_effect_boundaries(){
+        let mut f=neutral_frame();let c=f.commands[1].clone();
+        f.shader_groups.clear();f.commands=vec![c;81];
+        let mut caches=RetainedGroups::default();
+        for tick in 0..14 {
+            f.commands[80].opacity=0.5+tick as f32/100.;
+            render_cached(&f,960,544,&mut caches);
+        }
+        assert!(caches.overlay.baked);
+        let mut group=neutral_frame().shader_groups.remove(0);group.end=50;
+        f.shader_groups.push(group);
+        // Only 31 ungrouped commands remain; reusing the old 80-command
+        // range would apply the group's effect incorrectly or draw twice.
+        assert!(overlay_span(&f,960,544,Some(&caches.overlay)).is_none());
+        render_cached(&f,960,544,&mut caches);assert!(caches.overlay.group.is_none());
     }
     #[test]
     fn blend_modes_remain_distinct_and_effect_layout_matches_c() {

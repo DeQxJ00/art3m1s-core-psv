@@ -16,6 +16,8 @@ pub(super) struct NodeCache {
     final_owned: [bool;5],
     protected: [bool;5],
     clock: u64,
+    trace_at: Option<std::time::Instant>,
+    trace_reports: u32,
 }
 
 pub(super) fn eligible(frame:&DrawList,gi:usize)->bool {
@@ -40,6 +42,21 @@ fn same_node(a:&ShaderGroup,b:&ShaderGroup)->bool {
     }
 }
 impl NodeCache {
+    pub fn trace_miss(&mut self,frame:&DrawList,gi:usize,size:(u32,u32)) {
+        if !INPUT_TRACE.with(|v|v.get()) {return;}
+        let now=std::time::Instant::now();
+        if self.trace_at.is_none_or(|t|now.duration_since(t).as_secs()>=5) {
+            self.trace_at=Some(now);self.trace_reports=0;
+        }
+        if self.trace_reports>=8 {return;}self.trace_reports+=1;
+        let g=&frame.shader_groups[gi];
+        let prior=self.entries.iter().enumerate().filter(|(_,e)|e.identity.as_ref().is_some_and(|old|same_node(old,g)))
+            .max_by_key(|(_,e)|e.touched);
+        let reason=prior.map_or_else(||"unrecorded".to_string(),|(i,e)|format!("slot={} valid={} serial={}/{} {}",
+            i,e.input.valid,e.serial,unsafe{art3m1s_gxm_cache_slot_revision(i as u32)},e.input.describe_difference(frame,gi,size)));
+        crate::core_info!("[effect-input-miss] node={:?} filter={} reason={} busy={:?} final={:?} protected={:?}",
+            g.key,g.effect.name,reason,self.busy,self.final_owned,self.protected);
+    }
     pub fn begin(&mut self){self.busy.fill(false);self.final_owned.fill(false);self.protected.fill(false);self.clock=self.clock.saturating_add(1);}
     pub fn claim_final(&mut self,slot:usize){self.final_owned[slot]=true;}
     pub fn release_final(&mut self,slot:usize){self.final_owned[slot]=false;}

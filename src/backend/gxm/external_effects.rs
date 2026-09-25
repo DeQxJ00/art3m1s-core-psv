@@ -255,3 +255,5 @@ pub(super) fn premultiplied_spatial_filter(effect:&ShaderEffect)->bool {
 }
 #[cfg(test)]
 pub(super) fn mark_test_builtin_mosaic(id:&str){PROGRAMS.with(|p|p.borrow_mut().get_mut(id).unwrap().builtin_mosaic=true);changed();}
+#[cfg(test)]
+pub(super) fn mark_test_builtin_blur(id:&str){PROGRAMS.with(|p|p.borrow_mut().get_mut(id).unwrap().builtin_blur=true);changed();}
