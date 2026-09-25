@@ -9,6 +9,13 @@ impl TileProof {
     pub fn from_pixels(image:&image::RgbaImage)->Option<Self>{
         let (width,height)=image.dimensions();
         if width<960||height<540{return None;}
+        Self::for_prepared_upload(image)
+    }
+    // Prepared on the decode worker, including small character/face images.
+    // Lets a staged GPU upload publish without scanning uncached GPU memory.
+    pub fn for_prepared_upload(image:&image::RgbaImage)->Option<Self>{
+        let (width,height)=image.dimensions();
+        if width==0||height==0{return None;}
         let columns=(width as usize).checked_add(63)?/64;
         let rows=(height as usize).checked_add(63)?/64;
         let count=columns.checked_mul(rows)?.checked_add(HEADER)?;

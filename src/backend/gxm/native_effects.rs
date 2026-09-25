@@ -36,6 +36,8 @@ unsafe extern "C" {
     fn art3m1s_gxm_node_source_enabled()->i32;
     fn art3m1s_gxm_cache_slot_revision(slot:u32)->u64;
     fn art3m1s_gxm_node_source_end(draw:*const EffectDraw,slot:u32)->i32;
+    fn art3m1s_gxm_group_input_reuse_enabled()->i32;
+    fn art3m1s_gxm_group_begin_cached_input(slot:u32)->i32;
     fn art3m1s_gxm_group_begin() -> i32;
     fn art3m1s_gxm_overlay_cache_enabled() -> i32;
     fn art3m1s_gxm_overlay_end_cached(slot:u32, bounds:*const f32) -> i32;
@@ -450,6 +452,7 @@ pub(super) struct RetainedGroup {
     revision: u64,
     size: (u32,u32),
     baked: bool,
+    input_cached: bool,
     textures: Vec<(u64,u64)>,
     changing_frames: u32,
     stable_frames: u32,
@@ -527,6 +530,7 @@ pub(super) struct RetainedGroups {
     slots:[RetainedGroup;4], overlay:RetainedGroup, nodes:NodeCache,
     clock:u64, touched:[u64;4], identity_blur_reported:bool,
     overlay_pressure:u32, overlay_blocked:bool, overlay_layout:Vec<(usize,usize)>,
+    input_reports:u32,
 }
 impl RetainedGroups {
     fn select(&self, frame:&DrawList, g:&ShaderGroup, size:(u32,u32), revision:u64,
@@ -578,7 +582,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
     // Final pictures remain useful across returning to earlier scene states.
     // Input caches must not silently replace their physical slots.
     for (slot,cache) in caches.slots.iter().enumerate() {
-        if cache.baked && cache.pool_revision==unsafe{art3m1s_gxm_cache_slot_revision(slot as u32)} {
+        if (cache.baked || cache.input_cached) && cache.pool_revision==unsafe{art3m1s_gxm_cache_slot_revision(slot as u32)} {
             caches.nodes.claim_final(slot);
         }
     }
@@ -594,7 +598,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
     caches.clock=caches.clock.saturating_add(1);
     let limit=if overlay.is_some(){3}else{4};
     // The overlay and group pool share physical slot 3, never its metadata.
-    if overlay.is_some()||caches.overlay.group.is_some(){caches.slots[3].group=None;caches.slots[3].baked=false;}
+    if overlay.is_some()||caches.overlay.group.is_some(){caches.slots[3].group=None;caches.slots[3].baked=false;caches.slots[3].input_cached=false;}
     // Descend through proven neutral boundaries without leaving the cache-aware
     // traversal. Non-neutral ancestors still use the original isolated path.
     // Each scope bounds both commands and group indices, including equal ranges.
@@ -617,6 +621,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
         for slot in 0..limit {
             if !used[slot] && !caches.nodes.busy(slot) && caches.slots[slot].same_identity(g) {
                 caches.slots[slot].baked=false;
+                caches.slots[slot].input_cached=false;
                 caches.slots[slot].animated_output=true;
                 if caches.slots[slot].group.as_ref()!=Some(g) {caches.slots[slot].group=None;}
                 caches.nodes.release_final(slot);
@@ -656,7 +661,40 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
         if !same {
             // A changing group must not pay an extra cache-baking pass. Observe
             // one identical subsequent frame before building a retained result.
-            render_range(frame,g.start,g.end,gi+1,width,height,&mut stats,enabled,&mut caches.nodes,true);
+            // Keep the already isolated input in this group's reserved slot.
+            // Swapping ownership adds no pixel copy. A flattened wrapper with
+            // many child passes may add one outer pass now to avoid rebuilding
+            // all children next frame. Keep simple flattened/fused paths and
+            // the dedicated policy for animated mosaic/output unchanged.
+            cache.input_cached=false;
+            let flattened=passthrough_group_inner(frame,gi,width,height,true);
+            let complex_flattened=flattened && frame.shader_groups[..gi].iter().enumerate().filter(|(i,n)|
+                n.start>=g.start && n.end<=g.end && n.start<n.end
+                && !passthrough_group_inner(frame,*i,width,height,true)
+                && fused_group(frame,*i,width,height).is_none()
+                && local_opaque_group(frame,*i,width,height).is_none()).take(4).count()>=4;
+            let capture = !cache.animated_output
+                && g.mask_range.is_none() && unsafe{art3m1s_gxm_group_input_reuse_enabled()!=0}
+                && (!flattened || (complex_flattened && cache.changing_frames==1))
+                && local_opaque_group(frame,gi,width,height).is_none()
+                && fused_group(frame,gi,width,height).is_none()
+                && !frame.shader_groups[..=gi].iter().any(|n|n.start>=g.start && n.end<=g.end
+                    && super::external_effects::cacheable_mosaic(&n.effect));
+            if g.end-g.start>=8 && caches.input_reports<24 {
+                caches.input_reports+=1;
+                crate::core_info!("GXM retained-input slot={} commands={} groups={} flattened={} complex={} capture={} changes={}",
+                    slot,g.end-g.start,gi+1,flattened,complex_flattened,capture,cache.changing_frames);
+            }
+            if capture && let Some(draw)=encode(&group_command(g,width,height),width,height)
+                && unsafe{art3m1s_gxm_group_begin()!=0} {
+                caches.nodes.use_slot(slot);
+                render_range(frame,g.start,g.end,gi,width,height,&mut stats,enabled,&mut caches.nodes,true);
+                cache.input_cached=unsafe{art3m1s_gxm_node_source_end(&draw,slot as u32)!=0};
+                cache.pool_revision=unsafe{art3m1s_gxm_cache_slot_revision(slot as u32)};
+                stats[0]+=1;
+            }else{
+                render_range(frame,g.start,g.end,gi+1,width,height,&mut stats,enabled,&mut caches.nodes,true);
+            }
             cache.store(frame,g,(width,height),revision);cache.baked=false;
         }else if !hit && cache.stable_frames<24 && (cache.animated_output || frame.shader_groups.iter().take(gi+1).any(|n|
             n.start>=g.start && n.end<=g.end && super::external_effects::cacheable_mosaic(&n.effect))) {
@@ -667,9 +705,19 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
             render_range(frame,g.start,g.end,gi+1,width,height,&mut stats,enabled,&mut caches.nodes,true);
         }else if !hit {
             caches.nodes.use_slot(slot);
-            if let Some(draw)=encode(&group_command(g,width,height),width,height)
-                && unsafe {art3m1s_gxm_group_begin()!=0} {
-                render_range(frame,g.start,g.end,gi,width,height,&mut stats,enabled,&mut caches.nodes,true);
+            let draw=encode(&group_command(g,width,height),width,height);
+            let source=if cache.input_cached && cache.pool_revision==unsafe{art3m1s_gxm_cache_slot_revision(slot as u32)} {
+                Some(slot)
+            }else{caches.nodes.find(frame,gi,(width,height))};
+            let restored=draw.is_some() && source.is_some_and(|source|{
+                caches.nodes.use_slot(source);
+                let ok=unsafe{art3m1s_gxm_group_begin_cached_input(source as u32)!=0};
+                caches.nodes.invalidate(source);ok
+            });
+            cache.input_cached=false;
+            if let Some(draw)=draw
+                && (restored || unsafe {art3m1s_gxm_group_begin()!=0}) {
+                if !restored {render_range(frame,g.start,g.end,gi,width,height,&mut stats,enabled,&mut caches.nodes,true);}
                 let mask_ready = if let Some([start, end]) = g.mask_range {
                     if unsafe { art3m1s_gxm_group_mask_begin() } != 0 {
                         for cmd in frame.mask_commands.get(start..end).unwrap_or_default() {
@@ -703,7 +751,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
     }
     }
     if let Some(g)=overlay{
-        caches.slots[3].group=None;caches.slots[3].baked=false;
+        caches.slots[3].group=None;caches.slots[3].baked=false;caches.slots[3].input_cached=false;
         let revision=unsafe{art3m1s_gxm_texture_revision()};
         let cache=&mut caches.overlay;
         let same=cache.matches(frame,&g,(width,height),revision);
@@ -759,6 +807,13 @@ mod tests {
     extern "C" fn art3m1s_gxm_draw_cached_group(_:u32)->i32 {event("cached".into());1}
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_group_end_cached(_: *const EffectDraw,slot:u32)->i32 {bump_pool(slot as usize);event("bake".into());1}
+    #[unsafe(no_mangle)] extern "C" fn art3m1s_gxm_group_input_reuse_enabled()->i32 {1}
+    thread_local! { static RESTORE_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    #[unsafe(no_mangle)] extern "C" fn art3m1s_gxm_group_begin_cached_input(slot:u32)->i32 {
+        bump_pool(slot as usize);
+        if RESTORE_FAIL.with(|v|v.get()) {return 0;}
+        event("restore-input".into());1
+    }
     #[unsafe(no_mangle)] extern "C" fn art3m1s_gxm_node_source_draw(_: *const EffectDraw,_:u32)->i32 {event("node-source-hit".into());1}
     #[unsafe(no_mangle)] extern "C" fn art3m1s_gxm_node_source_enabled()->i32 {1}
     #[unsafe(no_mangle)] extern "C" fn art3m1s_gxm_cache_slot_revision(slot:u32)->u64 {POOL_SERIAL.with(|v|v.borrow()[slot as usize])}
@@ -1294,7 +1349,7 @@ mod tests {
         // An outer filter must apply to the combined child result, not be skipped.
         f.shader_groups[2].effect.uniforms.insert("grayscale".into(),vec![1.]);
         EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
-        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","begin-group","begin-group","draw:42","draw:43","end-group:3","end-group:3","draw:99","end-frame"]));
+        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","begin-group","begin-group","draw:42","draw:43","end-group:3","node-source-build","draw:99","end-frame"]));
     }
     #[test]
     fn opaque_cover_maps_visible_uvs_for_panning_and_reflection(){
@@ -1360,6 +1415,111 @@ mod tests {
         assert!(!caches.slots.iter().any(|c| c.matches(&f, &f.shader_groups[0], (960,544), 1)));
     }
 
+    fn layered_gray_frame()->DrawList {
+        let mut f=neutral_frame();
+        let pair=f.commands.clone();f.commands.clear();f.shader_groups.clear();
+        for i in 0..4 {
+            f.commands.extend(pair.iter().cloned().map(|mut c|{c.transform.translation.x+=i as f32*20.;c}));
+            let mut child=test_group(GROUP_COMPOSITE_SHADER,i*2,i*2+2);
+            child.effect.uniforms.insert("alpha".into(),vec![0.8]);
+            f.shader_groups.push(child);
+        }
+        let mut outer=test_group(GROUP_COMPOSITE_SHADER,0,8);
+        outer.effect.uniforms.insert("grayscale".into(),vec![1.]);f.shader_groups.push(outer);f
+    }
+    #[test]
+    fn initial_multi_layer_input_is_reused_without_redrawing_children() {
+        let f=layered_gray_frame();let mut cache=RetainedGroups::default();
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|{
+            assert_eq!(v.borrow().iter().filter(|e|e.starts_with("draw:")).count(),8);
+            assert!(!v.borrow().iter().any(|e|e=="bake"));
+        });
+        assert!(cache.slots[0].input_cached);assert!(!cache.slots[0].baked);
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","restore-input","bake","end-frame"]));
+        assert!(!cache.slots[0].input_cached);assert!(cache.slots[0].baked);
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","cached","end-frame"]));
+    }
+    fn layered_external_gray_frame()->DrawList {
+        let mut f=layered_gray_frame();
+        let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
+        super::super::external_effects::register_source("test_multi_gray",src).unwrap();
+        super::super::external_effects::mark_test_builtin_gray("test_multi_gray");
+        for g in &mut f.shader_groups[..4] {g.effect.name="test_multi_gray".into();g.effect.uniforms.clear();}
+        f.shader_groups[4].effect.uniforms.clear();f
+    }
+    #[test]
+    fn complex_flattened_gray_wrapper_keeps_combined_first_input() {
+        let f=layered_external_gray_frame();let mut cache=RetainedGroups::default();
+        assert!(passthrough_group_inner(&f,4,960,544,true));
+        assert!(!passthrough_group(&f,4,960,544));
+        render_cached(&f,960,544,&mut cache);
+        assert!(cache.slots[0].input_cached);
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","restore-input","bake","end-frame"]));
+    }
+    #[test]
+    fn continuously_moving_flattened_children_stop_extra_input_capture() {
+        let mut f=layered_external_gray_frame();let mut cache=RetainedGroups::default();
+        for frame in 0..12 {
+            f.commands[1].transform.translation.x=frame as f32;
+            render_cached(&f,960,544,&mut cache);
+        }
+        assert!(cache.slots.iter().all(|c|!c.input_cached && !c.baked));
+    }
+    #[test]
+    fn settled_composite_can_consume_matching_shared_node_input() {
+        let f=layered_external_gray_frame();let mut cache=RetainedGroups::default();
+        cache.slots[0].store(&f,&f.shader_groups[4],(960,544),1);
+        cache.nodes.store(4,&f,4,(960,544),true);
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","restore-input","bake","end-frame"]));
+        assert!(cache.nodes.find(&f,4,(960,544)).is_none()); // Ownership was consumed.
+        assert!(cache.slots[0].baked);
+    }
+    #[test]
+    fn first_input_never_hides_changed_expression_effect_or_program() {
+        for change in 0..8 {
+            let mut f=layered_gray_frame();let mut cache=RetainedGroups::default();
+            render_cached(&f,960,544,&mut cache);assert!(cache.slots[0].input_cached);
+            let mut size=(960,544);
+            match change {
+                0=>f.commands[1].texture=TextureId(78),
+                1=>f.commands[1].transform.translation.x+=1.,
+                2=>f.commands[1].opacity=0.3,
+                3=>{f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.7]);},
+                4=>{f.shader_groups[0].effect.mask_texture=Some(TextureId(71));},
+                5=>CHANGED_TEXTURE.with(|v|v.set(43)),
+                6=>cache.slots[0].programs=cache.slots[0].programs.wrapping_sub(1),
+                _=>size=(1280,720),
+            }
+            EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,size.0,size.1,&mut cache);
+            EVENTS.with(|v|{
+                assert!(!v.borrow().iter().any(|e|e=="restore-input"||e=="cached"),"change={change}");
+                assert!(v.borrow().iter().any(|e|e.starts_with("draw:")),"change={change}");
+            });
+            CHANGED_TEXTURE.with(|v|v.set(0));
+        }
+    }
+    #[test]
+    fn overwritten_or_unavailable_first_input_falls_back_to_full_composition() {
+        for failure in 0..2 {
+            let f=layered_gray_frame();let mut cache=RetainedGroups::default();
+            render_cached(&f,960,544,&mut cache);assert!(cache.slots[0].input_cached);
+            if failure==0 {bump_pool(0);}else{RESTORE_FAIL.with(|v|v.set(true));}
+            EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+            EVENTS.with(|v|{
+                assert_eq!(v.borrow().iter().filter(|e|e.starts_with("draw:")).count(),8);
+                assert!(v.borrow().iter().any(|e|e=="bake"));
+            });
+            RESTORE_FAIL.with(|v|v.set(false));
+            EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+            EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","cached","end-frame"]));
+        }
+    }
+
     #[test]
     fn looping_group_versions_reuse_results_and_invalidate_changed_sources(){
         let mut f=neutral_frame();
@@ -1384,6 +1544,9 @@ mod tests {
         let g=&f.shader_groups[0];
         assert!(caches.select(&f,g,(960,544),1,&[true;4],4).is_none());
         assert!(caches.select(&f,g,(960,544),1,&[true,true,true,false],3).is_none());
+        // The newly captured input is reserved for this whole frame.
+        assert!(caches.select(&f,g,(960,544),1,&[true,true,true,false],4).is_none());
+        caches.nodes.begin();
         assert_eq!(caches.select(&f,g,(960,544),1,&[true,true,true,false],4),Some(3));
     }
 
@@ -1395,7 +1558,7 @@ mod tests {
         let mut cache=RetainedGroups::default();
         render_cached(&f,960,544,&mut cache); // Observe the first frame, without a cache pass.
         EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
-        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","begin-group","draw:42","draw:43","bake","draw:99","end-frame"]));
+        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","restore-input","bake","draw:99","end-frame"]));
         f.commands[2].transform.translation.x=10.;
         EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
         EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","cached","draw:99","end-frame"]));
@@ -1464,7 +1627,7 @@ mod tests {
         EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","cached","begin-group","draw:42","draw:43","end-group:3","end-frame"]));
         f.commands[2].opacity=0.5;
         EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
-        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","cached","begin-group","draw:42","draw:43","end-group:3","end-frame"]));
+        EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","cached","begin-group","draw:42","draw:43","node-source-build","end-frame"]));
         for x in [1.,2.,3.] {
             f.commands[2].transform.translation.x=x;
             EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);

@@ -52,6 +52,8 @@ pub mod expression;
 pub mod interpreter;
 pub mod lua_engine;
 mod preload_hints;
+mod surface_timeline;
+pub use surface_timeline::SurfaceTimelineCursor;
 mod message_roles;
 pub use message_roles::MessageLayerIds;
 #[cfg(feature = "backend-luau")]

@@ -12,6 +12,10 @@ const BUDGET: usize = 16 * 1024 * 1024;
 const READY_BUDGET: usize = BUDGET;
 const MAX_QUEUE: usize = 64;
 const SCRIPT_PREFETCH_BURST: usize = 4;
+// One suspended source only, charged to the existing 16 MiB working allowance.
+// Never suspend decoded pixels or introduce a second decoder/worker.
+const MAX_PAUSED_SOURCE:usize=2*1024*1024;
+enum LoadStep { Complete(Option<Payload>), Paused(Tracked<Vec<u8>>) }
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
 pub(super) enum Kind { #[default] Image, Mask, Animation }
 impl Kind {
@@ -45,13 +49,18 @@ fn demote(payload: &mut Option<Payload>) -> usize {
     let released = pixels.as_raw().capacity();
     *payload = Some(Payload::Encoded(encoded,proof)); released
 }
-struct Entry { refs: usize, ticket: u64, bind_order:u64, prepared:bool, pending: bool, deferred: bool, demanded: bool, speculative:bool, payload: Option<Payload>,kind:Kind,leased:bool,retry_bytes:usize }
+struct Entry { refs: usize, ticket: u64, bind_order:u64, prepared:bool, story_suppressed:bool, pending: bool, deferred: bool, demanded: bool, speculative:bool, payload: Option<Payload>,kind:Kind,leased:bool,retry_bytes:usize }
 #[derive(Default)]
 struct State {
     entries: HashMap<String, Entry>, queue: VecDeque<(String, u64)>,
     masks:VecDeque<(String,u64)>,animations:VecDeque<(String,u64)>,urgent:Option<String>,lane:usize,chapter:String,
     script_burst:usize,
+    // References to existing jobs only: no extra binding or resource lifetime.
+    scene_priority:VecDeque<(String,u64)>,
+    story_priority:VecDeque<(String,u64)>,
+    story_managed:std::collections::HashSet<String>,
     serial: u64, stop: bool, active:Option<(String,u64)>,
+    parked:Option<(String,u64)>,
     demotion_samples:u32,
     reserve_requested:bool,
 }
@@ -62,8 +71,41 @@ impl State{
         for q in [&mut self.queue,&mut self.masks,&mut self.animations]{if let Some(i)=q.iter().position(|(p,_)|p==path){return q.remove(i);}}
         None
     }
+    fn pop_priority_job(&mut self)->Option<(String,u64)>{
+        if let Some(path)=self.urgent.take(){
+            if let Some(job)=self.remove_queued(&path){return Some(job);}
+            if self.parked.as_ref().is_some_and(|(p,_)|p==&path){return self.parked.clone();}
+        }
+        while let Some((path,ticket))=self.scene_priority.pop_front(){
+            if !self.entries.get(&path).is_some_and(|e|e.pending&&e.ticket==ticket){continue;}
+            // A scene batch can mention the worker's current request. Never
+            // enqueue it twice, including when the batch is refreshed mid-load.
+            if self.active.as_ref().is_some_and(|(p,t)|p==&path&&*t==ticket){continue;}
+            self.remove_queued(&path);
+            self.entries.get_mut(&path).unwrap().deferred=false;
+            return Some((path,ticket));
+        }
+        None
+    }
+    fn should_yield(&self,path:&str,ticket:u64)->bool{
+        if self.stop||self.parked.is_some(){return false;}
+        let live=|p:&str,t:u64|self.entries.get(p).is_some_and(|e|e.pending&&e.ticket==t);
+        if !self.entries.get(path).is_some_and(|e|e.pending&&e.ticket==ticket&&e.speculative&&!e.demanded){return false;}
+        // A refreshed batch can promote the active request itself.
+        if self.scene_priority.iter().any(|(p,t)|p==path&&*t==ticket){return false;}
+        self.urgent.as_ref().is_some_and(|p|p!=path&&self.entries.get(p).is_some_and(|e|e.pending))
+            ||self.scene_priority.iter().any(|(p,t)|p!=path&&live(p,*t))
+    }
     fn pop_job(&mut self)->Option<(String,u64)>{
-        if let Some(path)=self.urgent.take(){if let Some(job)=self.remove_queued(&path){return Some(job);}}
+        if let Some(job)=self.pop_priority_job(){return Some(job);}
+        while self.script_burst<SCRIPT_PREFETCH_BURST && !self.story_priority.is_empty(){
+            let (path,ticket)=self.story_priority.pop_front().unwrap();
+            if !self.entries.get(&path).is_some_and(|e|e.pending&&e.ticket==ticket){continue;}
+            if self.active.as_ref().is_some_and(|(p,t)|p==&path&&*t==ticket){continue;}
+            self.remove_queued(&path);
+            self.entries.get_mut(&path).unwrap().deferred=false;
+            self.script_burst+=1;return Some((path,ticket));
+        }
         // Lua bindings carry the game's first-use order, independent of resource
         // kind. Leave one supplemental opportunity after four script requests
         // so an effect omitted by cache.lua still makes forward progress.
@@ -91,7 +133,7 @@ impl State{
         self.entries.get_mut(&path).unwrap().deferred=false;
         Some((path,ticket))
     }
-    fn clear_queues(&mut self){self.queue.clear();self.masks.clear();self.animations.clear();self.urgent=None;self.script_burst=0;}
+    fn clear_queues(&mut self){self.queue.clear();self.masks.clear();self.animations.clear();self.urgent=None;self.scene_priority.clear();self.story_priority.clear();self.story_managed.clear();self.script_burst=0;}
     fn kind_parts(&self,kind:Kind)->CacheParts{
         self.entries.values().filter(|e|e.kind==kind).filter_map(|e|e.payload.as_ref()).fold(CacheParts::default(),|mut sum,p|{sum.add(p.parts());sum})
     }
@@ -107,7 +149,7 @@ impl State{
     }
     fn script_preload_counts(&self)->crate::image_cache_budget::ScriptPreloadCounts{
         let mut counts=crate::image_cache_budget::ScriptPreloadCounts::default();
-        for e in self.entries.values().filter(|e|e.refs>0){
+        for (_,e) in self.entries.iter().filter(|(p,e)|e.refs>0&&!e.story_suppressed&&!crate::ui_image_lifetime::transient_menu_image(p)){
             counts.planned+=1;
             counts.completed+=usize::from(e.prepared);
             match e.payload{
@@ -126,10 +168,15 @@ impl Loader {
     pub fn new(load: impl Fn(&str, &dyn Fn() -> bool) -> Option<Payload> + Send + 'static) -> std::io::Result<Self> {
         Self::with_budget(load, BUDGET)
     }
+    #[cfg(test)]
     fn with_budget(load: impl Fn(&str, &dyn Fn() -> bool) -> Option<Payload> + Send + 'static, budget: usize) -> std::io::Result<Self> {
         Self::with_policy(load,budget,None)
     }
+    #[cfg(test)]
     fn with_policy(load: impl Fn(&str, &dyn Fn() -> bool) -> Option<Payload> + Send + 'static, budget: usize, cache:Option<SharedCacheBudget>) -> std::io::Result<Self> {
+        Self::with_steps(move|p,resume,c,_,_|{assert!(resume.is_none());LoadStep::Complete(load(p,c))},budget,cache)
+    }
+    fn with_steps(load: impl Fn(&str,Option<Tracked<Vec<u8>>>,&dyn Fn()->bool,&dyn Fn(usize)->bool,usize)->LoadStep + Send + 'static, budget:usize,cache:Option<SharedCacheBudget>)->std::io::Result<Self>{
         let shared = Arc::new(Shared { state: Mutex::new(State::default()), wake: Condvar::new(),cache,budget });
         let s = shared.clone();
         let worker = std::thread::Builder::new().name("surface-loader".into()).stack_size(512 * 1024).spawn(move || {
@@ -140,12 +187,28 @@ impl Loader {
             crate::core_info!("[surface-prefetch] thread priority=180 result={}", result);
           }
           crate::ffi::worker_started(c"surface-loader");
+          let mut paused:Option<(String,u64,Tracked<Vec<u8>>)>=None;
           loop {
             let mut state = s.state.lock().unwrap();
-            while state.queue_len()==0 && !state.stop { state = s.wake.wait(state).unwrap(); }
+            if paused.as_ref().is_some_and(|(p,t,_)|!state.entries.get(p).is_some_and(|e|e.pending&&e.ticket==*t)){
+                paused=None;state.parked=None;
+            }
+            while state.queue_len()==0 && paused.is_none() && !state.stop { state = s.wake.wait(state).unwrap(); }
             if state.stop { break; }
-            let (path, ticket) = state.pop_job().unwrap();
+            let (job,priority)=if let Some(job)=state.pop_priority_job(){(Some(job),true)}
+                else if let Some((p,t,_))=&paused{(Some((p.clone(),*t)),false)}
+                else{(state.pop_job(),false)};
+            let Some((path,ticket))=job else{continue;};
             if !state.entries.get(&path).is_some_and(|e| e.pending && e.ticket == ticket) { continue; }
+            let resume=if paused.as_ref().is_some_and(|(p,t,_)|p==&path&&*t==ticket){
+                state.parked=None;state.remove_queued(&path);
+                let (_,_,bytes)=paused.take().unwrap();
+                crate::core_info!("[surface-prefetch] resume path={} source_bytes={} ticket={}",path,bytes.capacity(),ticket);
+                Some(bytes)
+            }else{None};
+            let work_budget=BUDGET-paused.as_ref().map_or(0,|(_,_,b)|b.capacity());
+            // An urgent batch runs to completion before resuming speculation.
+            let allow_yield=!priority&&paused.is_none();
             state.active=Some((path.clone(),ticket));
             refill(&mut state);
             drop(state);
@@ -154,9 +217,23 @@ impl Loader {
                 let state = s.state.lock().unwrap();
                 state.stop || !state.entries.get(&path).is_some_and(|e| e.pending && e.ticket == ticket)
             };
-            let mut payload = if cancelled(){None}else{load(&path, &cancelled)}; // No cache lock, Lua or graphics calls here.
+            let should_yield=|bytes:usize|allow_yield&&bytes<=MAX_PAUSED_SOURCE&&s.state.lock().unwrap().should_yield(&path,ticket);
+            let step=if cancelled(){LoadStep::Complete(None)}else{load(&path,resume,&cancelled,&should_yield,work_budget)};
             let mut state = s.state.lock().unwrap();
             state.active=None;
+            let mut payload=match step{
+                LoadStep::Complete(p)=>p,
+                LoadStep::Paused(bytes)=>{
+                    if !state.stop&&state.entries.get(&path).is_some_and(|e|e.pending&&e.ticket==ticket){
+                        assert!(paused.is_none()&&bytes.capacity()<=MAX_PAUSED_SOURCE);
+                        crate::core_info!("[surface-prefetch] yield path={} source_bytes={} ticket={} elapsed_us={}",path,bytes.capacity(),ticket,start.elapsed().as_micros());
+                        state.parked=Some((path.clone(),ticket));paused=Some((path,ticket,bytes));
+                    }
+                    // Pending stays true: consumers must never see a partial
+                    // decode as a missing file or a completed encoded fallback.
+                    s.wake.notify_all();continue;
+                }
+            };
             if state.entries.get(&path).is_some_and(|e| e.pending && e.ticket == ticket) && !state.stop {
                 // Lock order: loader state -> retention budget. Provider retain
                 // never takes loader state and never invokes a loader callback.
@@ -260,6 +337,7 @@ impl Loader {
         let mut state=self.shared.state.lock().unwrap();
         if state.chapter==chapter{return;}
         state.chapter=chapter.into();
+        state.story_priority.clear();state.story_managed.clear();
         state.script_burst=0;
         for e in state.entries.values_mut(){e.leased=false;}
         state.entries.retain(|_,e|e.refs>0);
@@ -270,6 +348,62 @@ impl Loader {
         refill(&mut state);self.update_ready_account(&mut state);self.shared.wake.notify_all();
     }
     pub fn preload(&self,path:&str,kind:Kind){self.request(path,true,kind,true);}
+    pub fn prioritize_scene(&self,paths:&[String])->usize{
+        let mut state=self.shared.state.lock().unwrap();
+        state.scene_priority.clear();
+        if state.stop{return 0;}
+        let mut seen=std::collections::HashSet::new();
+        for path in paths{
+            let Some(key)=[path.clone(),format!("{path}.png"),format!("{path}.jpg"),format!("{path}.jpeg")]
+                .into_iter().find(|p|state.entries.contains_key(p)) else{continue;};
+            let entry=&state.entries[&key];
+            if !entry.pending||!seen.insert(key.clone()){continue;}
+            let ticket=entry.ticket;
+            state.scene_priority.push_back((key,ticket));
+        }
+        let count=state.scene_priority.len();
+        if count>0{self.shared.wake.notify_one();}
+        count
+    }
+    // Retire only direct image bindings previously observed in the standard
+    // script timeline. Dynamic/IPT/effect bindings retain their original policy.
+    // A suppressed binding still exists for Lua and can be demanded at any time.
+    pub fn update_story_plan(&self,future:&[String],current:&[String]) {
+        let mut state=self.shared.state.lock().unwrap();
+        if state.stop{return;}
+        let key=|p:&String|[p.clone(),format!("{p}.png"),format!("{p}.jpg"),format!("{p}.jpeg")]
+            .into_iter().find(|p|state.entries.contains_key(p));
+        let mut seen=std::collections::HashSet::new();
+        let future:Vec<_>=future.iter().filter_map(&key).filter(|p|{
+            let e=&state.entries[p];e.refs>0&&e.kind==Kind::Image
+                &&!crate::ui_image_lifetime::transient_menu_image(p)&&seen.insert(p.clone())
+        }).collect();
+        let protected:std::collections::HashSet<_>=current.iter().filter_map(key).collect();
+        state.story_managed.extend(future.iter().cloned());
+        let stale:Vec<_>=state.story_managed.iter().filter(|p|!seen.contains(*p)&&!protected.contains(*p)
+            &&state.entries.get(*p).is_some_and(|e|!e.demanded&&!e.story_suppressed)) .cloned().collect();
+        let mut released=0;
+        for path in &stale {
+            let e=state.entries.get_mut(path).unwrap();
+            released+=e.payload.take().map_or(0,|p|p.bytes());
+            e.pending=false;e.deferred=false;e.retry_bytes=0;e.prepared=false;e.story_suppressed=true;
+            state.remove_queued(path);
+        }
+        state.story_priority.clear();
+        for path in future {
+            if state.entries[&path].story_suppressed {
+                state.serial+=1;let ticket=state.serial;
+                let e=state.entries.get_mut(&path).unwrap();
+                e.story_suppressed=false;e.ticket=ticket;e.pending=true;e.deferred=true;e.speculative=true;
+            }
+            let e=&state.entries[&path];
+            if e.pending {let ticket=e.ticket;state.story_priority.push_back((path,ticket));}
+        }
+        refill(&mut state);self.update_ready_account(&mut state);self.refill_capacity(&mut state);
+        self.shared.wake.notify_all();
+        crate::core_info!("[surface-prefetch] story-plan future={} pending={} retired={} released_bytes={}",
+            seen.len(),state.story_priority.len(),stale.len(),released);
+    }
     fn request(&self,path:&str,asynchronous:bool,kind:Kind,lease:bool){
         let mut state = self.shared.state.lock().unwrap();
         if state.stop { return; }
@@ -277,7 +411,7 @@ impl Loader {
         let first_binding=!lease&&state.entries.get(path).is_none_or(|e|e.refs==0);
         if lease&&!already_leased&&state.entries.values().filter(|e|e.leased&&e.kind==kind).count()>=128{return;}
         if let Some(e) = state.entries.get_mut(path) { if lease{e.leased=true;}else{e.refs+=1;} }
-        else { state.entries.insert(path.into(), Entry { refs:usize::from(!lease),ticket:0,bind_order:0,prepared:false,pending:false,deferred:false,demanded:false,speculative:false,payload:None,kind,leased:lease,retry_bytes:0 }); }
+        else { state.entries.insert(path.into(), Entry { refs:usize::from(!lease),ticket:0,bind_order:0,prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:false,payload:None,kind,leased:lease,retry_bytes:0 }); }
         // A chapter hint can precede its Lua binding. Track script order apart
         // from the cancellation ticket; never invalidate an in-flight load.
         if first_binding{state.serial+=1;let order=state.serial;state.entries.get_mut(path).unwrap().bind_order=order;}
@@ -287,8 +421,12 @@ impl Loader {
             state.entries.get_mut(path).unwrap().kind=kind;
             if let Some(job)=state.remove_queued(path){state.queue_mut(kind).push_back(job);}
         }
+        state.entries.get_mut(path).unwrap().story_suppressed=false;
         if !asynchronous {state.entries.get_mut(path).unwrap().speculative=false;}
-        let needs_job=!(lease&&already_leased)&&state.entries.get(path).is_some_and(|e|!e.pending && e.payload.is_none());
+        // System-cache bindings for these menus keep reference bookkeeping,
+        // but no background IO or READY allocation while the menu is closed.
+        let lazy_ui=asynchronous&&crate::ui_image_lifetime::transient_menu_image(path);
+        let needs_job=!lazy_ui&&!(lease&&already_leased)&&state.entries.get(path).is_some_and(|e|!e.pending && e.payload.is_none());
         if needs_job {
             state.serial += 1;let ticket=state.serial;
             let e=state.entries.get_mut(path).unwrap();e.ticket=ticket;e.prepared=false;e.pending=true;e.deferred=true;e.speculative=asynchronous;e.retry_bytes=0;
@@ -318,6 +456,14 @@ impl Loader {
         let key = self.key(path)?;
         let started = std::time::Instant::now();
         let mut state = self.shared.state.lock().unwrap();
+        if (crate::ui_image_lifetime::transient_menu_image(&key)||state.entries[&key].story_suppressed)
+            && state.entries.get(&key).is_some_and(|e|!e.pending&&e.payload.is_none()) {
+            state.serial+=1;
+            let ticket=state.serial;
+            let e=state.entries.get_mut(&key)?;
+            e.ticket=ticket;e.pending=true;e.deferred=true;e.speculative=false;e.retry_bytes=0;e.story_suppressed=false;
+            refill(&mut state);self.shared.wake.notify_one();
+        }
         state.entries.get_mut(&key)?.demanded = true;
         // If demand arrives before a refill, the normal synchronous fallback
         // owns this attempt. Do not reload that consumed binding later.
@@ -334,6 +480,48 @@ impl Loader {
         drop(state);
         if started.elapsed().as_micros() >= 1000 { crate::core_info!("[surface-prefetch] demand-wait path={} us={}",path,started.elapsed().as_micros()); }
         result
+    }
+    /// Nonblocking handoff for render-thread staging. Atomically move CPU
+    /// ownership READY -> IDLE so the worker cannot spend those bytes again.
+    /// Never starts a job, decodes, waits, or consumes masks/menu/encoded data.
+    pub fn take_warm_pixels(&self, path: &str, max_bytes: usize) -> Option<Payload> {
+        let mut state = self.shared.state.try_lock().ok()?;
+        let key = [path.to_owned(), format!("{path}.png"), format!("{path}.jpg"), format!("{path}.jpeg")]
+            .into_iter().find(|p| state.entries.contains_key(p))?;
+        let entry = state.entries.get(&key)?;
+        if state.stop || entry.pending || entry.demanded || entry.story_suppressed
+            || entry.refs == 0 || entry.kind != Kind::Image
+            || crate::ui_image_lifetime::transient_menu_image(&key) { return None; }
+        let Some(Payload::Pixels(p, _, Some(_))) = &entry.payload else { return None; };
+        if p.width() == 0 || p.height() == 0 || p.width() > 4096 || p.height() > 4096
+            || entry.payload.as_ref()?.bytes() > max_bytes { return None; }
+        let cache = self.shared.cache.as_ref()?;
+        let mut account = cache.try_lock().ok()?;
+        let result = state.entries.get_mut(&key)?.payload.take()?;
+        account.set_ready_parts(state.ready_parts());
+        let idle = account.idle + result.bytes();
+        account.set_idle(idle);
+        state.update_reservation(&mut account);
+        Some(result)
+    }
+    pub fn retain_menu_images(&self, paths:&std::collections::HashSet<String>) {
+        let mut state=self.shared.state.lock().unwrap();
+        let stale:Vec<_>=state.entries.iter().filter(|(p,e)|
+            crate::ui_image_lifetime::transient_menu_image(p)&&!e.demanded
+            &&!paths.contains(*p)&&!paths.contains(p.strip_suffix(".png").unwrap_or(p))
+            &&(e.pending||e.payload.is_some()||e.retry_bytes>0))
+            .map(|(p,_)|p.clone()).collect();
+        if stale.is_empty(){return;}
+        let mut released=0;
+        for path in &stale {
+            let e=state.entries.get_mut(path).unwrap();
+            released+=e.payload.take().map_or(0,|p|p.bytes());
+            e.pending=false;e.deferred=false;e.retry_bytes=0;e.prepared=false;
+            state.remove_queued(path);
+        }
+        refill(&mut state);self.update_ready_account(&mut state);self.refill_capacity(&mut state);
+        self.shared.wake.notify_all();
+        crate::core_info!("[menu-image-release] stage=ready entries={} bytes={}",stale.len(),released);
     }
     pub fn loading(&self, path: Option<&str>) -> bool {
         let key = path.and_then(|p| self.key(p));
@@ -356,7 +544,8 @@ impl Loader {
         let mut state = self.shared.state.lock().unwrap();
         state.clear_queues();
         let active=state.active.clone();
-        for (path,e) in state.entries.iter_mut() { if e.leased{e.deferred=e.pending&&!active.as_ref().is_some_and(|(p,t)|p==path&&*t==e.ticket);}else{e.pending = false; e.deferred=false;e.retry_bytes=0;} }
+        let parked=state.parked.clone();
+        for (path,e) in state.entries.iter_mut() { if e.leased{e.deferred=e.pending&&!active.as_ref().is_some_and(|(p,t)|p==path&&*t==e.ticket)&&!parked.as_ref().is_some_and(|(p,t)|p==path&&*t==e.ticket);}else{e.pending = false; e.deferred=false;e.retry_bytes=0;} }
         refill(&mut state); // Chapter preloads have a separate lifetime from script bindings.
         self.update_ready_account(&mut state);
         self.shared.wake.notify_all(); // Active request is discarded by ticket/pending check.
@@ -413,6 +602,9 @@ fn refill(state:&mut State) {
     }
 }
 fn promote(state:&mut State,path:&str) {
+    if state.parked.as_ref().is_some_and(|(p,t)|p==path&&state.entries.get(p).is_some_and(|e|e.pending&&e.ticket==*t)){
+        state.urgent=Some(path.into());return;
+    }
     if let Some(job)=state.remove_queued(path){let kind=state.entries[path].kind;state.queue_mut(kind).push_front(job);state.urgent=Some(path.into());}
     else if state.entries.get(path).is_some_and(|e|e.pending&&e.deferred){
         if state.queue_len()==MAX_QUEUE {
@@ -442,20 +634,26 @@ fn decode_rgba(decoder: impl image::ImageDecoder, reserve: impl FnOnce(&mut Vec<
     crate::image_decode::rgba_with_reserve(decoder,BUDGET,reserve).ok()
 }
 const DECODE_READ_BUFFER: usize = 16384;
+#[cfg(test)]
 fn decoder_allowance(width:u32,height:u32,source_capacity:usize,pixel_storage:usize)->Option<usize> {
+    decoder_allowance_with_budget(width,height,source_capacity,pixel_storage,BUDGET)
+}
+fn decoder_allowance_with_budget(width:u32,height:u32,source_capacity:usize,pixel_storage:usize,budget:usize)->Option<usize> {
     if width==0 || height==0 {return None;}
     let output=(width as usize).checked_mul(height as usize)?.checked_mul(pixel_storage)?;
-    BUDGET.checked_sub(source_capacity)?.checked_sub(output)?.checked_sub(DECODE_READ_BUFFER)
+    budget.checked_sub(source_capacity)?.checked_sub(output)?.checked_sub(DECODE_READ_BUFFER)
         .filter(|remaining|*remaining>0)
 }
-fn load(path: &str, cancelled:&dyn Fn()->bool,comments:&super::png_comments::SharedComments) -> Option<Payload> {
+fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize,comments:&super::png_comments::SharedComments)->LoadStep{
+    if let Some(bytes)=resume{return decode_source(bytes,cancelled,should_yield,budget);}
+    let bytes=(||{
     for suffix in [".png", "", ".jpg", ".jpeg"] {
         if cancelled(){return None;}
         let candidate = format!("{path}{suffix}");
         let metadata_epoch=super::png_comments::prepare_epoch(comments,&candidate);
         let Some(size) = crate::ffi::query_asset_size(&candidate) else { continue; };
         if cancelled(){return None;}
-        if size > BUDGET as u64 { return None; } // Synchronous source remains the fallback.
+        if size > budget as u64 { return None; } // Synchronous source remains the fallback.
         // Size is already known: avoid a second archive/directory size lookup.
         let mut charge=Charge::reserve(Owner::Source,size as usize);
         let Some(bytes) = crate::ffi::request_asset_range(&candidate, 0, size as usize) else { continue; };
@@ -467,61 +665,85 @@ fn load(path: &str, cancelled:&dyn Fn()->bool,comments:&super::png_comments::Sha
             super::png_comments::prepare_loaded(comments,&candidate,bytes.as_slice(),epoch,cancelled);
         }
         if cancelled(){return None;}
+        return Some(bytes);
+    }
+    None
+    })();
+    match bytes{Some(b)=>decode_source(b,cancelled,should_yield,budget),None=>LoadStep::Complete(None)}
+}
+fn decode_source(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize)->LoadStep{
+        // Sticky interruption avoids restarting within the same decoder if the
+        // scene changes again between its reads. Only compressed data survives.
+        let yielded=std::cell::Cell::new(false);
+        let interrupted=||{
+            if cancelled(){return true;}
+            if yielded.get(){return true;}
+            if should_yield(bytes.capacity()){yielded.set(true);return true;}
+            false
+        };
+        let decoded=(||{
+        if interrupted(){return None;}
         // Only gray8 PNG is a candidate. Decoder color_type also checks tRNS;
         // avoid opening a second decoder for ordinary RGB/palette resources.
         if bytes.starts_with(b"\x89PNG\r\n\x1a\n")&&bytes.get(24..26)==Some(&[8,0]) {
             let w=u32::from_be_bytes(bytes[16..20].try_into().unwrap());
             let h=u32::from_be_bytes(bytes[20..24].try_into().unwrap());
             let gray=(||{
-                let allowance=decoder_allowance(w,h,bytes.capacity(),1)?;
-                let source=CancelReader{cursor:std::io::Cursor::new(bytes.as_slice()),cancelled};
+                let allowance=decoder_allowance_with_budget(w,h,bytes.capacity(),1,budget)?;
+                let source=CancelReader{cursor:std::io::Cursor::new(bytes.as_slice()),cancelled:&interrupted};
                 let mut reader=image::ImageReader::new(std::io::BufReader::with_capacity(DECODE_READ_BUFFER,source)).with_guessed_format().ok()?;
                 let mut limits=image::Limits::default();limits.max_alloc=Some(allowance as u64);reader.limits(limits);
                 let decoder=reader.into_decoder().ok()?;
-                crate::resource_ledger::decode_luma(decoder,BUDGET-bytes.capacity()-DECODE_READ_BUFFER)
+                crate::resource_ledger::decode_luma(decoder,budget-bytes.capacity()-DECODE_READ_BUFFER)
             })();
             if let Some(pixels)=gray{
-                if cancelled(){return None;}
-                return Some(Payload::Gray(w,h,pixels,bytes));
+                return Some(DecodedSource::Gray(w,h,pixels));
             }
         }
-
+        if interrupted(){return None;}
         let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice())).with_guessed_format().ok().and_then(|mut r| {
-            let mut limits=image::Limits::default();limits.max_alloc=Some(BUDGET as u64);r.limits(limits);
+            let mut limits=image::Limits::default();limits.max_alloc=Some(budget as u64);r.limits(limits);
             r.into_dimensions().ok()
         });
         // A 16-bit PNG may need eight bytes/pixel before in-place reduction to RGBA8.
         let pixel_storage=if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.get(24)==Some(&16) {8}else{4};
-        if cancelled(){return None;}
-        if let Some(allowance)=dimensions.and_then(|(w,h)|decoder_allowance(w,h,bytes.capacity(),pixel_storage)) {
-            let source=CancelReader{cursor:std::io::Cursor::new(bytes.as_slice()),cancelled};
+        if interrupted(){return None;}
+        if let Some(allowance)=dimensions.and_then(|(w,h)|decoder_allowance_with_budget(w,h,bytes.capacity(),pixel_storage,budget)) {
+            let source=CancelReader{cursor:std::io::Cursor::new(bytes.as_slice()),cancelled:&interrupted};
             if let Ok(mut reader) = image::ImageReader::new(std::io::BufReader::with_capacity(DECODE_READ_BUFFER,source)).with_guessed_format() {
                 // PNG copies this limit at construction; setting it afterwards is insufficient.
                 let mut limits = image::Limits::default(); limits.max_alloc = Some(allowance as u64);
                 reader.limits(limits);
                 let decoded=reader.into_decoder().ok().and_then(|decoder|
-                    crate::resource_ledger::decode_rgba(decoder,BUDGET).ok());
+                    crate::resource_ledger::decode_rgba(decoder,budget).ok());
                 if let Some(image) = decoded {
+                    // A complete decode is already useful; do not throw it
+                    // away merely because priority changed after its last read.
                     if cancelled(){return None;}
-                    let proof=TileProof::from_pixels(&image);
+                    let proof=TileProof::for_prepared_upload(&image);
                     if cancelled(){return None;}
-                    return Some(Payload::Pixels(image, bytes,proof));
+                    return Some(DecodedSource::Pixels(image,proof));
                 }
             }
         }
-        if cancelled(){return None;}
-        return Some(Payload::Encoded(bytes,None));
-    }
-    None
+        None
+        })();
+        if cancelled(){return LoadStep::Complete(None);}
+        if let Some(decoded)=decoded{return LoadStep::Complete(Some(match decoded{
+            DecodedSource::Gray(w,h,p)=>Payload::Gray(w,h,p,bytes),
+            DecodedSource::Pixels(p,proof)=>Payload::Pixels(p,bytes,proof),
+        }));}
+        if yielded.get(){LoadStep::Paused(bytes)}else{LoadStep::Complete(Some(Payload::Encoded(bytes,None)))}
 }
+enum DecodedSource { Gray(u32,u32,Tracked<Vec<u8>>), Pixels(Tracked<image::RgbaImage>,Option<TileProof>) }
 
 static LOADER: Mutex<Option<Arc<Loader>>> = Mutex::new(None);
 fn handle()->Option<Arc<Loader>> { LOADER.lock().unwrap().clone() }
 fn worker(comments:super::png_comments::SharedComments)->Option<Arc<Loader>> {
     let worker={
         let mut loader=LOADER.lock().unwrap();
-        if loader.is_none(){match Loader::with_policy(move|p,c|load(p,c,&comments),READY_BUDGET,Some(crate::image_cache_budget::session_budget())){
-            Ok(worker)=>{*loader=Some(Arc::new(worker));crate::core_info!("[surface-prefetch] worker started budget={} shared_budget={} decode_limit={} queue={} deferred=1 priority=lua-first-v1 script_burst={} protect_bound_pixels=1",READY_BUDGET,crate::image_cache_budget::SESSION_RETENTION_BYTES,BUDGET,MAX_QUEUE,SCRIPT_PREFETCH_BURST);}
+        if loader.is_none(){match Loader::with_steps(move|p,r,c,y,b|load(p,r,c,y,b,&comments),READY_BUDGET,Some(crate::image_cache_budget::session_budget())){
+            Ok(worker)=>{*loader=Some(Arc::new(worker));crate::core_info!("[surface-prefetch] worker started budget={} shared_budget={} decode_limit={} queue={} deferred=1 priority=lua-first-v1 script_burst={} protect_bound_pixels=1 cooperative_decode=1 paused_source_limit={}",READY_BUDGET,crate::image_cache_budget::SESSION_RETENTION_BYTES,BUDGET,MAX_QUEUE,SCRIPT_PREFETCH_BURST,MAX_PAUSED_SOURCE);}
             Err(e)=>{crate::core_warn!("[surface-prefetch] worker unavailable: {}",e);return None;}
         }}
         loader.as_ref().unwrap().clone()
@@ -537,6 +759,15 @@ pub(super) fn preload(paths:&[String],kind:Kind,chapter:Option<&str>,comments:su
     }
 }
 pub(super) fn take(path:&str)->Option<Payload>{handle()?.take(path)}
+pub(super) fn take_warm_pixels(path:&str,max:usize)->Option<Payload>{handle()?.take_warm_pixels(path,max)}
+pub(super) fn update_story_plan(future:&[String],current:&[String]){if let Some(l)=handle(){l.update_story_plan(future,current);}}
+pub(super) fn retain_menu_images(paths:&std::collections::HashSet<String>){if let Some(l)=handle(){l.retain_menu_images(paths);}}
+pub(super) fn prioritize_scene(paths:&[String]){
+    if let Some(loader)=handle(){
+        let count=loader.prioritize_scene(paths);
+        if count>0{crate::core_info!("[surface-prefetch] scene-priority pending={} resources={}",count,paths.len());}
+    }
+}
 pub(super) fn loading(path:Option<&str>)->bool{handle().is_some_and(|l|l.loading(path))}
 pub(super) fn unbind(path:&str){if let Some(l)=handle(){l.unbind(path);}}
 pub(super) fn cancel(){if let Some(l)=handle(){l.cancel();}}
@@ -545,6 +776,379 @@ pub(super) fn shutdown(){let loader=LOADER.lock().unwrap().take();if let Some(l)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warm_handoff_is_nonblocking_filtered_and_transfers_budget_once() {
+        let budget=crate::image_cache_budget::CacheBudget::new(4096);
+        let loader=Loader::with_policy(|name,_| {
+            if name=="compressed" {return Some(Payload::encoded(vec![7;16]));}
+            let image=image::RgbaImage::from_pixel(4,4,image::Rgba([8,9,10,128]));
+            let proof=TileProof::for_prepared_upload(&image);
+            Some(Payload::Pixels(image.into(),vec![1;8].into(),proof))
+        },4096,Some(budget.clone())).unwrap();
+        for path in ["future.png","compressed","pc/en/save/button.png"] {loader.bind(path,false);}
+        let before=budget.lock().unwrap().ready;
+        assert!(loader.take_warm_pixels("missing",4096).is_none());
+        assert!(loader.take_warm_pixels("compressed",4096).is_none());
+        assert!(loader.take_warm_pixels("pc/en/save/button.png",4096).is_none());
+        assert!(loader.take_warm_pixels("future",1).is_none());
+        {let _held=loader.shared.state.lock().unwrap();assert!(loader.take_warm_pixels("future",4096).is_none());}
+        {let _held=budget.lock().unwrap();assert!(loader.take_warm_pixels("future",4096).is_none());}
+        let warm=loader.take_warm_pixels("future",4096).unwrap();let bytes=warm.bytes();
+        assert!(loader.take_warm_pixels("future",4096).is_none());
+        {let b=budget.lock().unwrap();assert_eq!(b.ready,before-bytes);assert_eq!(b.idle,bytes);}
+        assert!(loader.take("future").is_none());
+        loader.shutdown();let mut b=budget.lock().unwrap();assert_eq!(b.ready,0);b.set_idle(0);
+    }
+    #[test]
+    fn menu_bindings_are_lazy_and_reopen_without_accumulating_references() {
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let reads=Arc::new(AtomicUsize::new(0));let count=reads.clone();
+        let budget=crate::image_cache_budget::CacheBudget::new(1024);
+        let loader=Loader::with_policy(move|_,_|{count.fetch_add(1,Ordering::SeqCst);Some(Payload::encoded(vec![3;32]))},1024,Some(budget.clone())).unwrap();
+        for path in ["pc/cn/conf/bg.png","pc/cn/save/bg_save.png","pc/cn/save/bg_load.png"] {
+        let before=reads.load(Ordering::SeqCst);
+        loader.bind(path,true);
+        assert!(!loader.loading(None));assert_eq!(reads.load(Ordering::SeqCst),before);
+        assert_eq!(budget.lock().unwrap().ready,0);
+        assert_eq!(budget.lock().unwrap().script_preload.planned,0);
+        for _ in 0..3 {
+            assert_eq!(loader.take(path).unwrap().bytes(),32);
+            loader.retain_menu_images(&Default::default());
+            assert_eq!(loader.shared.state.lock().unwrap().entries[path].refs,1);
+            assert_eq!(budget.lock().unwrap().ready,0);
+        }
+        assert_eq!(reads.load(Ordering::SeqCst),before+3);
+        loader.unbind(path);assert!(loader.key(path).is_none());
+        }
+    }
+    #[test]
+    fn menu_release_preserves_scene_references_and_other_preloads() {
+        let budget=crate::image_cache_budget::CacheBudget::new(1024);
+        let loader=Loader::with_policy(|_,_|Some(Payload::encoded(vec![7;32])),1024,Some(budget.clone())).unwrap();
+        let path="vita/ja/blog/bg.png";
+        loader.bind(path,false);loader.bind("image/bg/room",false);
+        loader.retain_menu_images(&std::collections::HashSet::from(["vita/ja/blog/bg".into()]));
+        assert_eq!(budget.lock().unwrap().ready,64);
+        loader.retain_menu_images(&Default::default());
+        assert_eq!(budget.lock().unwrap().ready,32);
+        assert!(!loader.loading(None));
+        assert!(loader.take("image/bg/room").is_some());
+        assert!(loader.take(path).is_some());
+    }
+    #[test]
+    fn closing_menu_cancels_inflight_warmup_without_republishing_old_pixels() {
+        let (started_tx,started_rx)=std::sync::mpsc::channel();
+        let (go_tx,go_rx)=std::sync::mpsc::channel();
+        let loader=Arc::new(Loader::with_policy(move|_,cancelled|{
+            started_tx.send(()).unwrap();go_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            assert!(cancelled());Some(Payload::encoded(vec![4;32]))
+        },1024,None).unwrap());
+        let path="pc/cn/blog/bg.png";
+        let other=loader.clone();let waiter=std::thread::spawn(move||other.bind(path,false));
+        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        loader.retain_menu_images(&Default::default());
+        waiter.join().unwrap();assert!(!loader.loading(None));
+        go_tx.send(()).unwrap();
+        loader.shutdown();
+        assert!(loader.shared.state.lock().unwrap().entries.is_empty());
+    }
+    #[test]
+    fn paused_source_stays_pending_and_resumes_after_urgent_batch_without_reread(){
+        let (started_tx,started_rx)=std::sync::mpsc::channel();
+        let (go_tx,go_rx)=std::sync::mpsc::channel();
+        let (body_tx,body_rx)=std::sync::mpsc::channel();
+        let (body_go_tx,body_go_rx)=std::sync::mpsc::channel();
+        let (done_tx,done_rx)=std::sync::mpsc::channel();
+        let source_address=Arc::new(std::sync::atomic::AtomicUsize::new(0));let ptr=source_address.clone();
+        let loader=Loader::with_steps(move|p,resume,c,y,budget|{
+            assert!(!c());
+            if p=="background"&&resume.is_none(){
+                let source=Tracked::bytes(vec![7;1024],Owner::Source);
+                ptr.store(source.as_ptr() as usize,std::sync::atomic::Ordering::Relaxed);
+                started_tx.send(()).unwrap();go_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                assert!(!y(MAX_PAUSED_SOURCE+1));assert!(y(source.capacity()));
+                return LoadStep::Paused(source);
+            }
+            if p=="body"||p=="face"{
+                assert_eq!(budget,BUDGET-1024);assert!(!y(1024));assert!(resume.is_none());
+            }
+            if p=="body"{body_tx.send(()).unwrap();body_go_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();}
+            let source=if p=="background"{
+                let source=resume.unwrap();assert_eq!(budget,BUDGET);
+                assert_eq!(source.as_ptr() as usize,ptr.load(std::sync::atomic::Ordering::Relaxed));source
+            }else{vec![1].into()};
+            done_tx.send(p.to_string()).unwrap();LoadStep::Complete(Some(Payload::Encoded(source,None)))
+        },4096,None).unwrap();
+        loader.bind("background",true);started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        loader.bind("later",true);loader.bind("body",true);loader.bind("face",true);
+        loader.prioritize_scene(&["body".into(),"face".into()]);go_tx.send(()).unwrap();
+        body_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        {let state=loader.shared.state.lock().unwrap();
+            assert!(state.entries["background"].pending);assert!(!state.entries["background"].prepared);
+            assert!(state.entries["background"].payload.is_none());assert!(state.parked.is_some());
+            assert_eq!(state.script_preload_counts().completed,0);
+        }
+        body_go_tx.send(()).unwrap();
+        for expected in ["body","face","background","later"]{assert_eq!(done_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),expected);}
+        assert!(loader.take("background").is_some());assert!(loader.shared.state.lock().unwrap().parked.is_none());
+    }
+
+    #[test]
+    fn paused_sources_obey_cancel_rebind_and_chapter_lifetimes(){
+        // Script cancellation drops suspended bindings, chapter changes drop
+        // old leases, and leased work survives script queue cancellation.
+        for mode in 0..4{
+            let (started_tx,started_rx)=std::sync::mpsc::channel();let (go_tx,go_rx)=std::sync::mpsc::channel();
+            let (urgent_tx,urgent_rx)=std::sync::mpsc::channel();let (finish_tx,finish_rx)=std::sync::mpsc::channel();
+            let reads=Arc::new(std::sync::atomic::AtomicUsize::new(0));let n=reads.clone();
+            let resumes=Arc::new(std::sync::atomic::AtomicUsize::new(0));let r=resumes.clone();
+            let loader=Loader::with_steps(move|p,resume,_,y,_|{
+                if p=="background"{
+                    if let Some(bytes)=resume{r.fetch_add(1,std::sync::atomic::Ordering::Relaxed);return LoadStep::Complete(Some(Payload::Encoded(bytes,None)));}
+                    if n.fetch_add(1,std::sync::atomic::Ordering::Relaxed)==0{
+                        started_tx.send(()).unwrap();go_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                        assert!(y(8));return LoadStep::Paused(vec![8;8].into());
+                    }
+                }
+                if p=="urgent"{urgent_tx.send(()).unwrap();finish_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();}
+                LoadStep::Complete(Some(Payload::encoded(vec![9])))
+            },1024,None).unwrap();
+            if mode>=2{loader.begin_chapter("old");loader.preload("background",Kind::Image);}else{loader.bind("background",true);}
+            started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            loader.bind("urgent",true);loader.prioritize_scene(&["urgent".into()]);go_tx.send(()).unwrap();
+            urgent_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            match mode{0=>loader.cancel(),1=>{loader.unbind("background");loader.bind("background",true);},2=>loader.begin_chapter("next"),_=>loader.cancel()}
+            loader.bind("barrier",true);finish_tx.send(()).unwrap();loader.wait("barrier");
+            let result=loader.take("background");
+            assert_eq!(result.is_some(),mode==1||mode==3);
+            assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed),if mode==1{2}else{1});
+            assert_eq!(resumes.load(std::sync::atomic::Ordering::Relaxed),usize::from(mode==3));
+            assert!(loader.shared.state.lock().unwrap().parked.is_none());
+        }
+    }
+
+    #[test]
+    fn real_png_decode_can_yield_and_resume_same_source_with_exact_pixels(){
+        use image::ImageEncoder;
+        for channels in [1usize,4]{
+            let raw:Vec<u8>=(0..256*256*channels).map(|i|((i.wrapping_mul(37)^(i/257).wrapping_mul(19))%251)as u8).collect();
+            let mut png=Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png).write_image(&raw,256,256,
+                if channels==1{image::ExtendedColorType::L8}else{image::ExtendedColorType::Rgba8}).unwrap();
+            let address=png.as_ptr();let checks=std::cell::Cell::new(0);
+            let step=decode_source(png.into(),&||false,&|_|{let n=checks.get()+1;checks.set(n);n>=6},BUDGET);
+            let LoadStep::Paused(source)=step else{panic!("decoder did not yield");};
+            assert_eq!(source.as_ptr(),address);assert!(checks.get()>=6);
+            match decode_source(source,&||false,&|_|false,BUDGET){
+                LoadStep::Complete(Some(Payload::Gray(256,256,p,b)))=>{assert_eq!(channels,1);assert_eq!(p.as_slice(),raw);assert_eq!(b.as_ptr(),address);},
+                LoadStep::Complete(Some(Payload::Pixels(p,b,_)))=>{assert_eq!(channels,4);assert_eq!(p.as_raw(),&raw);assert_eq!(b.as_ptr(),address);},
+                _=>panic!("resume did not produce pixels"),
+            }
+        }
+        assert!(matches!(decode_source(vec![1,2,3].into(),&||true,&|_|true,BUDGET),LoadStep::Complete(None)));
+        assert!(matches!(decode_source(vec![1,2,3].into(),&||false,&|_|false,BUDGET),LoadStep::Complete(Some(Payload::Encoded(..)))));
+    }
+    #[test]
+    fn parked_demand_preempts_scene_batch_and_shutdown_discards_parked_work(){
+        for shutdown in [false,true]{
+            let (start_tx,start_rx)=std::sync::mpsc::channel();let (go_tx,go_rx)=std::sync::mpsc::channel();
+            let (urgent_tx,urgent_rx)=std::sync::mpsc::channel();let (finish_tx,finish_rx)=std::sync::mpsc::channel();
+            let (done_tx,done_rx)=std::sync::mpsc::channel();
+            let loader=Arc::new(Loader::with_steps(move|p,resume,c,y,_|{
+                if p=="background"&&resume.is_none(){
+                    start_tx.send(()).unwrap();go_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                    assert!(y(8));return LoadStep::Paused(vec![7;8].into());
+                }
+                if p=="urgent"{urgent_tx.send(()).unwrap();finish_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();assert_eq!(c(),shutdown);}
+                done_tx.send(p.to_string()).unwrap();LoadStep::Complete(Some(Payload::encoded(vec![1])))
+            },1024,None).unwrap());
+            loader.bind("background",true);start_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            loader.bind("urgent",true);loader.bind("face",true);loader.prioritize_scene(&["urgent".into(),"face".into()]);
+            go_tx.send(()).unwrap();urgent_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let other=loader.clone();
+            if shutdown{
+                let joined=std::thread::spawn(move||other.shutdown());
+                let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+                while !loader.shared.state.lock().unwrap().stop{assert!(std::time::Instant::now()<deadline);std::thread::yield_now();}
+                assert!(loader.take("background").is_none());finish_tx.send(()).unwrap();joined.join().unwrap();
+                assert_eq!(done_rx.try_iter().collect::<Vec<_>>(),["urgent"]);
+            }else{
+                let consumer=std::thread::spawn(move||other.take("background").is_some());
+                let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+                while !loader.shared.state.lock().unwrap().entries["background"].demanded{assert!(std::time::Instant::now()<deadline);std::thread::yield_now();}
+                finish_tx.send(()).unwrap();assert!(consumer.join().unwrap());loader.wait("face");
+                assert_eq!(done_rx.try_iter().collect::<Vec<_>>(),["urgent","background","face"]);
+            }
+        }
+    }
+    #[test]
+    fn scene_batch_finishes_body_face_and_mask_before_unrelated_prefetch(){
+        let (started_tx,started_rx)=std::sync::mpsc::channel();
+        let (go_tx,go_rx)=std::sync::mpsc::channel();
+        let (loaded_tx,loaded_rx)=std::sync::mpsc::channel();
+        let loader=Loader::new(move|path,_|{
+            if path=="active"{
+                started_tx.send(()).unwrap();
+                go_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            }
+            loaded_tx.send(path.to_string()).unwrap();
+            Some(Payload::encoded(vec![1]))
+        }).unwrap();
+        loader.bind("active",true);
+        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        loader.bind("later-background",true);
+        loader.bind("body.png",true);
+        loader.bind("face",true);
+        loader.preload("mask.png",Kind::Mask);
+        let paths=["active","body","face","mask","body.png","generated"].map(String::from);
+        assert_eq!(loader.prioritize_scene(&paths),4);
+        {let state=loader.shared.state.lock().unwrap();
+            assert_eq!(state.entries.len(),5);
+            assert_eq!(state.entries["body.png"].refs,1);
+            assert_eq!(state.entries["mask.png"].refs,0);
+        }
+        go_tx.send(()).unwrap();
+        // No take() here: the batch alone must keep the face/mask ahead of
+        // speculative reads during the body's eventual foreground upload.
+        for expected in ["active","body.png","face","mask.png","later-background"]{
+            assert_eq!(loaded_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),expected);
+        }
+        assert!(loader.take("body").is_some());
+        assert!(loader.take("face").is_some());
+        assert!(loader.take("mask").is_some());
+        loader.unbind("body.png");
+        assert!(loader.key("body").is_none());
+    }
+
+    #[test]
+    fn timeline_to_loader_keeps_decoded_pixels_during_deferred_scene_commit(){
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let reads=Arc::new(AtomicUsize::new(0));let calls=reads.clone();
+        let loader=Loader::new(move|_,_|{calls.fetch_add(1,Ordering::SeqCst);Some(Payload::encoded(vec![1;8]))}).unwrap();
+        let it=asb_interpreter::Interpreter::new(Default::default());
+        it.lua().load(r#"
+            scr={ip={file='chapter',block='a',count=1}};
+            game={fgext='.png'};init={fgid={face=1}};
+            cachebuff={img={background=true,['body.png']=true,['face.png']=true,later=true}};
+            ast={a={{'bg',path='',file='background'},{'fg',path='',file='body',face='face'},
+                    {'text'},linknext='b'},b={{'bg',path='',file='later'},{'text'}}};
+        "#).exec().unwrap();
+        // Use real, nonempty virtual directories as required by the protocol.
+        it.lua().load(r#"
+            for _,block in pairs(ast) do for _,tag in ipairs(block) do
+                if tag.path then tag.path='images/' end
+            end end
+            cachebuff.img={['images/background']=true,['images/body.png']=true,['images/face.png']=true,['images/later']=true}
+        "#).exec().unwrap();
+        let names=["images/background","images/body.png","images/face.png","images/later"];
+        for name in names{loader.bind(name,false);}
+        let mut cursor=asb_interpreter::SurfaceTimelineCursor::default();
+        let plan=it.query_surface_timeline(&mut cursor).unwrap();loader.update_story_plan(&plan,&[]);
+        // The interpreter has advanced, but image_loop/extrans has not yet
+        // published any new scene files. This used to discard all three images.
+        it.lua().load("scr.ip.count=3").exec().unwrap();
+        if let Some(plan)=it.query_surface_timeline(&mut cursor){loader.update_story_plan(&plan,&[]);}
+        for name in &names[..3]{assert!(loader.take(name).is_some());}
+        assert_eq!(reads.load(Ordering::SeqCst),4,"all visible images must consume the original READY data");
+        it.lua().load("scr.ip.block='b';scr.ip.count=2").exec().unwrap();
+        let plan=it.query_surface_timeline(&mut cursor).unwrap();
+        loader.update_story_plan(&plan,&names[..3].iter().map(|s|s.to_string()).collect::<Vec<_>>());
+        assert!(loader.take(names[3]).is_some());
+        assert_eq!(reads.load(Ordering::SeqCst),4);
+    }
+
+    #[test]
+    fn story_plan_cancels_passed_jobs_keeps_reuse_and_reloads_on_backtrack(){
+        let (started_tx,started_rx)=std::sync::mpsc::channel();
+        let (go_tx,go_rx)=std::sync::mpsc::channel();
+        let (loaded_tx,loaded_rx)=std::sync::mpsc::channel();
+        let loader=Loader::new(move|p,_|{
+            if p=="old"{started_tx.send(()).unwrap();go_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();}
+            loaded_tx.send(p.to_string()).unwrap();Some(Payload::encoded(vec![1]))
+        }).unwrap();
+        loader.bind("old",true);started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        for p in ["skipped","far","body.png","face","reused"]{loader.bind(p,true);}
+        loader.update_story_plan(&["old","skipped","far","body","face","reused"].map(String::from),&[]);
+        loader.update_story_plan(&["body","face","reused","far"].map(String::from),&[]);
+        {let state=loader.shared.state.lock().unwrap();
+            assert!(!state.entries["old"].pending);assert!(state.entries["skipped"].story_suppressed);
+            assert_eq!(state.entries["old"].refs,1);
+        }
+        go_tx.send(()).unwrap();
+        for expected in ["old","body.png","face","reused","far"]{
+            assert_eq!(loaded_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),expected);
+        }
+        loader.wait("far");
+        {let state=loader.shared.state.lock().unwrap();assert!(state.entries["old"].payload.is_none());}
+        // Reverse navigation revives the same binding, without growing refs.
+        loader.update_story_plan(&["skipped".into()],&["body".into()]);
+        loader.wait("skipped");
+        {let state=loader.shared.state.lock().unwrap();
+            assert_eq!(state.entries["skipped"].refs,1);assert!(state.entries["skipped"].payload.is_some());
+            assert!(state.entries["body.png"].payload.is_some());
+            assert!(state.entries["face"].payload.is_none());
+        }
+        // Dynamic demand outside the inferred path also revives a binding.
+        assert!(loader.take("face").is_some());
+        assert_eq!(loader.shared.state.lock().unwrap().entries["face"].refs,1);
+    }
+
+    #[test]
+    fn story_plan_does_not_retire_unknown_or_effect_bindings(){
+        let loader=Loader::new(|_,_|Some(Payload::encoded(vec![1;8]))).unwrap();
+        for p in ["current.png","previous","dynamic","future"]{loader.bind(p,false);}
+        loader.preload("mask",Kind::Mask);loader.wait("mask");
+        loader.update_story_plan(&["current","previous","future","mask"].map(String::from),&[]);
+        loader.update_story_plan(&["future".into()],&["current".into()]);
+        let state=loader.shared.state.lock().unwrap();
+        assert!(state.entries["current.png"].payload.is_some());
+        assert!(state.entries["dynamic"].payload.is_some());
+        assert!(state.entries["mask"].payload.is_some());
+        assert!(state.entries["future"].payload.is_some());
+        assert!(state.entries["previous"].payload.is_none());
+        assert_eq!(state.script_preload_counts().planned,3);
+    }
+
+    #[test]
+    fn scene_priority_preserves_bounded_queues_and_rejects_stale_tickets(){
+        let mut state=State::default();
+        for i in 0..100{
+            state.entries.insert(format!("q{i}"),Entry{refs:1,ticket:i,bind_order:i,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,retry_bytes:0});
+        }
+        refill(&mut state);
+        state.scene_priority=VecDeque::from([("q99".into(),99),("q98".into(),98),("q97".into(),96)]);
+        promote(&mut state,"q0");
+        assert_eq!(state.pop_job().unwrap().0,"q0");
+        let mut seen=std::collections::HashSet::from(["q0".to_owned()]);
+        for expected in ["q99","q98","q1"]{
+            let (path,_)=state.pop_job().unwrap();assert_eq!(path,expected);assert!(seen.insert(path));
+            refill(&mut state);assert!(state.queue_len()<=MAX_QUEUE);
+        }
+        while let Some((path,_))=state.pop_job(){assert!(seen.insert(path));refill(&mut state);assert!(state.queue_len()<=MAX_QUEUE);}
+        assert_eq!(seen.len(),100);
+        state.scene_priority.push_back(("q1".into(),1));state.clear_queues();
+        assert!(state.scene_priority.is_empty());
+    }
+
+    #[test]
+    fn scene_priority_replacement_does_not_keep_obsolete_scene_jobs_urgent(){
+        let (started_tx,started_rx)=std::sync::mpsc::channel();
+        let (go_tx,go_rx)=std::sync::mpsc::channel();
+        let (loaded_tx,loaded_rx)=std::sync::mpsc::channel();
+        let loader=Loader::new(move|p,_|{
+            if p=="active"{started_tx.send(()).unwrap();go_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();}
+            loaded_tx.send(p.to_string()).unwrap();Some(Payload::encoded(vec![1]))
+        }).unwrap();
+        loader.bind("active",true);started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        loader.bind("ordinary",true);loader.bind("old",true);loader.bind("new",true);
+        loader.prioritize_scene(&["old".into()]);
+        loader.prioritize_scene(&["new".into()]);
+        go_tx.send(()).unwrap();
+        for expected in ["active","new","ordinary","old"]{
+            assert_eq!(loaded_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),expected);
+        }
+    }
+
     #[test] fn script_hud_counts_unique_live_bindings_and_preserves_completed_handoff(){
         use crate::image_cache_budget::ScriptPreloadCounts as Counts;
         let budget=crate::image_cache_budget::CacheBudget::new(1024);
@@ -682,7 +1286,7 @@ mod tests {
     }
     #[test] fn three_lanes_share_queue_limit_and_urgent_demand_beats_rotation(){
         let mut s=State::default();
-        for i in 0..100{let kind=[Kind::Image,Kind::Mask,Kind::Animation][i%3];s.entries.insert(format!("p{i}"),Entry{refs:1,ticket:i as u64,bind_order:i as u64,prepared:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind,leased:false,retry_bytes:0});}
+        for i in 0..100{let kind=[Kind::Image,Kind::Mask,Kind::Animation][i%3];s.entries.insert(format!("p{i}"),Entry{refs:1,ticket:i as u64,bind_order:i as u64,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind,leased:false,retry_bytes:0});}
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         assert_eq!(s.pop_job().unwrap().0,"p0");assert_eq!(s.pop_job().unwrap().0,"p1");assert_eq!(s.pop_job().unwrap().0,"p2");assert_eq!(s.pop_job().unwrap().0,"p3");
         refill(&mut s);promote(&mut s,"p99");assert_eq!(s.queue_len(),MAX_QUEUE);assert_eq!(s.pop_job().unwrap().0,"p99");
@@ -690,11 +1294,11 @@ mod tests {
     #[test] fn lua_jobs_bypass_full_supplement_queue_but_effects_are_not_starved(){
         let mut s=State::default();
         for i in 0..80{
-            s.entries.insert(format!("effect{i}"),Entry{refs:0,ticket:i,bind_order:0,prepared:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,retry_bytes:0});
+            s.entries.insert(format!("effect{i}"),Entry{refs:0,ticket:i,bind_order:0,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,retry_bytes:0});
         }
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         for i in 0..9{
-            s.entries.insert(format!("lua{i}"),Entry{refs:1,ticket:100+i,bind_order:100+i,prepared:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,retry_bytes:0});
+            s.entries.insert(format!("lua{i}"),Entry{refs:1,ticket:100+i,bind_order:100+i,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,retry_bytes:0});
         }
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         for expected in ["lua0","lua1","lua2","lua3","effect0","lua4","lua5","lua6","lua7","effect1","lua8"]{
@@ -753,7 +1357,7 @@ mod tests {
     #[test] fn capacity_refill_prefers_lua_order_over_earlier_chapter_tickets(){
         let mut s=State::default();
         for (path,refs,ticket,bind_order) in [("effect",0,1,0),("second",1,2,20),("first",1,3,10)]{
-            s.entries.insert(path.into(),Entry{refs,ticket,bind_order,prepared:false,pending:false,deferred:false,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,retry_bytes:72});
+            s.entries.insert(path.into(),Entry{refs,ticket,bind_order,prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,retry_bytes:72});
         }
         assert!(retry_capacity(&mut s,72));
         assert_eq!(s.pop_job().unwrap().0,"first");

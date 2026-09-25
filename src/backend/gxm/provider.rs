@@ -1,3 +1,4 @@
+mod warm;
 use crate::render_pipeline::draw::{
     TextureId, TextureInfo, TextureProvider, masked_texture_name, solid_texture_name,
 };
@@ -143,14 +144,21 @@ pub struct GxmTextureProvider {
     timing_started: Instant,
     upload_retry_pending: bool,
     upload_reclaim_bytes: usize,
+    transient_save_directory: Option<String>,
+    warm: warm::WarmState,
 }
 
 impl GxmTextureProvider {
+    pub fn set_save_image_directory(&mut self,path:&str) {
+        if self.transient_save_directory.as_deref()!=Some(path) {
+            self.transient_save_directory=Some(path.to_owned());
+        }
+    }
     // Sample at the existing bounded log cadence, never scan pixels or take
     // loader state. Optional prepared CPU backups are charged even while active.
     fn idle_parts(&self)->crate::image_cache_budget::CacheParts{
         use crate::image_cache_budget::CacheParts;
-        let mut parts=CacheParts::default();
+        let mut parts=self.warm.parts();
         for e in self.entries.values(){
             if e.shared||e.reclaimable{parts.decoded+=e.rgba.capacity();}
             if e.reclaimable{parts.gpu+=e.cache_bytes()-e.rgba.capacity();}
@@ -163,6 +171,7 @@ impl GxmTextureProvider {
     /// reclaim cold GPU residency once after decoder allocation fails. Never
     /// resolve/decode, copy shared pixels back, or call the loader from here.
     pub fn reclaim_video_gpu_cache(&mut self,requested:usize)->usize {
+        self.cancel_warm_upload();
         self.reclaim_idle_gpu_cache(requested,"video-cache-reclaim")
     }
     fn reclaim_idle_gpu_cache(&mut self,requested:usize,reason:&str)->usize {
@@ -241,6 +250,8 @@ impl GxmTextureProvider {
             timing_started: Instant::now(),
             upload_retry_pending:false,
             upload_reclaim_bytes:0,
+            transient_save_directory:None,
+            warm:Default::default(),
         }
     }
 
@@ -290,6 +301,7 @@ impl GxmTextureProvider {
     }
 
     pub fn evict_prefix(&mut self, prefix: &str) -> usize {
+        if self.warm.job.as_ref().is_some_and(|j|j.name.starts_with(prefix)){self.cancel_warm_upload();}
         let names=self.entries.keys().chain(self.decoded.keys()).chain(self.encoded.keys())
             .filter(|name|name.starts_with(prefix)).cloned().collect::<HashSet<_>>();
         for name in &names {self.remove(name);self.decoded.remove(name);self.encoded.remove(name);}
@@ -328,6 +340,7 @@ impl GxmTextureProvider {
         self.upload_prepared(name,width,height,pixels,video,retain_pixels,None)
     }
     fn upload_prepared(&mut self,name:&str,width:u32,height:u32,mut pixels:PixelStorage<'_>,video:bool,retain_pixels:bool,proof:Option<&TileProof>)->Option<(TextureId,TextureInfo)>{
+        if self.warm.job.as_ref().is_some_and(|j|j.name==name){self.cancel_warm_upload();}
         if let PixelStorage::Owned(p)=&mut pixels {p.transfer(Owner::Temporary);}
         let rgba = pixels.as_ref();
         let expected = width as usize * height as usize * 4;
@@ -508,6 +521,7 @@ impl Drop for GxmTextureProvider {
 
 impl TextureProvider for GxmTextureProvider {
     fn resolve(&mut self, name: &str) -> Option<(TextureId, TextureInfo)> {
+        if self.warm.job.as_ref().is_some_and(|job|job.name==name){self.cancel_warm_upload();}
         self.cache_clock = self.cache_clock.saturating_add(1);
         if let Some(entry) = self.entries.get_mut(name) {
             entry.last_used = self.cache_clock;entry.reclaimable=false;
@@ -748,6 +762,7 @@ impl TextureProvider for GxmTextureProvider {
     fn retain(&mut self, names: &HashSet<String>) {
         // Keep admission serialized with loader publication. No loader calls
         // (or waits for loader tickets) occur while this budget lock is held.
+        self.cancel_warm_under_pressure();
         let cache=self.cache_budget.clone();
         let mut account=cache.as_ref().map(|b|b.lock().unwrap());
         let idle_limit=account.as_ref().map_or(self.idle_budget,|b|b.idle_limit(self.idle_budget));
@@ -758,13 +773,25 @@ impl TextureProvider for GxmTextureProvider {
             crate::core_info!("GXM texture-perf wall_us={} reads={} missing={} decoded={} decode_errors={} uploads={} upload_errors={} upload_bytes={} read_us={} decode_us={} upload_us={} upload_max_us={}",
                 wall_us, t.reads, t.missing, t.decoded, t.decode_errors, t.uploads, t.upload_errors, t.upload_bytes, t.read_us, t.decode_us, t.upload_us, t.upload_max_us);
         }
+        // Transition/current-scene names are already included by the caller.
+        // Once no longer referenced, menu art must leave every cache tier,
+        // even when there is plenty of shared retention budget available.
+        let menu_stale:HashSet<_>=self.entries.keys().chain(self.decoded.keys()).chain(self.encoded.keys())
+            .filter(|n|!names.contains(*n)&&(crate::ui_image_lifetime::transient_menu_image(n)
+                ||self.transient_save_directory.as_deref().is_some_and(|p|crate::ui_image_lifetime::image_in_save_directory(n,p))))
+            .cloned().collect();
+        if !menu_stale.is_empty(){
+            let before=self.idle_parts().total();
+            for name in &menu_stale{self.remove(name);self.decoded.remove(name);self.encoded.remove(name);}
+            crate::core_info!("[menu-image-release] stage=provider entries={} idle_bytes={}",menu_stale.len(),before.saturating_sub(self.idle_parts().total()));
+        }
         let stale = self.entries.iter_mut().filter_map(|(name,entry)|{
             let stale=!names.contains(name)&&!name.starts_with("__solid_");
             entry.reclaimable=entry.cacheable&&stale;
             stale.then(||name.clone())
         }).collect::<Vec<_>>();
         let mut idle = Vec::new();
-        let mut idle_bytes = self.decoded.values().map(|e|e.rgba.capacity()).sum::<usize>()
+        let mut idle_bytes = self.warm.parts().total()+self.decoded.values().map(|e|e.rgba.capacity()).sum::<usize>()
             +self.encoded.values().map(EncodedEntry::capacity).sum::<usize>()
             +self.entries.values().filter(|e|e.shared).map(|e|e.rgba.capacity()).sum::<usize>();
         for name in stale {
@@ -788,7 +815,7 @@ impl TextureProvider for GxmTextureProvider {
         // GPU and decoded copies retain their existing shared recency order.
         // Sources cannot occupy more than 1/4 of this same total budget.
         reclaim.sort_unstable_by(|a,b|(a.2==2,a.0,&a.1,a.2).cmp(&(b.2==2,b.0,&b.1,b.2)));
-        let mut idle_gpu=self.entries.values().filter(|e|e.reclaimable)
+        let mut idle_gpu=self.warm.parts().gpu+self.entries.values().filter(|e|e.reclaimable)
             .map(|e|e.cache_bytes()-e.rgba.capacity()).sum::<usize>();
         let gpu_limit=IDLE_GPU_BUDGET.min(idle_limit);
         for (_,name,tier,gpu_bytes) in reclaim {
@@ -1190,6 +1217,17 @@ mod tests {
     static FAIL_SURFACE:AtomicUsize=AtomicUsize::new(0);
     static ABORTED:AtomicUsize=AtomicUsize::new(0);
     #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_surface_warm_allowed(_:usize)->i32{1}
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_surface_publish_strided(p:usize,id:u64,proof:*const u8,count:usize)->i32{
+        if FAIL_SURFACE.load(Ordering::Relaxed)==2{return 0;}
+        let s=unsafe{Box::from_raw(p as *mut MockSurface)};
+        let cert=unsafe{std::slice::from_raw_parts(proof,count)};
+        assert_eq!(u32::from_le_bytes(cert[4..8].try_into().unwrap()) as usize,s.w);
+        assert_eq!(u32::from_le_bytes(cert[8..12].try_into().unwrap()) as usize,s.h);
+        NATIVE.lock().unwrap().get_or_insert_with(HashMap::new).insert(id,*s);1
+    }
+    #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_surface_prepare(w:u32,h:u32,p:*mut *mut u8,n:*mut usize)->usize{
         if FAIL_SURFACE.load(Ordering::Relaxed)==1{return 0;}
         let stride=(w as usize+7)&!7;let mut s=Box::new(MockSurface{w:w as usize,h:h as usize,stride,data:vec![0;stride*h as usize*4]});
@@ -1264,6 +1302,61 @@ mod tests {
     extern "C" fn art3m1s_gxm_delete_texture(id:u64) {if let Some(m)=NATIVE.lock().unwrap().as_mut(){m.remove(&id);}}
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_update_texture_region(_: u64, _: u32, _: u32, _: *const u8, _: usize, _: u32, _: u32, _: u32, _: u32) -> i32 { 1 }
+
+    fn warm_provider(name:&str) -> GxmTextureProvider {
+        let mut image=image::RgbaImage::new(397,463);
+        for (x,y,p) in image.enumerate_pixels_mut(){*p=image::Rgba([x as u8,y as u8,51,if x==0 {0}else{139}]);}
+        let proof=TileProof::for_prepared_upload(&image).unwrap();
+        let cost=image.as_raw().capacity()+proof.bytes();
+        let budget=crate::image_cache_budget::CacheBudget::new(32*1024*1024);
+        budget.lock().unwrap().set_ready(cost);
+        let b=budget.clone();let image=std::cell::RefCell::new(Some((Ok(image.into()),Some(proof),None)));
+        let mut p=GxmTextureProvider::new().with_cache_budget(budget).with_source(|_|panic!("warm upload must not read/decode"))
+            .with_warm_prefetch(move |_|{
+                let payload=image.borrow_mut().take()?;
+                let mut b=b.lock().unwrap();b.set_ready(0);let idle=b.idle+cost;b.set_idle(idle);Some(payload)
+            });
+        p.set_warm_plan(&[name.into()]);p
+    }
+    #[test]
+    fn staged_warm_upload_is_invisible_until_complete_and_matches_odd_stride_alpha(){
+        let _guard=LOCK.lock().unwrap();let mut p=warm_provider("future");
+        for _ in 0..4 {p.warm_step();}
+        assert!(p.warm.job.is_some());assert!(!p.entries.contains_key("future"));
+        for _ in 0..64 {
+            p.warm_step();
+            assert_eq!(p.idle_parts().total(),p.cache_budget.as_ref().unwrap().lock().unwrap().idle);
+            if p.warm.job.is_none(){break;}
+            assert!(!p.entries.contains_key("future"));
+        }
+        assert!(p.entries.contains_key("future"));assert!(p.warm.job.is_none());
+        let uploads=UPLOADS.load(Ordering::Relaxed);let (id,_)=p.resolve("future").unwrap();
+        assert_eq!(uploads,UPLOADS.load(Ordering::Relaxed));assert_eq!(p.timing.reads,0);assert_eq!(p.timing.decoded,0);
+        assert_eq!(p.pixel_alpha(id,0,20),Some(0));assert_eq!(p.pixel_alpha(id,396,462),Some(139));
+        let native=NATIVE.lock().unwrap();let s=&native.as_ref().unwrap()[&id.0];
+        for y in 0..s.h {for x in 0..s.stride {
+            let sx=x.min(s.w-1);assert_eq!(&s.data[(y*s.stride+x)*4..(y*s.stride+x+1)*4],&[sx as u8,y as u8,51,if sx==0{0}else{139}]);
+        }}
+    }
+    #[test]
+    fn staged_warm_demand_cancellation_pressure_and_publish_failure_keep_cpu_pixels(){
+        let _guard=LOCK.lock().unwrap();
+        for cause in 0..5 {
+            let mut p=warm_provider("future");for _ in 0..6 {p.warm_step();}
+            assert!(p.warm.job.is_some());
+            match cause {
+                0=>{p.resolve("future").unwrap();},
+                1=>p.set_warm_plan(&["elsewhere".into()]),
+                2=>{p.idle_budget=1;p.cancel_warm_under_pressure();},
+                3=>{FAIL_SURFACE.store(2,Ordering::Relaxed);for _ in 0..16 {p.warm_step();}FAIL_SURFACE.store(0,Ordering::Relaxed);},
+                _=>{p.upload_rgba("future",2,2,&[255;16]).unwrap();},
+            }
+            assert!(p.warm.job.is_none());
+            if cause!=4 {let (id,_)=p.resolve("future").unwrap();assert_eq!(p.pixel_alpha(id,396,462),Some(139));}
+            else {assert_eq!(p.resolve("future").unwrap().1.width,2);}
+            assert_eq!(p.timing.reads,0);assert_eq!(p.timing.decoded,0);
+        }
+    }
 
     #[test]
     fn shared_decode_uses_one_surface_and_preserves_odd_width_reads_and_eviction(){
@@ -1407,6 +1500,58 @@ mod tests {
         (GxmTextureProvider::new().with_source(move |_| {
             counter.set(counter.get()+1); Some(png.get_ref().clone())
         }), reads)
+    }
+
+    #[test]
+    fn menu_images_release_all_tiers_after_last_scene_or_transition_reference() {
+        let _guard=LOCK.lock().unwrap();
+        let (p,reads)=provider();
+        let budget=crate::image_cache_budget::CacheBudget::new(1024*1024);
+        let mut p=p.with_cache_budget(budget.clone());
+        let menu=":ui/conf/bg.png";
+        let backlog=":ui/blog/bg.png";
+        let common=":ui/mw/bt_blog.png";
+        for n in [menu,backlog,common,"image/bg/room"] {p.resolve(n).unwrap();}
+        p.encoded.insert(menu.into(),EncodedEntry{bytes:vec![1;32].into(),proof:None,last_used:0});
+        p.decoded.insert(backlog.into(),DecodedEntry{gray:false,info:p.entries[backlog].info,rgba:vec![128;64].into(),last_used:0});
+        let held=HashSet::from([menu.into(),backlog.into()]);
+        // Includes outgoing transition references as well as the visible scene.
+        p.retain(&held);
+        assert!(p.entries.contains_key(menu)&&p.entries.contains_key(backlog));
+        assert!(p.encoded.contains_key(menu)&&p.decoded.contains_key(backlog));
+        p.retain(&HashSet::from([menu.into()]));
+        assert!(!p.entries.contains_key(backlog)&&!p.decoded.contains_key(backlog));
+        assert!(p.entries.contains_key(menu));
+        p.retain(&HashSet::new());
+        assert!(!p.entries.contains_key(menu)&&!p.encoded.contains_key(menu));
+        assert!(p.entries.contains_key(common)&&p.entries.contains_key("image/bg/room"));
+        assert_eq!(budget.lock().unwrap().idle,p.idle_parts().total());
+        let count=reads.get();
+        for n in [menu,backlog] {let (id,_)=p.resolve(n).unwrap();assert_eq!(p.pixel_alpha(id,0,0),Some(128));}
+        assert_eq!(reads.get(),count+2);
+    }
+
+    #[test]
+    fn save_load_art_and_thumbnails_release_then_reload_after_menu_closes() {
+        let _guard=LOCK.lock().unwrap();
+        let (mut p,reads)=provider();p.set_save_image_directory("profile/data");
+        let images=[":ui/save/bg_save.png",":ui/save/bg_load.png","profile/data/slot01.png"];
+        let mut held=HashSet::new();
+        for n in images {p.resolve(n).unwrap();held.insert(n.to_owned());
+            p.encoded.insert(n.into(),EncodedEntry{bytes:vec![2;32].into(),proof:None,last_used:0});}
+        let combined=masked_texture_name(images[2],":ui/save/mask");
+        p.resolve_with_mask(images[2],":ui/save/mask").unwrap();
+        held.insert(combined.clone());held.insert(":ui/save/mask".into());
+        p.retain(&held);assert!(p.entries.contains_key(&combined));
+        assert!(p.entries.contains_key(images[2]));
+        // Close/finish transition. This only releases textures, never save files
+        // or the separate gameplay capture held by the save subsystem.
+        p.retain(&HashSet::new());
+        for n in images {assert!(!p.entries.contains_key(n));assert!(!p.encoded.contains_key(n));assert!(!p.decoded.contains_key(n));}
+        assert!(!p.entries.contains_key(&combined));
+        let before=reads.get();
+        for n in images {let (id,_)=p.resolve(n).unwrap();assert_eq!(p.pixel_alpha(id,0,0),Some(128));}
+        assert_eq!(reads.get(),before+3);
     }
 
     #[test] fn split_idle_account_excludes_active_and_counts_backups_separately(){

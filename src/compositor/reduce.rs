@@ -182,6 +182,18 @@ impl Compositor {
             .clone_from(&other.default_message_layer);
     }
 
+    pub(crate) fn sync_query_changes_from(&mut self, other: &Self, accepted: &mut HashMap<String, (u64, u64)>) -> usize {
+        let copied=self.scene.sync_query_changes_from(&other.scene, accepted);
+        self.clock_ms = other.clock_ms;
+        self.anime_states.clone_from(&other.anime_states);
+        self.tween_set_pending.clone_from(&other.tween_set_pending);
+        self.next_tween_set_id = other.next_tween_set_id;
+        self.message_layer_bindings.clone_from(&other.message_layer_bindings);
+        self.deleted_message_layers.clone_from(&other.deleted_message_layers);
+        self.default_message_layer.clone_from(&other.default_message_layer);
+        copied
+    }
+
     /// Clock ticks can only change animated layers. Script/structural changes
     /// still use the full synchronization path. Include previously animated
     /// layers so completed tweens and deleted subtrees are exported as well.

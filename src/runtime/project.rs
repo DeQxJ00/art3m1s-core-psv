@@ -171,6 +171,17 @@ impl CoreRuntime {
                 })
             })
         };
+        #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+        let provider = {
+            let paths = Arc::clone(&self.magic_paths);
+            provider.with_warm_prefetch(move |name| {
+                let resolved = magic_path::resolve_path(&paths, name);
+                match super::surface_loader::take_warm_pixels(&resolved, 4*1024*1024)? {
+                    super::surface_loader::Payload::Pixels(image, bytes, proof) => Some((Ok(image.into()), proof, Some(bytes))),
+                    _ => unreachable!("warm handoff only accepts certified RGBA"),
+                }
+            })
+        };
         self.texture_provider =
             provider.with_source(move |name: &str| -> Option<Vec<u8>> {
                 let resolved = magic_path::resolve_path(&magic_paths_tex, name);
