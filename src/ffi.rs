@@ -1336,6 +1336,13 @@ pub unsafe extern "C" fn art3m1s_runtime_prepare_gxm_textures(rt: *mut CoreRunti
     }
 }
 
+/// Read on the runtime owner thread after advancing scripts, before rendering.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_effect_pan_active(rt: *const CoreRuntime) -> i32 {
+    unsafe { rt.as_ref() }.is_some_and(|rt| rt.effect_pan_active()) as i32
+}
+
 #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_runtime_present_gxm(rt: *mut CoreRuntime) -> i32 {
