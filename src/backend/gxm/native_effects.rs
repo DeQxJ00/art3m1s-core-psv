@@ -33,7 +33,9 @@ struct EffectDraw {
 }
 unsafe extern "C" {
     fn art3m1s_gxm_draw_effect(draw: *const EffectDraw);
-    fn art3m1s_gxm_group_filter(draw:*const EffectDraw)->i32;
+    fn art3m1s_gxm_group_filter_chain(draw:*const EffectDraw,count:u32)->i32;
+    fn art3m1s_gxm_group_end_half_blur(draw:*const EffectDraw,count:u32)->i32;
+    fn art3m1s_gxm_draw_cached_blur(source:*const EffectDraw,passes:*const EffectDraw,count:u32,revision:u64)->i32;
     fn art3m1s_gxm_node_source_draw(draw:*const EffectDraw,slot:u32)->i32;
     fn art3m1s_gxm_node_source_enabled()->i32;
     fn art3m1s_gxm_cache_slot_revision(slot:u32)->u64;
@@ -213,6 +215,25 @@ fn group_command(group: &ShaderGroup, width: u32, height: u32) -> DrawCommand {
 fn full_stage_clip(clip: Option<[f32; 4]>, width: u32, height: u32) -> bool {
     clip.is_none_or(|r| r.iter().all(|v| v.is_finite()) && r[0] <= 0.0 && r[1] <= 0.0
         && r[0]+r[2] >= width as f32 && r[1]+r[3] >= height as f32)
+}
+// Reduced-resolution blur is restricted to one opaque image, never a text or
+// character composite. Every pass must match a bundled Kawase source hash.
+fn half_blur_chain(frame:&DrawList,chain:&[usize],inner:usize,width:u32,height:u32)->bool {
+    if chain.len()<3{return false;}
+    let g=&frame.shader_groups[chain[0]];
+    if g.end!=g.start+1 || next_group(frame,g.start,g.end,inner).is_some(){return false;}
+    let c=&frame.commands[g.start];
+    if c.opacity!=1. || c.shader.is_some() || c.mesh.is_some() || c.stencil.is_some()
+        || c.native_emote.is_some() || !matches!(c.blend,BlendMode::Alpha|BlendMode::PremultipliedAlpha)
+        || !full_stage_clip(c.clip_bounds,width,height)
+        // Use the already prepared opacity certificate, including the full image,
+        // without rescanning pixels or inferring opacity from a resource path.
+        || unsafe{art3m1s_gxm_texture_region_is_opaque(c.texture.0,0.,0.,1.,1.)==0}{return false;}
+    chain.iter().all(|&i|{
+        let g=&frame.shader_groups[i];
+        g.mask_range.is_none() && full_stage_clip(g.clip_bounds,width,height)
+            && super::external_effects::verified_kawase(&g.effect)
+    })
 }
 fn opaque_cover(c: &DrawCommand, width: u32, height: u32) -> bool {
     if c.opacity != 1.0 || c.mesh.is_some() || c.stencil.is_some() || c.native_emote.is_some()
@@ -411,22 +432,47 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
             // inner-to-outer through one target + scratch, preserving each pass,
             // clip and constants without exceeding the host's nesting depth.
             let mut chain=vec![group_index];
+            let mut inner=group_index;
             if draw.custom.program!=0 && group.mask_range.is_none(){
-                let mut limit=group_index;
-                while let Some((i,g))=next_group(frame,group.start,group.end,limit){
-                    if g.start!=group.start||g.end!=group.end||g.mask_range.is_some()
-                        || !super::external_effects::registered(&g.effect.name){break;}
-                    chain.push(i);limit=i;
+                while let Some((i,g))=next_group(frame,group.start,group.end,inner){
+                    if g.start!=group.start||g.end!=group.end||g.mask_range.is_some(){break;}
+                    // Script-generated intermediate layers sit between the
+                    // unary passes. Cross only independently proven neutral
+                    // boundaries, never an opacity, mask or blend operation.
+                    if allow_flatten && passthrough_group_inner(frame,i,width,height,true) {
+                        stats[0]+=1;stats[1]+=1;inner=i;continue;
+                    }
+                    if !super::external_effects::registered(&g.effect.name){break;}
+                    chain.push(i);inner=i;
                 }
             }
+            let half_passes=half_blur_chain(frame,&chain,inner,width,height).then(||
+                chain.iter().rev().filter_map(|&i|
+                    encode(&group_command(&frame.shader_groups[i],width,height),width,height)).collect::<Vec<_>>());
+            if let Some(passes)=half_passes.as_ref().filter(|p|p.len()==chain.len())
+                && let Some(source)=encode(&frame.commands[group.start],width,height)
+                && unsafe{art3m1s_gxm_draw_cached_blur(&source,passes.as_ptr(),passes.len() as u32,
+                    super::external_effects::revision())!=0} {
+                stats[0]+=(chain.len()-1) as u32;
+                index=group.end;continue;
+            }
             if unsafe { art3m1s_gxm_group_begin() } != 0 {
-                let inner=*chain.last().unwrap();
                 render_range(frame, group.start, group.end, inner, width, height, stats, allow_flatten,nodes,admit);
-                for &i in chain.iter().rev().take(chain.len()-1){
-                    if let Some(pass)=encode(&group_command(&frame.shader_groups[i],width,height),width,height){
-                        if unsafe{art3m1s_gxm_group_filter(&pass)}==0{crate::core_warn!("GXM external filter target/pass failed");}
-                        stats[0]+=1;
+                if let Some(all_passes)=half_passes {
+                    if all_passes.len()==chain.len() && unsafe{
+                        art3m1s_gxm_group_end_half_blur(all_passes.as_ptr(),all_passes.len() as u32)!=0
+                    } {
+                        stats[0]+=(chain.len()-1) as u32;
+                        index=group.end;continue;
                     }
+                }
+                let passes:Vec<_>=chain.iter().rev().take(chain.len()-1).filter_map(|&i|
+                    encode(&group_command(&frame.shader_groups[i],width,height),width,height)).collect();
+                if !passes.is_empty() {
+                    if unsafe{art3m1s_gxm_group_filter_chain(passes.as_ptr(),passes.len() as u32)}==0 {
+                        crate::core_warn!("GXM external filter target/pass failed");
+                    }
+                    stats[0]+=passes.len() as u32;
                 }
                 if let Some([start, end]) = group.mask_range {
                     if unsafe { art3m1s_gxm_group_mask_begin() } != 0 {
@@ -834,6 +880,7 @@ mod tests {
     extern "C" fn art3m1s_gxm_texture_revision()->u64 {CHANGED_TEXTURE.with(|c|if c.get()==0{1}else{2})}
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_texture_region_is_opaque(id:u64,u0:f32,v0:f32,u1:f32,v1:f32)->i32 {
+        if id==45 {return i32::from(u0.min(u1)>=0. && u0.max(u1)<=1. && v0.min(v1)>=0. && v0.max(v1)<=1.);}
         if id==44 {return i32::from(u0.min(u1)>=0.24&&u0.max(u1)<=0.76&&v0.min(v1)>=0.24&&v0.max(v1)<=0.76);}
         art3m1s_gxm_texture_is_opaque(id)
     }
@@ -1151,7 +1198,11 @@ mod tests {
         event(format!("draw:{}", unsafe { (*draw).texture }));
     }
     #[unsafe(no_mangle)]
-    extern "C" fn art3m1s_gxm_group_filter(_:*const EffectDraw)->i32 {event("filter".into());1}
+    extern "C" fn art3m1s_gxm_group_filter_chain(_:*const EffectDraw,count:u32)->i32 {for _ in 0..count{event("filter".into());}1}
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_group_end_half_blur(_:*const EffectDraw,count:u32)->i32 {event(format!("half-blur:{count}"));1}
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_draw_cached_blur(_:*const EffectDraw,_:*const EffectDraw,_:u32,_:u64)->i32 {0}
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_group_begin() -> i32 {
         event("begin-group".into());
@@ -1433,6 +1484,64 @@ mod tests {
         assert!(!identity_blur_fallback(&f.shader_groups[4],960,544));
         EVENTS.with(|v|v.borrow_mut().clear());render(&f,960,544);
         EVENTS.with(|v|{let v=v.borrow();assert_eq!(v.iter().filter(|e|*e=="begin-group").count(),2);assert_eq!(v.iter().filter(|e|*e=="filter").count(),3);assert_eq!(v.iter().filter(|e|*e=="end-group:0").count(),1);assert_eq!(v.iter().filter(|e|*e=="node-source-build").count(),1);});
+        super::super::external_effects::clear();
+    }
+    #[test]
+    fn moving_kawase_chain_crosses_only_neutral_intermediates(){
+        let id="verified_kawase_chain";
+        let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
+        super::super::external_effects::register_source(id,src).unwrap();
+        super::super::external_effects::mark_test_builtin_kawase(id);
+        let mut f=neutral_frame();f.shader_groups.clear();
+        for _ in 0..5 {
+            let mut g=test_group(id,0,2);
+            g.effect.uniforms.insert("offset".into(),vec![2.5]);
+            g.effect.uniforms.insert("size".into(),vec![1./1920.]);
+            f.shader_groups.push(g);
+            f.shader_groups.push(test_group(GROUP_COMPOSITE_SHADER,0,2));
+        }
+        let mut nodes=NodeCache::default();
+        for y in [-300.,-320.,-400.] {
+            f.commands[0].transform.translation.y=y;
+            let mut stats=[0,0];EVENTS.with(|v|v.borrow_mut().clear());
+            render_range(&f,0,2,10,960,544,&mut stats,true,&mut nodes,false);
+            EVENTS.with(|v|{let v=v.borrow();
+                assert_eq!(v.iter().filter(|e|*e=="begin-group").count(),1);
+                assert_eq!(v.iter().filter(|e|*e=="filter").count(),4);
+                assert_eq!(v.iter().filter(|e|*e=="end-group:0").count(),1);
+            });
+            assert_eq!(stats,[10,5]);
+        }
+        // One opaque background qualifies; mixed composites and alpha sprites do not.
+        let mut background=f.clone();
+        background.commands.truncate(1);
+        for g in &mut background.shader_groups{g.end=1;}
+        EVENTS.with(|v|v.borrow_mut().clear());
+        render_range(&background,0,1,10,960,544,&mut [0,0],true,&mut nodes,false);
+        EVENTS.with(|v|{let v=v.borrow();assert!(v.contains(&"half-blur:5".into()));assert!(!v.iter().any(|e|e=="filter"));});
+        // Large opaque image: the cheap flag is false but every tile is proven.
+        background.commands[0].texture=TextureId(45);
+        assert_eq!(art3m1s_gxm_texture_is_opaque(45),0);
+        assert!(half_blur_chain(&background,&[8,6,4,2,0],0,960,544));
+        EVENTS.with(|v|v.borrow_mut().clear());
+        render_range(&background,0,1,10,960,544,&mut [0,0],true,&mut nodes,false);
+        EVENTS.with(|v|assert!(v.borrow().contains(&"half-blur:5".into())));
+        // A tile proof covering only the center cannot certify the whole image.
+        background.commands[0].texture=TextureId(44);
+        assert!(!half_blur_chain(&background,&[8,6,4,2,0],0,960,544));
+        background.commands[0].texture=TextureId(43);
+        assert!(!half_blur_chain(&background,&[8,6,4,2,0],0,960,544));
+        background.commands[0].texture=TextureId(42);
+        background.shader_groups[4].clip_bounds=Some([0.,0.,400.,400.]);
+        assert!(!half_blur_chain(&background,&[8,6,4,2,0],0,960,544));
+        // A translucent intermediate really changes the image: it must survive.
+        f.shader_groups[5].effect.uniforms.insert("alpha".into(),vec![0.5]);
+        EVENTS.with(|v|v.borrow_mut().clear());
+        render_range(&f,0,2,10,960,544,&mut [0,0],true,&mut nodes,false);
+        EVENTS.with(|v|assert!(v.borrow().iter().filter(|e|*e=="begin-group").count()>=3));
+        // Replacing the source under the same ID revokes the proof.
+        super::super::external_effects::register_source(id,src).unwrap();
+        assert!(!passthrough_group_inner(&f,9,960,544,true));
         super::super::external_effects::clear();
     }
     #[test]

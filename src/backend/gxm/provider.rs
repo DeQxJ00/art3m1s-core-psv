@@ -623,7 +623,8 @@ impl TextureProvider for GxmTextureProvider {
             self.timing.decode_errors+=1;crate::core_warn!("GXM texture decoder failure: {name}: {error}");return None;
         }};
         let (width,height)=decoder.dimensions();
-        if decoder.color_type()==image::ColorType::L8{
+        let color=decoder.color_type();
+        if color==image::ColorType::L8{
             let pixels=crate::resource_ledger::decode_luma(decoder,512*1024*1024)?;
             self.timing.decoded+=1;self.timing.decode_us+=elapsed_us(started);
             let result=self.upload_gray(name,width,height,pixels);
@@ -637,6 +638,7 @@ impl TextureProvider for GxmTextureProvider {
                     self.timing.decode_errors+=1;crate::core_warn!("GXM shared-surface decode failure: {name}: {error}");return None;
                 }
                 let decode_us=elapsed_us(started);self.timing.decoded+=1;self.timing.decode_us+=decode_us;
+                if proof.is_none(){proof=TileProof::for_rgb24(width,height,color);}
                 let opaque=proof.as_ref().and_then(|p|p.opaque_for_size(width,height))
                     .unwrap_or_else(||surface.bytes()[..logical as usize].chunks_exact(4).all(|p|p[3]==255));
                 let id=self.entries.get(name).map_or(TextureId(self.next_id),|e|e.id);
@@ -674,6 +676,7 @@ impl TextureProvider for GxmTextureProvider {
             crate::core_info!("GXM texture-slow-decode name={} size={}x{} decode_us={}", name, image.width(), image.height(), decode_us);
         }
         let (width, height) = image.dimensions();
+        if proof.is_none(){proof=TileProof::for_rgb24(width,height,color);}
         let result = self.upload_prepared(name, width, height, PixelStorage::Owned(image.into_raw()), false, true,proof.as_ref());
         if result.is_some() {
             self.entries.get_mut(name).unwrap().cacheable = true;
@@ -959,6 +962,30 @@ mod tests {
     use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
     static LOCK: Mutex<()> = Mutex::new(());
+    #[test] fn rgb24_opacity_reaches_owned_and_shared_uploads_independent_of_path(){
+        let _guard=LOCK.lock().unwrap();
+        for shared in [false,true]{
+            let mut png=Cursor::new(Vec::new());
+            image::RgbImage::from_pixel(513,515,image::Rgb([40,80,120]))
+                .write_to(&mut png,image::ImageFormat::Png).unwrap();
+            let bytes=png.into_inner();
+            let mut p=GxmTextureProvider::new().with_source(move |_|Some(bytes.clone()));
+            p.shared_surfaces=shared;
+            for name in ["image/bg/opaque.png","image/fg/opaque.png","ui/opaque.png"]{
+                let (id,_)=p.resolve(name).unwrap();
+                assert!(p.texture_is_opaque(id));assert_eq!(p.entries[name].shared,shared);
+                assert_eq!(p.encoded[name].proof.as_ref().unwrap().opaque_for_size(513,515),Some(true));
+                assert_eq!(p.pixel_alpha(id,512,514),Some(255));
+            }
+        }
+    }
+    #[test] fn rgb_png_color_key_is_preserved_even_in_background_directory(){
+        let _guard=LOCK.lock().unwrap();let bytes=include_bytes!("../../image_decode_testdata/rgb24-trns.png");
+        let mut p=GxmTextureProvider::new().with_source(move |_|Some(bytes.to_vec()));
+        let (id,_)=p.resolve("image/bg/color-key.png").unwrap();
+        assert!(!p.texture_is_opaque(id));
+        assert_eq!(p.pixel_alpha(id,0,0),Some(0));assert_eq!(p.pixel_alpha(id,1,0),Some(255));
+    }
     #[test] fn alpha_atlas_updates_preserve_identity_and_retry_without_cpu_mirror(){
         let _guard=LOCK.lock().unwrap();let mut p=GxmTextureProvider::new();let mut data=vec![0;512*512];
         data[7*512+5]=139;

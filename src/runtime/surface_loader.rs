@@ -728,13 +728,16 @@ fn decode_source(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&
                 // PNG copies this limit at construction; setting it afterwards is insufficient.
                 let mut limits = image::Limits::default(); limits.max_alloc = Some(allowance as u64);
                 reader.limits(limits);
-                let decoded=reader.into_decoder().ok().and_then(|decoder|
-                    crate::resource_ledger::decode_rgba(decoder,budget).ok());
-                if let Some(image) = decoded {
+                let decoded=reader.into_decoder().ok().and_then(|decoder|{
+                    let color=image::ImageDecoder::color_type(&decoder);
+                    crate::resource_ledger::decode_rgba(decoder,budget).ok().map(|image|(image,color))
+                });
+                if let Some((image,color)) = decoded {
                     // A complete decode is already useful; do not throw it
                     // away merely because priority changed after its last read.
                     if cancelled(){return None;}
-                    let proof=TileProof::for_prepared_upload(&image);
+                    let proof=TileProof::for_rgb24(image.width(),image.height(),color)
+                        .or_else(||TileProof::for_prepared_upload(&image));
                     if cancelled(){return None;}
                     return Some(DecodedSource::Pixels(image,proof));
                 }
@@ -790,6 +793,19 @@ pub(super) fn shutdown(){let loader=LOADER.lock().unwrap().take();if let Some(l)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn rgb24_preload_marks_opaque_but_preserves_png_color_key(){
+        let mut png=std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(65,17,image::Rgb([40,80,120]))
+            .write_to(&mut png,image::ImageFormat::Png).unwrap();
+        for (bytes,w,h,opaque) in [(png.into_inner(),65,17,true),
+            (include_bytes!("../image_decode_testdata/rgb24-trns.png").to_vec(),2,1,false)]{
+            let LoadStep::Complete(Some(Payload::Pixels(p,_,Some(proof))))=
+                decode_source(bytes.into(),&||false,&|_|false,BUDGET) else{panic!("missing decoded proof")};
+            assert_eq!(proof.opaque_for_size(w,h),Some(opaque));
+            assert_eq!(p.pixels().all(|p|p[3]==255),opaque);
+            if !opaque {assert_eq!(p.get_pixel(0,0)[3],0);assert_eq!(p.get_pixel(1,0)[3],255);}
+        }
+    }
     #[test]
     fn warm_handoff_is_nonblocking_filtered_and_transfers_budget_once() {
         let budget=crate::image_cache_budget::CacheBudget::new(4096);
