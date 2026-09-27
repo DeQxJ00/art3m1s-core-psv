@@ -163,7 +163,7 @@ impl Default for EmoteFrameContent {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct EmoteMesh {
     pub blend_points: Option<Vec<f32>>,
     pub control_coordinates: Option<Vec<f32>>,
