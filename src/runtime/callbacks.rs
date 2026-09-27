@@ -749,6 +749,16 @@ impl EngineCallbacks for FfiCallbacks {
         self.emote.lock().unwrap().get_layer(id, next)
     }
 
+    fn emote_variable(&self, id: &str, next: bool, label: &str) -> asb_interpreter::Result<f32> {
+        self.emote.lock().unwrap().variable(id, next, label)
+            .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
+    }
+
+    fn emote_timeline_playing(&self, id: &str, next: bool, label: &str) -> asb_interpreter::Result<bool> {
+        self.emote.lock().unwrap().timeline_playing(id, next, label)
+            .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
+    }
+
     fn command_emote_layer(
         &self,
         id: &str,
