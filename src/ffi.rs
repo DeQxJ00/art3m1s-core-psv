@@ -1343,6 +1343,13 @@ pub unsafe extern "C" fn art3m1s_runtime_effect_pan_active(rt: *const CoreRuntim
     unsafe { rt.as_ref() }.is_some_and(|rt| rt.effect_pan_active()) as i32
 }
 
+/// Read-only E-mote scene presence for host clock policy; null is inactive.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_emote_active(rt: *const CoreRuntime) -> i32 {
+    unsafe { rt.as_ref() }.is_some_and(|rt| rt.emote_active()) as i32
+}
+
 #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_runtime_present_gxm(rt: *mut CoreRuntime) -> i32 {
