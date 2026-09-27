@@ -749,6 +749,11 @@ impl EngineCallbacks for FfiCallbacks {
         self.emote.lock().unwrap().get_layer(id, next)
     }
 
+    fn emote_mesh_ratio(&self, id: &str, next: bool) -> asb_interpreter::Result<f32> {
+        self.emote.lock().unwrap().mesh_ratio(id, next)
+            .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
+    }
+
     fn emote_variable(&self, id: &str, next: bool, label: &str) -> asb_interpreter::Result<f32> {
         self.emote.lock().unwrap().variable(id, next, label)
             .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })

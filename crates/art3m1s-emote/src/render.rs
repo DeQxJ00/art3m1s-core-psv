@@ -382,11 +382,24 @@ impl EmoteEvaluationHistory {
 
 pub struct EmoteMotionEvaluator<'a> {
     model: &'a EmoteModel,
+    mesh_side: usize,
 }
 
 impl<'a> EmoteMotionEvaluator<'a> {
     pub fn new(model: &'a EmoteModel) -> Self {
-        Self { model }
+        Self { model, mesh_side: DEFORMED_MESH_SIDE }
+    }
+
+    /// Scale the sampled grid, preserving authored Bezier controls and the
+    /// complete ancestor deformation chain. The default retains the original
+    /// 8x8 grid. This backend supports reduction, not supersampling.
+    pub fn with_mesh_division_ratio(mut self, ratio: f32) -> Self {
+        self.mesh_side = if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 {
+            (((DEFORMED_MESH_SIDE - 1) as f32 * ratio) as usize).max(1) + 1
+        } else {
+            DEFORMED_MESH_SIDE
+        };
+        self
     }
 
     pub fn evaluate_base(&self, state: &EmoteRenderState) -> Result<Vec<EmoteDrawItem>> {
@@ -774,7 +787,7 @@ impl<'a> EmoteMotionEvaluator<'a> {
                 stencil_mask_layers,
                 draw_order,
             );
-            history.deformations.apply(&mut item, deformers, history_path, history.generation);
+            history.deformations.apply_at_resolution(&mut item, deformers, history_path, history.generation, self.mesh_side);
             items.push(item);
             return Ok(());
         }
@@ -960,7 +973,12 @@ fn lerp_point(from: [f32; 2], to: [f32; 2], ratio: f32) -> [f32; 2] {
     ]
 }
 
+#[cfg(test)]
 fn apply_deformers(item: &mut EmoteDrawItem, deformers: &[MeshDeformer]) {
+    apply_deformers_at_resolution(item, deformers, DEFORMED_MESH_SIDE);
+}
+
+fn apply_deformers_at_resolution(item: &mut EmoteDrawItem, deformers: &[MeshDeformer], mesh_side: usize) {
     if item.atlas_rect[2] <= 0.0 || item.atlas_rect[3] <= 0.0 {
         return;
     }
@@ -990,12 +1008,12 @@ fn apply_deformers(item: &mut EmoteDrawItem, deformers: &[MeshDeformer]) {
     }) {
         return;
     }
-    let mut deformed = Vec::with_capacity(DEFORMED_MESH_SIDE * DEFORMED_MESH_SIDE * 2);
-    for y in 0..DEFORMED_MESH_SIDE {
-        for x in 0..DEFORMED_MESH_SIDE {
+    let mut deformed = Vec::with_capacity(mesh_side * mesh_side * 2);
+    for y in 0..mesh_side {
+        for x in 0..mesh_side {
             let normalized = [
-                x as f32 / (DEFORMED_MESH_SIDE - 1) as f32,
-                y as f32 / (DEFORMED_MESH_SIDE - 1) as f32,
+                x as f32 / (mesh_side - 1) as f32,
+                y as f32 / (mesh_side - 1) as f32,
             ];
             let point = source_patch
                 .as_ref()
