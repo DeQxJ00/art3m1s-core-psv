@@ -85,6 +85,7 @@ pub struct EmotePlayer {
     variables: BTreeMap<String, VariableState>,
     timelines: BTreeMap<String, TimelineState>,
     difference_tracks: BTreeMap<String, BTreeMap<String, DifferenceTrackState>>,
+    ordinary_cursors: BTreeMap<String, Vec<usize>>,
     commands: VecDeque<EmoteCommand>,
 }
 
@@ -115,14 +116,24 @@ impl EmotePlayer {
 
     pub fn set_variable(&mut self, label: impl Into<String>, value: f32, frames: f32, easing: u32) {
         let label = label.into();
+        self.set_variable_target(&label, value, frames, easing);
+        self.commands.push_back(EmoteCommand::SetVariable {
+            label,
+            value,
+            frames: frames.max(0.0),
+            easing,
+        });
+    }
+
+    fn set_variable_target(&mut self, label: &str, value: f32, frames: f32, easing: u32) {
         let current = self
             .variables
-            .get(&label)
+            .get(label)
             .map(|state| state.value)
             .unwrap_or(0.0);
         let frames = frames.max(0.0);
         self.variables.insert(
-            label.clone(),
+            label.to_owned(),
             VariableState {
                 value: if frames == 0.0 { value } else { current },
                 target: value,
@@ -130,12 +141,6 @@ impl EmotePlayer {
                 easing,
             },
         );
-        self.commands.push_back(EmoteCommand::SetVariable {
-            label,
-            value,
-            frames,
-            easing,
-        });
     }
 
     pub fn play_timeline(&mut self, label: impl Into<String>, flags: u32) {
@@ -166,14 +171,15 @@ impl EmotePlayer {
         if flags & 1 == 0 {
             self.timelines.clear();
             self.difference_tracks.clear();
+            self.ordinary_cursors.clear();
         }
         self.play_timeline(label.clone(), flags);
-        if let Some(timeline) = model
-            .timelines()
-            .get(&label)
-            .filter(|timeline| timeline.diff)
-        {
-            self.initialize_difference_timeline(timeline);
+        if let Some(timeline) = model.timelines().get(&label) {
+            if timeline.diff {
+                self.initialize_difference_timeline(timeline);
+            } else {
+                self.seek_ordinary_timeline(timeline, 0.0);
+            }
         }
     }
 
@@ -185,11 +191,13 @@ impl EmotePlayer {
         easing: u32,
     ) {
         let label = label.into();
+        let was_playing = self.timelines.contains_key(&label);
         self.fade_in_timeline(label.clone(), frames, easing);
-        if let Some(timeline) = model
-            .timelines()
-            .get(&label)
-            .filter(|timeline| timeline.diff)
+        if !was_playing
+            && let Some(timeline) = model
+                .timelines()
+                .get(&label)
+                .filter(|timeline| timeline.diff)
         {
             self.initialize_difference_timeline_at(timeline, 0.0);
         }
@@ -207,6 +215,7 @@ impl EmotePlayer {
         let label = label.into();
         self.timelines.remove(&label);
         self.difference_tracks.remove(&label);
+        self.ordinary_cursors.remove(&label);
         self.commands
             .push_back(EmoteCommand::StopTimeline { label });
     }
@@ -238,17 +247,8 @@ impl EmotePlayer {
     fn advance_inner(&mut self, frames: f32, model: Option<&EmoteModel>) -> bool {
         let frames = frames.max(0.0);
         let mut changed = false;
-        for state in self.variables.values_mut() {
-            let before = state.value;
-            advance_scalar(
-                &mut state.value,
-                state.target,
-                &mut state.remaining_frames,
-                frames,
-            );
-            changed |= state.value != before;
-        }
         let mut difference_updates = Vec::new();
+        let mut ordinary_updates = Vec::new();
         for state in self.timelines.values_mut() {
             let old_position = state.position;
             let next_position = model
@@ -268,6 +268,8 @@ impl EmotePlayer {
             {
                 difference_updates.push((state.label.clone(), old_position, next_position));
                 changed = true;
+            } else if model.is_some() {
+                ordinary_updates.push((state.label.clone(), old_position, next_position));
             }
             let before = state.weight;
             advance_scalar(
@@ -279,6 +281,11 @@ impl EmotePlayer {
             changed |= state.weight != before;
         }
         if let Some(model) = model {
+            for (label, old_position, new_position) in ordinary_updates {
+                if let Some(timeline) = model.timelines().get(&label) {
+                    self.advance_ordinary_timeline(timeline, old_position, new_position);
+                }
+            }
             for (label, old_position, new_position) in difference_updates {
                 if let Some(timeline) = model.timelines().get(&label) {
                     self.advance_difference_timeline(
@@ -291,10 +298,22 @@ impl EmotePlayer {
                 }
             }
         }
+        for state in self.variables.values_mut() {
+            let before = state.value;
+            advance_scalar(
+                &mut state.value,
+                state.target,
+                &mut state.remaining_frames,
+                frames,
+            );
+            changed |= state.value != before;
+        }
         let before = self.timelines.len();
         self.timelines
             .retain(|_, timeline| timeline.weight != 0.0 || timeline.target_weight != 0.0);
         self.difference_tracks
+            .retain(|label, _| self.timelines.contains_key(label));
+        self.ordinary_cursors
             .retain(|label, _| self.timelines.contains_key(label));
         changed | (self.timelines.len() != before)
     }
@@ -328,6 +347,110 @@ impl EmotePlayer {
                 })
             })
             .collect()
+    }
+
+    /// Logical values persist after a timeline finishes. Difference tracks
+    /// are overlays for evaluation and must not leak into GetVariable.
+    pub fn evaluated_variables(&self) -> BTreeMap<String, f32> {
+        let mut values: BTreeMap<_, _> = self
+            .variables
+            .iter()
+            .map(|(name, state)| (name.clone(), state.value))
+            .collect();
+        for (label, tracks) in &self.difference_tracks {
+            let Some(timeline) = self.timelines.get(label) else {
+                continue;
+            };
+            for (name, track) in tracks {
+                *values.entry(name.clone()).or_default() += track.value * timeline.weight;
+            }
+        }
+        values
+    }
+
+    fn issue_ordinary_frame(
+        &mut self,
+        source: &crate::EmoteTimelineTrack,
+        index: usize,
+        time: f32,
+    ) {
+        let frame = &source.frames[index];
+        if frame.hold {
+            return;
+        }
+        let duration = source
+            .frames
+            .get(index + 1)
+            .map_or(0.0, |next| (next.frame - time - 1.0).max(0.0));
+        self.set_variable_target(
+            &source.label,
+            frame.value,
+            duration,
+            frame.easing.unwrap_or(0) as u32,
+        );
+    }
+
+    fn seek_ordinary_timeline(&mut self, timeline: &crate::EmoteTimeline, time: f32) {
+        let mut cursors = vec![usize::MAX; timeline.tracks.len()];
+        for (index, source) in timeline.tracks.iter().enumerate() {
+            if let Some(cursor) = source.frames.iter().rposition(|frame| frame.frame <= time) {
+                cursors[index] = cursor;
+                if let Some(command) = source.frames[..=cursor]
+                    .iter()
+                    .rposition(|frame| !frame.hold)
+                {
+                    self.issue_ordinary_frame(source, command, time);
+                }
+            }
+        }
+        self.ordinary_cursors
+            .insert(timeline.label.clone(), cursors);
+    }
+
+    fn advance_ordinary_to(&mut self, timeline: &crate::EmoteTimeline, time: f32, inclusive: bool) {
+        let mut cursors = self
+            .ordinary_cursors
+            .remove(&timeline.label)
+            .unwrap_or_else(|| vec![usize::MAX; timeline.tracks.len()]);
+        for (index, source) in timeline.tracks.iter().enumerate() {
+            loop {
+                let next = cursors[index].wrapping_add(1);
+                let Some(frame) = source.frames.get(next) else {
+                    break;
+                };
+                if !(frame.frame < time || (inclusive && frame.frame == time)) {
+                    break;
+                }
+                self.issue_ordinary_frame(source, next, time);
+                cursors[index] = next;
+            }
+        }
+        self.ordinary_cursors
+            .insert(timeline.label.clone(), cursors);
+    }
+
+    fn advance_ordinary_timeline(&mut self, timeline: &crate::EmoteTimeline, old: f32, new: f32) {
+        let span = timeline.loop_end - timeline.loop_begin;
+        if span <= 0.0 {
+            self.advance_ordinary_to(timeline, new, true);
+            return;
+        }
+        let mut position = if old >= timeline.loop_end {
+            timeline.loop_begin + (old - timeline.loop_begin).rem_euclid(span)
+        } else {
+            old
+        };
+        let mut remaining = (new - old).max(0.0);
+        while remaining > 0.0 {
+            let step = remaining.min(timeline.loop_end - position);
+            position += step;
+            self.advance_ordinary_to(timeline, position, position < timeline.loop_end);
+            remaining -= step;
+            if position >= timeline.loop_end {
+                position = timeline.loop_begin;
+                self.seek_ordinary_timeline(timeline, position);
+            }
+        }
     }
 
     fn initialize_difference_timeline(&mut self, timeline: &crate::EmoteTimeline) {
@@ -644,6 +767,76 @@ mod tests {
         assert!((player.variables()["face_talk"].value - 0.4).abs() < 0.0001);
         player.advance(6.0);
         assert_eq!(player.variables()["face_talk"].value, 1.0);
+    }
+
+    #[test]
+    fn parallel_expression_only_writes_at_authored_frames() {
+        use crate::{EmoteKeyframe, EmoteTimeline, EmoteTimelineTrack};
+        let mut old = EmoteTimeline {
+            label: "z-first".into(),
+            diff: false,
+            last_time: -1.0,
+            loop_begin: -1.0,
+            loop_end: -1.0,
+            tracks: vec![EmoteTimelineTrack {
+                label: "face".into(),
+                frames: vec![
+                    EmoteKeyframe {
+                        frame: 0.0,
+                        hold: false,
+                        value: 8.0,
+                        easing: None,
+                    },
+                    EmoteKeyframe {
+                        frame: 20.0,
+                        hold: true,
+                        value: 0.0,
+                        easing: None,
+                    },
+                ],
+            }],
+        };
+        let mut next = old.clone();
+        next.label = "a-second".into();
+        next.tracks[0].frames = vec![EmoteKeyframe {
+            frame: 0.0,
+            hold: false,
+            value: 3.0,
+            easing: None,
+        }];
+        let mut player = EmotePlayer::default();
+        player.play_timeline(old.label.clone(), 1);
+        player.seek_ordinary_timeline(&old, 0.0);
+        player.advance(19.0);
+        assert_eq!(player.variables()["face"].value, 8.0);
+        player.play_timeline(next.label.clone(), 1);
+        player.seek_ordinary_timeline(&next, 0.0);
+        player.advance_ordinary_timeline(&old, 19.0, 50.0);
+        player.advance(31.0);
+        assert_eq!(
+            player.variables()["face"].value,
+            3.0,
+            "the older timeline's hold marker must not restore its old pose"
+        );
+        player.set_variable("face", 5.0, 0.0, 0);
+        player.advance_ordinary_timeline(&next, 0.0, 50.0);
+        assert_eq!(
+            player.variables()["face"].value,
+            5.0,
+            "a finished timeline must not undo a script setter"
+        );
+        old.tracks[0].frames.push(EmoteKeyframe {
+            frame: 60.0,
+            hold: false,
+            value: 9.0,
+            easing: None,
+        });
+        player.advance_ordinary_timeline(&old, 50.0, 60.0);
+        assert_eq!(
+            player.variables()["face"].value,
+            9.0,
+            "a later authored keyframe may write again"
+        );
     }
 
     #[test]

@@ -955,11 +955,22 @@ fn apply_deformers(item: &mut EmoteDrawItem, deformers: &[MeshDeformer]) {
     if source_patch.is_none() && deformers.is_empty() {
         return;
     }
-    // Authored 4x4 patches are already the native E-Mote control grid. Keep
-    // them intact when no ancestor surface has to be applied; expanding every
-    // static patch to 8x8 creates four times as many vertices for no visual
-    // gain and used to dominate scene rebuilds.
-    if deformers.is_empty() {
+    // A 4x4 authored patch contains Bezier control points, not triangle
+    // vertices. Only an affine patch may bypass evaluation; connecting curved
+    // control points directly makes hair/face pieces visibly disagree.
+    if deformers.is_empty() && source_patch.as_ref().is_some_and(|(points, side)| {
+        let last = *side - 1;
+        let point = |x: usize, y: usize| [points[(y * side + x) * 2], points[(y * side + x) * 2 + 1]];
+        let origin = point(0, 0);
+        let right = point(last, 0);
+        let bottom = point(0, last);
+        (0..*side).all(|y| (0..*side).all(|x| {
+            let p = point(x, y);
+            (0..2).all(|axis| (p[axis] - origin[axis]
+                - (right[axis] - origin[axis]) * x as f32 / last as f32
+                - (bottom[axis] - origin[axis]) * y as f32 / last as f32).abs() < 0.00001)
+        }))
+    }) {
         return;
     }
     let mut deformed = Vec::with_capacity(DEFORMED_MESH_SIDE * DEFORMED_MESH_SIDE * 2);
@@ -2298,7 +2309,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_authored_mesh_when_no_ancestor_deformer_is_active() {
+    fn evaluates_curved_control_points_without_an_ancestor_deformer() {
         let mut points = identity_grid();
         points[(1 * 4 + 1) * 2 + 1] += 0.6;
         let mut item = EmoteDrawItem {
@@ -2323,8 +2334,13 @@ mod tests {
             stencil_mask_layers: Vec::new(),
         };
         apply_deformers(&mut item, &[]);
-        let preserved = item.mesh.unwrap().blend_points.unwrap();
-        assert_eq!(preserved, points);
+        let evaluated = item.mesh.unwrap().blend_points.unwrap();
+        assert_eq!(evaluated.len(), DEFORMED_MESH_SIDE * DEFORMED_MESH_SIDE * 2);
+        let t = 1.0 / (DEFORMED_MESH_SIDE - 1) as f32;
+        // Cubic basis for the sole displaced control point (1,1).
+        let basis = 3.0 * t * (1.0 - t) * (1.0 - t);
+        let y = evaluated[(DEFORMED_MESH_SIDE + 1) * 2 + 1];
+        assert!((y - (t + 0.6 * basis * basis)).abs() < 0.00001);
     }
 
     #[test]

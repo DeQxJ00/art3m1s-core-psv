@@ -5,6 +5,8 @@ use crate::{EmoteError, PsbDocument, PsbResourceData, PsbValue, ResourceRef, Res
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextureFormat {
     Dxt5,
+    /// PSB RGBA8 uses little-endian ARGB words (B, G, R, A bytes).
+    Rgba8,
     Other(String),
 }
 
@@ -107,6 +109,7 @@ impl EmoteAtlas {
         let bytes = document.resource(texture.resource)?;
         match texture.format {
             TextureFormat::Dxt5 => decode_dxt5(bytes, texture.width, texture.height),
+            TextureFormat::Rgba8 => decode_rgba8(bytes, texture.width, texture.height),
             TextureFormat::Other(ref format) => {
                 Err(EmoteError::Unsupported(format!("texture format {format}")))
             }
@@ -119,6 +122,7 @@ impl EmoteAtlas {
             .ok_or_else(|| EmoteError::InvalidFormat(format!("unknown texture {id}")))?;
         match texture.format {
             TextureFormat::Dxt5 => decode_dxt5(bytes, texture.width, texture.height),
+            TextureFormat::Rgba8 => decode_rgba8(bytes, texture.width, texture.height),
             TextureFormat::Other(ref format) => {
                 Err(EmoteError::Unsupported(format!("texture format {format}")))
             }
@@ -136,6 +140,8 @@ fn parse_texture(id: &str, value: &PsbValue) -> Result<EmoteTexture> {
         truncated_height: required_u32(value, "truncated_height")?,
         format: if format.eq_ignore_ascii_case("DXT5") {
             TextureFormat::Dxt5
+        } else if format.eq_ignore_ascii_case("RGBA8") {
+            TextureFormat::Rgba8
         } else {
             TextureFormat::Other(format)
         },
@@ -170,6 +176,9 @@ fn parse_icon(texture_id: &str, id: &str, value: &PsbValue) -> Result<AtlasIcon>
 
 fn validate_texture_resource(document: &PsbDocument, texture: &EmoteTexture) -> Result<()> {
     let bytes = document.resource(texture.resource)?;
+    if texture.format == TextureFormat::Rgba8 {
+        validate_rgba8(bytes, texture.width, texture.height)?;
+    }
     if texture.format == TextureFormat::Dxt5 {
         let blocks_x = texture.width.div_ceil(4) as usize;
         let blocks_y = texture.height.div_ceil(4) as usize;
@@ -186,6 +195,49 @@ fn validate_texture_resource(document: &PsbDocument, texture: &EmoteTexture) -> 
         }
     }
     Ok(())
+}
+
+fn validate_rgba8(bytes: &[u8], width: u32, height: u32) -> Result<()> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| EmoteError::InvalidFormat("RGBA8 texture size overflow".into()))?;
+    if width == 0 || height == 0 || bytes.len() != expected {
+        return Err(EmoteError::InvalidFormat(format!(
+            "RGBA8 resource has {} bytes, expected {width}x{height}x4",
+            bytes.len()
+        )));
+    }
+    Ok(())
+}
+
+fn decode_rgba8(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    validate_rgba8(bytes, width, height)?;
+    let mut rgba = bytes.to_vec();
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(rgba)
+}
+
+#[cfg(test)]
+mod rgba_tests {
+    use super::*;
+    #[test]
+    fn rgba8_swaps_color_channels_and_preserves_alpha_and_rows() {
+        let bgra = [
+            11, 23, 37, 0, 51, 63, 79, 127, 91, 103, 117, 255, 1, 2, 3, 64,
+        ];
+        assert_eq!(
+            decode_rgba8(&bgra, 2, 2).unwrap(),
+            [
+                37, 23, 11, 0, 79, 63, 51, 127, 117, 103, 91, 255, 3, 2, 1, 64
+            ]
+        );
+        assert!(decode_rgba8(&bgra[..15], 2, 2).is_err());
+        assert!(decode_rgba8(&bgra, u32::MAX, u32::MAX).is_err());
+        assert!(decode_rgba8(&[], 0, 0).is_err());
+    }
 }
 
 fn required_string(value: &PsbValue, key: &str) -> Result<String> {

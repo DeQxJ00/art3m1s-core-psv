@@ -294,6 +294,14 @@ pub trait EngineCallbacks: Send + Sync {
         None
     }
 
+    fn emote_variable(&self, _id: &str, _next: bool, _label: &str) -> crate::Result<f32> {
+        Err(unsupported_emote())
+    }
+
+    fn emote_timeline_playing(&self, _id: &str, _next: bool, _label: &str) -> crate::Result<bool> {
+        Err(unsupported_emote())
+    }
+
     /// Applies one operation to the current or pending E-Mote layer.
     fn command_emote_layer(
         &self,
@@ -467,6 +475,22 @@ impl EmoteLayerApi {
 
 impl UserData for EmoteLayerApi {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("getVariable", |_lua, this, label: String| {
+            this.ctx
+                .lock()
+                .unwrap()
+                .callbacks
+                .emote_variable(&this.id, this.next, &label)
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method("isTimelinePlaying", |_lua, this, label: Option<String>| {
+            this.ctx
+                .lock()
+                .unwrap()
+                .callbacks
+                .emote_timeline_playing(&this.id, this.next, label.as_deref().unwrap_or(""))
+                .map_err(mlua::Error::external)
+        });
         methods.add_method(
             "setScale",
             |_lua, this, (scale, origin_x, origin_y): (f32, f32, f32)| {
@@ -1704,6 +1728,16 @@ mod tests {
             (id == "1.0").then_some(false)
         }
 
+        fn emote_variable(&self, id: &str, next: bool, label: &str) -> crate::Result<f32> {
+            assert_eq!((id, next, label), ("1.0", false, "face_talk"));
+            Ok(0.5)
+        }
+
+        fn emote_timeline_playing(&self, id: &str, next: bool, label: &str) -> crate::Result<bool> {
+            assert_eq!((id, next), ("1.0", false));
+            Ok(label.is_empty() || label == "active")
+        }
+
         fn command_emote_layer(
             &self,
             id: &str,
@@ -2032,6 +2066,10 @@ mod tests {
             layer:playTimeline("笑顔_ボイス再生用", 1)
             local current = __engine:getEmoteLayer{id="1.0", next=true}
             current:setVariable("face_talk", 0.5, 0, 0)
+            assert(current:getVariable("face_talk") == 0.5)
+            assert(current:isTimelinePlaying("active"))
+            assert(current:isTimelinePlaying())
+            assert(not current:isTimelinePlaying("missing"))
             "#,
         )
         .exec()

@@ -136,6 +136,7 @@ struct EmoteTextureState {
     name: String,
     width: u32,
     height: u32,
+    format: art3m1s_emote::TextureFormat,
     gpu: Option<(TextureId, TextureInfo)>,
     source: Option<PsbResourceData>,
 }
@@ -277,6 +278,41 @@ impl EmoteState {
         instance.command(command)
     }
 
+    fn builtin(&self, id: &str, next: bool) -> Result<&EmoteInstance, String> {
+        let slots = self
+            .layers
+            .get(id)
+            .ok_or_else(|| format!("unknown E-Mote layer {id}"))?;
+        match if next {
+            slots.pending.as_ref()
+        } else {
+            slots.active.as_ref()
+        } {
+            Some(EmoteInstanceSlot::Builtin(instance)) => Ok(instance),
+            _ => Err(format!(
+                "E-Mote query unavailable for layer {id}, pending={next}"
+            )),
+        }
+    }
+
+    pub fn variable(&self, id: &str, next: bool, label: &str) -> Result<f32, String> {
+        let instance = self.builtin(id, next)?;
+        Ok(instance
+            .player
+            .variables()
+            .get(label)
+            .map_or(0.0, |state| state.value))
+    }
+
+    pub fn timeline_playing(&self, id: &str, next: bool, label: &str) -> Result<bool, String> {
+        let timelines = self.builtin(id, next)?.player.timelines();
+        Ok(if label.is_empty() {
+            !timelines.is_empty()
+        } else {
+            timelines.contains_key(label)
+        })
+    }
+
     pub fn advance(&mut self, delta_ms: u64) -> bool {
         let frames = delta_ms as f32 * 60.0 / 1000.0;
         let mut changed = false;
@@ -415,6 +451,10 @@ impl EmoteInstance {
         let (texture_source_bytes, mut texture_data) = model
             .take_texture_data()
             .map_err(|error| format!("failed to detach E-Mote textures {path}: {error}"))?;
+        crate::core_info!(
+            "[E-Mote] model={path} surface={width}x{height} textures={} source_bytes={texture_source_bytes}",
+            model.atlas().textures().len()
+        );
         let mut textures = BTreeMap::new();
         for (texture_id, texture) in model.atlas().textures() {
             textures.insert(
@@ -423,6 +463,7 @@ impl EmoteInstance {
                     name: format!(":emote/{generation}/{texture_id}"),
                     width: texture.width,
                     height: texture.height,
+                    format: texture.format.clone(),
                     gpu: None,
                     source: texture_data.remove(texture_id),
                 },
@@ -488,7 +529,9 @@ impl EmoteInstance {
                 label,
                 frames,
                 easing,
-            } => self.player.fade_in_timeline(label, frames, easing),
+            } => self
+                .player
+                .fade_in_model_timeline(&self.model, label, frames, easing),
             EmoteLayerCommand::FadeOutTimeline {
                 label,
                 frames,
@@ -516,12 +559,14 @@ impl EmoteInstance {
                     format!("E-Mote texture {texture_id} was evicted after source release")
                 })?;
                 let compressed = compressed.as_bytes();
-                texture.gpu = provider.upload_dxt5_render_only(
-                    &texture.name,
-                    texture.width,
-                    texture.height,
-                    compressed,
-                );
+                if texture.format == art3m1s_emote::TextureFormat::Dxt5 {
+                    texture.gpu = provider.upload_dxt5_render_only(
+                        &texture.name,
+                        texture.width,
+                        texture.height,
+                        compressed,
+                    );
+                }
 
                 #[cfg(any(
                     target_os = "android",
@@ -652,42 +697,7 @@ impl EmoteInstance {
             }
         }
 
-        let mut state = EmoteRenderState {
-            // The base motion is the static model graph entry. Timeline
-            // playback drives its parameterized layers independently.
-            motion_time: 0.0,
-            variables: BTreeMap::new(),
-        };
-        let samples = self.player.active_timeline_samples(&self.model);
-        for (timeline, values) in samples.iter().filter(|(state, _)| {
-            self.model
-                .timelines()
-                .get(&state.label)
-                .is_some_and(|timeline| !timeline.diff)
-        }) {
-            for (label, value) in values {
-                let current = state.variables.entry(label.clone()).or_insert(0.0);
-                *current += (*value - *current) * timeline.weight.clamp(0.0, 1.0);
-            }
-        }
-        for (timeline, values) in samples.iter().filter(|(state, _)| {
-            self.model
-                .timelines()
-                .get(&state.label)
-                .is_some_and(|timeline| timeline.diff)
-        }) {
-            for (label, value) in values {
-                *state.variables.entry(label.clone()).or_insert(0.0) +=
-                    *value * timeline.weight.clamp(0.0, 1.0);
-            }
-        }
-        for (label, variable) in self.player.variables() {
-            state.variables.insert(label.clone(), variable.value);
-        }
-        for blink in &self.eye_blinks {
-            blink.apply(&mut state.variables);
-        }
-
+        let state = self.render_state();
         let items = EmoteMotionEvaluator::new(&self.model)
             .evaluate_base_with_history(&state, &mut self.evaluation_history)
             .map_err(|error| error.to_string())?;
@@ -695,6 +705,20 @@ impl EmoteInstance {
             .into_iter()
             .filter_map(|item| self.draw_command(item))
             .collect())
+    }
+
+    fn render_state(&self) -> EmoteRenderState {
+        let mut state = EmoteRenderState {
+            // The base motion is the static model graph entry. Timeline
+            // playback drives its parameterized layers independently.
+            motion_time: 0.0,
+            variables: self.player.evaluated_variables(),
+        };
+        for blink in &self.eye_blinks {
+            blink.apply(&mut state.variables);
+        }
+
+        state
     }
 
     fn draw_command(&self, item: EmoteDrawItem) -> Option<DrawCommand> {
@@ -1109,6 +1133,83 @@ mod tests {
                 "set ART3M1S_FIXTURE_NEKOMIKO_DIR or ART3M1S_FIXTURES_DIR before running ignored compatibility tests",
             );
         root.join("image/fhd/fg/aya/tay_0.psb")
+    }
+
+    #[test]
+    #[ignore = "requires ART3M1S_FIXTURE_RGBA_EMOTE_MODEL"]
+    fn rgba_model_uploads_and_answers_live_playback_queries() {
+        let path = std::env::var("ART3M1S_FIXTURE_RGBA_EMOTE_MODEL").unwrap();
+        let mut state = EmoteState::default();
+        assert!(
+            !state
+                .create_layer(
+                    "10.0",
+                    vec![(path.clone(), std::fs::read(&path).unwrap())],
+                    960,
+                    540
+                )
+                .unwrap()
+        );
+        let instance = state.builtin("10.0", false).unwrap();
+        assert!(
+            instance
+                .textures
+                .values()
+                .all(|t| t.format == art3m1s_emote::TextureFormat::Rgba8)
+        );
+        let label = instance.model.timelines().keys().next().unwrap().clone();
+        assert!(!state.timeline_playing("10.0", false, &label).unwrap());
+        state
+            .command(
+                "10.0",
+                false,
+                EmoteLayerCommand::PlayTimeline {
+                    label: label.clone(),
+                    flags: 1,
+                },
+            )
+            .unwrap();
+        assert!(state.timeline_playing("10.0", false, &label).unwrap());
+        assert!(state.timeline_playing("10.0", false, "").unwrap());
+        state
+            .command(
+                "10.0",
+                false,
+                EmoteLayerCommand::SetVariable {
+                    label: "face_talk".into(),
+                    value: 0.6,
+                    frames: 0.,
+                    easing: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(state.variable("10.0", false, "face_talk").unwrap(), 0.6);
+        let mut provider = MockProvider::new();
+        state.advance(16);
+        let (commands, retained) = state.build_commands(&mut provider);
+        assert!(commands["10.0"].len() > 10);
+        assert!(!retained.is_empty());
+        assert!(
+            state
+                .builtin("10.0", false)
+                .unwrap()
+                .textures
+                .values()
+                .all(|t| t.source.is_none())
+        );
+        state
+            .command(
+                "10.0",
+                false,
+                EmoteLayerCommand::StopTimeline {
+                    label: label.clone(),
+                },
+            )
+            .unwrap();
+        assert!(!state.timeline_playing("10.0", false, &label).unwrap());
+        // Removing an instance must invalidate userdata queries, not return stale values.
+        state.clear();
+        assert!(state.variable("10.0", false, "face_talk").is_err());
     }
 
     #[test]
