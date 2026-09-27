@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 mod deformation_cache;
@@ -590,9 +591,9 @@ impl<'a> EmoteMotionEvaluator<'a> {
             parent_context.inherit_source.mesh_sync.as_deref(),
             content.as_mut(),
         ) {
-            apply_mesh_sync_to_content(content, sync, layer.inherit_mask);
+            apply_mesh_sync_to_content(content.to_mut(), sync, layer.inherit_mask);
         }
-        let content_ref = content.as_ref();
+        let content_ref = content.as_deref();
         let frame_start = active_frame_start(layer, layer_time).unwrap_or(layer_time);
         let layer_context = apply_layer_transform(parent_context, layer, content_ref);
         // This layer's own patch becomes the coord/angle/zoom sync source for
@@ -1119,12 +1120,12 @@ fn identity_grid() -> Vec<f32> {
     points
 }
 
-fn sample_content_with_history(
-    layer: &EmoteLayer,
+fn sample_content_with_history<'a>(
+    layer: &'a EmoteLayer,
     time: f32,
     history: &mut EmoteEvaluationHistory,
     path: &[usize],
-) -> Option<EmoteFrameContent> {
+) -> Option<Cow<'a, EmoteFrameContent>> {
     if !layer.frames.iter().any(|frame| frame.frame_type == 0) {
         return sample_content(layer, time);
     }
@@ -1132,16 +1133,16 @@ fn sample_content_with_history(
     if frame.frame_type == 0 {
         let (generation, content) = history.frames.get_mut(path)?;
         *generation = history.generation;
-        return Some(content.clone());
+        return Some(Cow::Owned(content.clone()));
     }
     let content = sample_content(layer, time)?;
     history
         .frames
-        .insert(path.to_vec(), (history.generation, content.clone()));
+        .insert(path.to_vec(), (history.generation, content.as_ref().clone()));
     Some(content)
 }
 
-fn sample_content(layer: &EmoteLayer, time: f32) -> Option<EmoteFrameContent> {
+fn sample_content(layer: &EmoteLayer, time: f32) -> Option<Cow<'_, EmoteFrameContent>> {
     let index = layer.frames.iter().rposition(|frame| frame.time <= time)?;
     let frame = &layer.frames[index];
     match frame.frame_type {
@@ -1150,30 +1151,30 @@ fn sample_content(layer: &EmoteLayer, time: f32) -> Option<EmoteFrameContent> {
         0 => None,
         3 => {
             let Some(next) = layer.frames.get(index + 1) else {
-                return frame.content.clone();
+                return frame.content.as_ref().map(Cow::Borrowed);
             };
             if next.frame_type == 0 {
-                return frame.content.clone();
+                return frame.content.as_ref().map(Cow::Borrowed);
             }
             let (Some(from), Some(to)) = (&frame.content, &next.content) else {
-                return frame.content.clone();
+                return frame.content.as_ref().map(Cow::Borrowed);
             };
             let span = next.time - frame.time;
             if span <= f32::EPSILON {
-                next.content.clone()
+                next.content.as_ref().map(Cow::Borrowed)
             } else {
                 let mut elapsed = (time - frame.time).max(0.0);
                 if let Some(interval) = from.time_interval.filter(|value| *value > 0.0) {
                     elapsed = (elapsed / interval).trunc() * interval;
                 }
-                Some(interpolate_content(
+                Some(Cow::Owned(interpolate_content(
                     from,
                     to,
                     (elapsed / span).clamp(0.0, 1.0),
-                ))
+                )))
             }
         }
-        _ => frame.content.clone(),
+        _ => frame.content.as_ref().map(Cow::Borrowed),
     }
 }
 
@@ -1662,7 +1663,10 @@ fn apply_layer_transform(
     content: Option<&EmoteFrameContent>,
 ) -> TransformContext {
     let mask = layer.inherit_mask;
-    let content = content.cloned().unwrap_or_default();
+    // Transform evaluation only reads frame channels. Cloning the whole frame
+    // also duplicates its strings and mesh arrays for every layer each frame.
+    let default_content = EmoteFrameContent::default();
+    let content = content.unwrap_or(&default_content);
     let own = FrameLinearState {
         flip_x: content.flip_x,
         flip_y: content.flip_y,
@@ -1674,9 +1678,8 @@ fn apply_layer_transform(
     };
     let source = parent.inherit_source.clone();
     let inherited = inherit_linear_state(own, source.state, mask);
-    let own_linear = build_linear_transform(&layer.transform_order, own);
     let linear = if mask & 0x1fc == 0x1fc {
-        source.linear.then(own_linear)
+        source.linear.then(build_linear_transform(&layer.transform_order, own))
     } else if !parent.motion_independent_layer_inherit {
         let relative = remove_motion_root_linear_state(inherited, parent.motion_root.state, mask);
         parent
@@ -1991,6 +1994,27 @@ mod tests {
         assert!((angle + 90.0).abs() < 0.7, "angle was {angle}");
         // 坐标位未置位，位置不动。
         assert_eq!(content.coord.unwrap(), vec![50.0, 50.0, 0.0]);
+    }
+
+    #[test]
+    fn sampled_frame_mutation_does_not_modify_model_or_hold_history() {
+        let mut layer = sampled_layer(1);
+        layer.frames.push(crate::EmoteLayerFrame { time: 20.0, frame_type: 0, content: None });
+        let original = layer.frames[0].content.as_ref().unwrap().coord.clone();
+        let mut history = EmoteEvaluationHistory::default();
+        let mut sampled = sample_content_with_history(&layer, 5.0, &mut history, &[1]).unwrap();
+        assert!(matches!(sampled, Cow::Borrowed(_)));
+        // meshSync may rewrite channels on the returned frame. Both the
+        // authored model and HOLD's pre-warp snapshot must remain untouched.
+        sampled.to_mut().coord.as_mut().unwrap()[0] = 99.0;
+        assert_eq!(layer.frames[0].content.as_ref().unwrap().coord, original);
+        let held = sample_content_with_history(&layer, 20.0, &mut history, &[1]).unwrap();
+        assert!(matches!(held, Cow::Owned(_)));
+        assert_eq!(held.coord, original);
+        let tween = sampled_layer(3);
+        let interpolated = sample_content(&tween, 5.0).unwrap();
+        assert!(matches!(interpolated, Cow::Owned(_)));
+        assert_eq!(interpolated.coord, Some(vec![5.0, 0.0]));
     }
 
     #[test]
