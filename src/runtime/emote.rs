@@ -17,6 +17,7 @@ use crate::render_pipeline::draw::{
 mod eluna;
 
 mod pose_cache;
+mod scene_activity;
 mod vertex_cache;
 
 pub(super) type SharedEmoteState = Arc<Mutex<EmoteState>>;
@@ -1090,6 +1091,22 @@ fn draw_mesh(points: Option<&[f32]>, width: f32, height: f32) -> Option<DrawMesh
 }
 
 impl CoreRuntime {
+    /// Scene presence, not animation/redraw activity: a held pose still uses
+    /// the scene clock, while retained models outside the scene do not.
+    pub fn emote_active(&self) -> bool {
+        if self.video.is_fullscreen_playing() {
+            return false;
+        }
+        let Ok(state) = self.emote.lock() else { return false; };
+        scene_activity::has_visible_emote(
+            self.compositor.scene(),
+            self.compositor.clock_ms(),
+            state.layers.iter().filter_map(|(id, slots)| {
+                (slots.active.is_some() || slots.pending.is_some()).then_some(id.as_str())
+            }),
+        )
+    }
+
     pub(crate) fn set_emote_backend(&mut self, backend: EmoteBackend) {
         let cleared = self.emote.lock().unwrap().set_backend(backend);
         #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
