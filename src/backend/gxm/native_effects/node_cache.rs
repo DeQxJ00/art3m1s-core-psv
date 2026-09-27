@@ -11,6 +11,7 @@ struct Entry {
 }
 #[derive(Default)]
 pub(super) struct NodeCache {
+    pub masks: super::mask_reuse::MaskReuse,
     entries: [Entry;5],
     busy: [bool;5],
     final_owned: [bool;5],
@@ -57,7 +58,7 @@ impl NodeCache {
         crate::core_info!("[effect-input-miss] node={:?} filter={} reason={} busy={:?} final={:?} protected={:?}",
             g.key,g.effect.name,reason,self.busy,self.final_owned,self.protected);
     }
-    pub fn begin(&mut self){self.busy.fill(false);self.final_owned.fill(false);self.protected.fill(false);self.clock=self.clock.saturating_add(1);}
+    pub fn begin(&mut self){self.masks.clear();self.busy.fill(false);self.final_owned.fill(false);self.protected.fill(false);self.clock=self.clock.saturating_add(1);}
     pub fn claim_final(&mut self,slot:usize){self.final_owned[slot]=true;}
     pub fn release_final(&mut self,slot:usize){self.final_owned[slot]=false;}
     pub fn busy(&self,slot:usize)->bool {self.busy[slot]}
