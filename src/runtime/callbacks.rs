@@ -730,7 +730,7 @@ impl EngineCallbacks for FfiCallbacks {
         let mut loaded = Vec::with_capacity(files.len());
         for file in files {
             let resolved = magic_path::resolve_path(&self.magic_paths, file);
-            let bytes = ffi::request_file(&resolved).map_err(|message| {
+            let bytes = super::emote_source_cache::read(&resolved).map_err(|message| {
                 asb_interpreter::Error::IoError(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     message,
@@ -738,11 +738,13 @@ impl EngineCallbacks for FfiCallbacks {
             })?;
             loaded.push((resolved, bytes));
         }
-        self.emote
+        let paths:Vec<_>=loaded.iter().map(|(p,_)|p.clone()).collect();
+        let result=self.emote
             .lock()
             .unwrap()
-            .create_layer(id, loaded, width, height)
-            .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
+            .create_layer_shared(id, loaded, width, height);
+        if result.is_err(){for path in paths{super::emote_source_cache::invalidate(&path);}}
+        result.map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
     }
 
     fn get_emote_layer(&self, id: &str, next: bool) -> Option<bool> {

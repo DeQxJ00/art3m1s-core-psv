@@ -138,6 +138,12 @@ impl PsbDocument {
     }
 
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
+        Self::from_shared_bytes(Arc::new(data))
+    }
+
+    /// Parse without copying a retained model source. Resource views keep this
+    /// same immutable allocation alive until the last texture consumer exits.
+    pub fn from_shared_bytes(data: Arc<Vec<u8>>) -> Result<Self> {
         let header = parse_header(&data)?;
         validate_body_start(&data, &header)?;
 
@@ -186,7 +192,7 @@ impl PsbDocument {
         let root = parser.parse_value(header.offset_entries as usize, 0)?;
 
         Ok(Self {
-            data: Arc::new(data),
+            data,
             header,
             names,
             strings,

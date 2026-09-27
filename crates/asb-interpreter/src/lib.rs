@@ -53,6 +53,8 @@ pub mod interpreter;
 pub mod lua_engine;
 mod preload_hints;
 mod surface_timeline;
+mod emote_timeline;
+pub use emote_timeline::EmoteTimelineCursor;
 pub use surface_timeline::SurfaceTimelineCursor;
 mod message_roles;
 mod toolbar_roles;

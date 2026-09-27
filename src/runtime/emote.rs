@@ -119,6 +119,7 @@ struct EmoteInstance {
     eye_blinks: Vec<EmoteEyeBlink>,
     textures: BTreeMap<String, EmoteTextureState>,
     texture_source_bytes: usize,
+    source_lease: Option<Arc<super::emote_source_cache::Source>>,
     #[cfg(any(
         target_os = "android",
         target_os = "ios",
@@ -219,6 +220,12 @@ impl EmoteState {
         width: u32,
         height: u32,
     ) -> Result<bool, String> {
+        self.create_layer_shared(id,files.into_iter().map(|(p,b)|(p,super::emote_source_cache::Source::uncached(b))).collect(),width,height)
+    }
+
+    pub(super) fn create_layer_shared(
+        &mut self,id:&str,files:Vec<(String,Arc<super::emote_source_cache::Source>)>,width:u32,height:u32,
+    )->Result<bool,String> {
         if files.len() != 1 {
             return Err(format!(
                 "E-Mote layer {id} requires exactly one embedded-texture PSB, got {}",
@@ -233,7 +240,7 @@ impl EmoteState {
         let generation = self.next_generation;
         let instance = match self.backend {
             EmoteBackend::Builtin => {
-                let mut instance = EmoteInstance::new(generation, &path, bytes, width, height)?;
+                let mut instance = EmoteInstance::new_shared(generation, &path, bytes, width, height)?;
                 instance.command(EmoteLayerCommand::SetMeshDivisionRatio { ratio: self.default_mesh_ratio });
                 EmoteInstanceSlot::Builtin(instance)
             }
@@ -243,7 +250,7 @@ impl EmoteState {
                     EmoteInstanceSlot::Eluna(eluna::ElunaEmoteInstance::new(
                         generation,
                         &path,
-                        &bytes,
+                        &bytes.bytes,
                         width,
                         height,
                         self.profiling_enabled,
@@ -478,7 +485,11 @@ impl EmoteInstance {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
-        let document = PsbDocument::from_bytes(bytes)
+        Self::new_shared(generation,path,super::emote_source_cache::Source::uncached(bytes),width,height)
+    }
+
+    fn new_shared(generation:u64,path:&str,source:Arc<super::emote_source_cache::Source>,width:u32,height:u32)->Result<Self,String>{
+        let document = PsbDocument::from_shared_bytes(source.bytes.clone())
             .map_err(|error| format!("failed to parse E-Mote model {path}: {error}"))?;
         let mut model = EmoteModel::from_document(document)
             .map_err(|error| format!("failed to load E-Mote model {path}: {error}"))?;
@@ -528,6 +539,7 @@ impl EmoteInstance {
             eye_blinks,
             textures,
             texture_source_bytes,
+            source_lease: Some(source),
             #[cfg(any(
                 target_os = "android",
                 target_os = "ios",
@@ -735,6 +747,7 @@ impl EmoteInstance {
                 self.astc_encoder = None;
             }
             let released = std::mem::take(&mut self.texture_source_bytes);
+            self.source_lease=None;
             if released != 0 {
                 crate::core_info!(
                     "[E-Mote] released {:.1} MiB shared texture source after GPU upload",
@@ -1171,6 +1184,8 @@ impl CoreRuntime {
     }
 
     pub(super) fn clear_emote_state(&mut self, reason: &str) {
+        super::emote_source_cache::cancel_plan();
+        self.emote_timeline_cursor=Default::default();
         let layers = self.emote.lock().unwrap().clear();
         #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
         let textures = if self.gl_ctx.make_current() {
