@@ -1356,6 +1356,39 @@ mod tests {
         }
     }
     #[test]
+    fn generated_stencil_runs_inside_existing_character_groups() {
+        let mut inner = test_group(GROUP_COMPOSITE_SHADER, 1, 2);
+        inner.effect.uniforms.insert("grayscale".into(), vec![1.0]);
+        let mut outer = test_group(GROUP_COMPOSITE_SHADER, 0, 3);
+        outer.effect.uniforms.insert("alpha".into(), vec![0.8]);
+        let mut frame = DrawList::new();
+        for (id, label, masks) in [
+            (10, "face", vec![]),
+            (20, "shadow", vec!["face".to_owned()]),
+            (30, "following", vec![]),
+        ] {
+            let mut c = group_command(&inner, 960, 544);
+            c.texture = TextureId(id);
+            c.shader = None;
+            c.stencil = Some(StencilMetadata {
+                namespace: 7,
+                source_label: label.into(),
+                mask_labels: masks,
+            });
+            frame.push(c);
+        }
+        frame.shader_groups = vec![inner, outer];
+        frame.materialize_stencil_groups(ALPHA_MASK_SHADER);
+        EVENTS.with(|v| v.borrow_mut().clear());
+        render(&frame, 960, 544);
+        EVENTS.with(|v| assert_eq!(*v.borrow(), [
+            "frame", "begin-group", "draw:10", "begin-group", "begin-group",
+            "draw:20", "begin-mask", "draw:10", "end-group:2", "end-group:3",
+            "draw:30", "end-group:3", "end-frame",
+        ]));
+    }
+
+    #[test]
     fn nested_groups_masks_and_following_sprites_keep_draw_order() {
         let mut inner = test_group(GROUP_COMPOSITE_SHADER, 0, 1);
         inner.effect.uniforms.insert("grayscale".into(),vec![1.0]);

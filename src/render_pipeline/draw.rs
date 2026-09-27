@@ -414,7 +414,15 @@ impl DrawList {
             if mask_end == mask_start {
                 continue;
             }
-            self.shader_groups.push(ShaderGroup {
+            // Groups are stored child-before-parent. Renderers recurse only
+            // into entries preceding the current group; appending a stencil
+            // after an existing character composite silently bypasses it.
+            // Mask this sprite before any enclosing filter/composite, including
+            // an existing group with exactly the same one-command range.
+            let position = self.shader_groups.iter()
+                .position(|group| group.start <= index && index < group.end)
+                .unwrap_or(self.shader_groups.len());
+            self.shader_groups.insert(position, ShaderGroup {
                 key: command_key.map(|command| ShaderGroupKey::Stencil { command }),
                 start: index,
                 end: index + 1,
