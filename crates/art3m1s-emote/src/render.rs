@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 mod deformation_cache;
+mod evaluation_plan;
 use deformation_cache::DeformationCache;
 
 use crate::{
@@ -356,6 +357,7 @@ pub struct EmoteEvaluationHistory {
     generation: u64,
     frames: HashMap<Vec<usize>, (u64, EmoteFrameContent)>,
     deformations: DeformationCache,
+    plans: HashMap<usize, evaluation_plan::LayerPlan>,
 }
 
 impl EmoteEvaluationHistory {
@@ -364,6 +366,7 @@ impl EmoteEvaluationHistory {
         if !self.model.ptr_eq(&identity) || self.generation == u64::MAX {
             self.frames.clear();
             self.deformations.clear();
+            self.plans = evaluation_plan::compile(model);
             self.generation = 0;
         }
         self.model = identity;
@@ -439,7 +442,7 @@ impl<'a> EmoteMotionEvaluator<'a> {
         self.model
             .apply_clamp_controls(&mut resolved_state.variables);
         let mut items = Vec::new();
-        let mut stack = BTreeSet::new();
+        let mut stack = Vec::with_capacity(32);
         let mut deformers = Vec::new();
         self.visit_motion(
             character,
@@ -449,7 +452,7 @@ impl<'a> EmoteMotionEvaluator<'a> {
             TransformContext::default(),
             0,
             &[],
-            &[],
+            &mut Vec::with_capacity(16),
             &mut stack,
             &mut deformers,
             &mut items,
@@ -478,8 +481,8 @@ impl<'a> EmoteMotionEvaluator<'a> {
         parent_context: TransformContext,
         depth: usize,
         stencil_mask_layers: &[String],
-        order_prefix: &[i64],
-        stack: &mut BTreeSet<(String, String)>,
+        order_prefix: &mut Vec<i64>,
+        stack: &mut Vec<usize>,
         deformers: &mut Vec<MeshDeformer>,
         items: &mut Vec<EmoteDrawItem>,
         history: &mut EmoteEvaluationHistory,
@@ -490,10 +493,6 @@ impl<'a> EmoteMotionEvaluator<'a> {
                 "E-Mote motion recursion limit exceeded".into(),
             ));
         }
-        let key = (character.to_owned(), motion_label.to_owned());
-        if !stack.insert(key.clone()) {
-            return Ok(());
-        }
         let motion = self
             .model
             .motions()
@@ -503,6 +502,9 @@ impl<'a> EmoteMotionEvaluator<'a> {
                     "missing referenced motion {character}/{motion_label}"
                 ))
             })?;
+        let key = motion as *const crate::EmoteMotion as usize;
+        if stack.contains(&key) { return Ok(()); }
+        stack.push(key);
         // loop_time < 0（原始 0xFF 哨兵）表示不循环，走 clamp 分支。
         let motion_time = if motion.loop_time >= 0.0
             && motion.last_time > motion.loop_time
@@ -541,7 +543,8 @@ impl<'a> EmoteMotionEvaluator<'a> {
                 history_path,
             )?;
         }
-        stack.remove(&key);
+        let popped = stack.pop();
+        debug_assert_eq!(popped, Some(key));
         Ok(())
     }
 
@@ -556,33 +559,32 @@ impl<'a> EmoteMotionEvaluator<'a> {
         parent_context: TransformContext,
         depth: usize,
         parent_stencil_mask_layers: &[String],
-        order_prefix: &[i64],
+        order_prefix: &mut Vec<i64>,
         structural_index: &mut usize,
-        stack: &mut BTreeSet<(String, String)>,
+        stack: &mut Vec<usize>,
         deformers: &mut Vec<MeshDeformer>,
         items: &mut Vec<EmoteDrawItem>,
         history: &mut EmoteEvaluationHistory,
         history_path: &mut Vec<usize>,
     ) -> Result<()> {
         let suspended_deformers = (!layer.inherit_shape).then(|| std::mem::take(deformers));
-        let mut draw_order = order_prefix.to_vec();
+
         let index = *structural_index;
         *structural_index += 1;
         // Priority references preorder LayerInfo indices, never authored names.
         // Negate emission ranks for the existing descending key comparator.
-        draw_order.push(
+        order_prefix.push(
             priority
                 .and_then(|ranks| ranks.get(index))
                 .map_or(index as i64, |rank| -(*rank as i64)),
         );
         history_path.push(layer as *const EmoteLayer as usize);
         let layer_time = resolve_layer_time(layer, parameters, motion_time, state);
-        let mut content = sample_content_with_history(layer, layer_time, history, history_path);
-        let frame_valid = layer
-            .frames
-            .iter()
-            .rfind(|frame| frame.time <= layer_time)
-            .is_some_and(|frame| frame.frame_type != 0);
+        let plan = history.plans.get(&(layer as *const EmoteLayer as usize)).copied()
+            .unwrap_or_else(|| evaluation_plan::LayerPlan::new(layer));
+        let cursor = plan.cursor(layer, layer_time);
+        let mut content = sample_content_with_cursor(layer, layer_time, cursor, plan.has_hold, history, history_path);
+        let frame_valid = cursor.is_some_and(|i| layer.frames[i].frame_type != 0);
         // Native meshSyncChild low bits (coord/angle/zoom): the selected
         // ancestor's patch warps this layer's evaluated frame channels before
         // its transform is composed.  The history snapshot stays unwarped so
@@ -594,7 +596,7 @@ impl<'a> EmoteMotionEvaluator<'a> {
             apply_mesh_sync_to_content(content.to_mut(), sync, layer.inherit_mask);
         }
         let content_ref = content.as_deref();
-        let frame_start = active_frame_start(layer, layer_time).unwrap_or(layer_time);
+        let frame_start = cursor.map_or(layer_time, |i| layer.frames[i].time);
         let layer_context = apply_layer_transform(parent_context, layer, content_ref);
         // This layer's own patch becomes the coord/angle/zoom sync source for
         // its direct children when the low mask bits are set.
@@ -666,7 +668,7 @@ impl<'a> EmoteMotionEvaluator<'a> {
                 layer.motion_independent_layer_inherit,
                 depth,
                 stencil_mask_layers,
-                &draw_order,
+                order_prefix,
                 stack,
                 deformers,
                 items,
@@ -674,6 +676,8 @@ impl<'a> EmoteMotionEvaluator<'a> {
                 history_path,
             )?;
         }
+
+        order_prefix.pop();
 
         // The layer's own sprite consumes its mesh through the draw item's
         // authored patch (see apply_deformers); the chain entry exists for
@@ -726,8 +730,8 @@ impl<'a> EmoteMotionEvaluator<'a> {
         motion_independent_layer_inherit: bool,
         depth: usize,
         stencil_mask_layers: &[String],
-        draw_order: &[i64],
-        stack: &mut BTreeSet<(String, String)>,
+        draw_order: &mut Vec<i64>,
+        stack: &mut Vec<usize>,
         deformers: &mut Vec<MeshDeformer>,
         items: &mut Vec<EmoteDrawItem>,
         history: &mut EmoteEvaluationHistory,
@@ -1120,30 +1124,43 @@ fn identity_grid() -> Vec<f32> {
     points
 }
 
+#[cfg(test)]
 fn sample_content_with_history<'a>(
     layer: &'a EmoteLayer,
     time: f32,
     history: &mut EmoteEvaluationHistory,
     path: &[usize],
 ) -> Option<Cow<'a, EmoteFrameContent>> {
-    if !layer.frames.iter().any(|frame| frame.frame_type == 0) {
-        return sample_content(layer, time);
-    }
-    let frame = layer.frames.iter().rfind(|frame| frame.time <= time)?;
+    let plan = evaluation_plan::LayerPlan::new(layer);
+    sample_content_with_cursor(layer, time, plan.cursor(layer,time), plan.has_hold, history, path)
+}
+
+fn sample_content_with_cursor<'a>(
+    layer: &'a EmoteLayer, time: f32, cursor: Option<usize>, has_hold: bool,
+    history: &mut EmoteEvaluationHistory, path: &[usize],
+) -> Option<Cow<'a, EmoteFrameContent>> {
+    let index = cursor?;
+    if !has_hold { return sample_content_at(layer, time, index); }
+    let frame = &layer.frames[index];
     if frame.frame_type == 0 {
         let (generation, content) = history.frames.get_mut(path)?;
         *generation = history.generation;
         return Some(Cow::Owned(content.clone()));
     }
-    let content = sample_content(layer, time)?;
+    let content = sample_content_at(layer, time, index)?;
     history
         .frames
         .insert(path.to_vec(), (history.generation, content.as_ref().clone()));
     Some(content)
 }
 
+#[cfg(test)]
 fn sample_content(layer: &EmoteLayer, time: f32) -> Option<Cow<'_, EmoteFrameContent>> {
     let index = layer.frames.iter().rposition(|frame| frame.time <= time)?;
+    sample_content_at(layer,time,index)
+}
+
+fn sample_content_at(layer: &EmoteLayer, time: f32, index: usize) -> Option<Cow<'_, EmoteFrameContent>> {
     let frame = &layer.frames[index];
     match frame.frame_type {
         // A fresh evaluator has no decoded local state to hold. Playback
@@ -1178,6 +1195,7 @@ fn sample_content(layer: &EmoteLayer, time: f32) -> Option<Cow<'_, EmoteFrameCon
     }
 }
 
+#[cfg(test)]
 fn active_frame_start(layer: &EmoteLayer, time: f32) -> Option<f32> {
     layer
         .frames
@@ -1872,7 +1890,7 @@ fn compare_draw_order(left: &[i64], right: &[i64]) -> Ordering {
 mod tests {
     use super::*;
 
-    fn sampled_layer(frame_type: i64) -> EmoteLayer {
+    pub(super) fn sampled_layer(frame_type: i64) -> EmoteLayer {
         EmoteLayer {
             label: "sample".into(),
             layer_type: 0,
