@@ -90,7 +90,7 @@ impl Compositor {
         // area behind while a layer is moving (or otherwise being animated).
         let props = resolved_props(layer, self.clock_ms);
 
-        if !props.is_visible() {
+        if layer.host_hidden || !props.is_visible() {
             return;
         }
 

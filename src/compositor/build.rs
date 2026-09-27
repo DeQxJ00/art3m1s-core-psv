@@ -139,7 +139,7 @@ fn visit(
     let props = resolved_props(layer, now_ms);
 
     // 隐藏的图层连同整棵子树一起跳过。
-    if !props.is_visible() {
+    if layer.host_hidden || !props.is_visible() {
         return;
     }
 

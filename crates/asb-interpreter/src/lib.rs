@@ -55,6 +55,7 @@ mod preload_hints;
 mod surface_timeline;
 pub use surface_timeline::SurfaceTimelineCursor;
 mod message_roles;
+mod toolbar_roles;
 pub use message_roles::MessageLayerIds;
 #[cfg(feature = "backend-luau")]
 pub mod luau_polyfill;
