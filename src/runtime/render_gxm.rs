@@ -15,6 +15,10 @@ impl CoreRuntime {
         self.texture_provider.reclaim_video_gpu_cache(bytes)
     }
     pub fn prepare_gxm_textures(&mut self) {
+        if let Some(paths)=self.interpreter.query_emote_timeline(&mut self.emote_timeline_cursor){
+            let paths:Vec<_>=paths.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect();
+            super::emote_source_cache::plan(&paths,self.png_comments.clone());
+        }
         let timeline_started=std::time::Instant::now();
         if let Some(future)=self.interpreter.query_surface_timeline(&mut self.surface_timeline_cursor) {
             self.texture_provider.set_warm_plan(&future);

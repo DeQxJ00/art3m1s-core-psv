@@ -47,6 +47,10 @@ impl CoreRuntime {
         self.pending_message_text = None;
         self.clear_pending_text_translation();
         self.clear_emote_state("project reload");
+        #[cfg(all(target_os="vita",feature="gxm-backend"))]
+        super::surface_loader::shutdown();
+        super::emote_source_cache::reset();
+        self.emote_timeline_cursor=Default::default();
         self.install_interpreter(project.create_interpreter());
 
         self.wire_texture_source();
@@ -108,12 +112,13 @@ impl CoreRuntime {
     }
 
     fn wire_engine_callbacks(&mut self) {
+        self.png_comments=Default::default();
         self.interpreter
             .set_engine_callbacks(Box::new(FfiCallbacks {
                 input: Arc::clone(&self.input),
                 magic_paths: Arc::clone(&self.magic_paths),
                 layer_info: Arc::clone(&self.layer_info),
-            png_comments: Default::default(),
+                png_comments: self.png_comments.clone(),
                 volumes: Arc::clone(&self.volumes),
                 debug_skip_active: Arc::clone(&self.debug_skip_active),
                 script_status: Arc::clone(&self.script_status),

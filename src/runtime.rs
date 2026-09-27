@@ -31,6 +31,7 @@ mod surface_loader;
 mod control;
 mod dialog;
 pub(crate) mod emote;
+mod emote_source_cache;
 mod events;
 mod input;
 mod layer_info;
@@ -90,6 +91,8 @@ pub struct CoreRuntime {
     renderer: RuntimeRenderer,
     texture_provider: RuntimeTextureProvider,
     surface_timeline_cursor: asb_interpreter::SurfaceTimelineCursor,
+    emote_timeline_cursor: asb_interpreter::EmoteTimelineCursor,
+    png_comments: png_comments::SharedComments,
     compositor: Compositor,
     /// 上一帧已经提交的逻辑场景。转场源帧需保留旧图像层，同时按当前状态
     /// 剔除刚隐藏或删除的消息文字，不能直接复用已经烘入文字的 FBO。
@@ -268,6 +271,8 @@ impl CoreRuntime {
             renderer,
             texture_provider,
             surface_timeline_cursor: Default::default(),
+            emote_timeline_cursor: Default::default(),
+            png_comments: Default::default(),
             compositor,
             last_rendered_scene: None,
             last_rendered_clock_ms: 0,
@@ -871,6 +876,7 @@ impl Drop for CoreRuntime {
         #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
         surface_loader::shutdown();
         callbacks::clear_surface_cache();
+        emote_source_cache::reset();
     }
 }
 

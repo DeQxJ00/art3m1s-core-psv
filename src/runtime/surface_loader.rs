@@ -63,6 +63,7 @@ struct State {
     parked:Option<(String,u64)>,
     demotion_samples:u32,
     reserve_requested:bool,
+    model_pending:bool, model_last:bool,
 }
 impl State{
     fn queue_len(&self)->usize{self.queue.len()+self.masks.len()+self.animations.len()}
@@ -193,8 +194,19 @@ impl Loader {
             if paused.as_ref().is_some_and(|(p,t,_)|!state.entries.get(p).is_some_and(|e|e.pending&&e.ticket==*t)){
                 paused=None;state.parked=None;
             }
-            while state.queue_len()==0 && paused.is_none() && !state.stop { state = s.wake.wait(state).unwrap(); }
+            while state.queue_len()==0 && paused.is_none() && !state.model_pending && !state.stop { state = s.wake.wait(state).unwrap(); }
             if state.stop { break; }
+            // One bounded model request between image jobs; urgent image work
+            // keeps precedence. Model reads check cancellation between chunks.
+            if state.model_pending && state.urgent.is_none() && state.scene_priority.is_empty()
+                && (!state.model_last || state.queue_len()==0) {
+                state.model_pending=false;state.model_last=true;drop(state);
+                super::emote_source_cache::process_one();
+                let mut state=s.state.lock().unwrap();
+                state.model_pending|=super::emote_source_cache::pending();
+                continue;
+            }
+            state.model_last=false;
             let (job,priority)=if let Some(job)=state.pop_priority_job(){(Some(job),true)}
                 else if let Some((p,t,_))=&paused{(Some((p.clone(),*t)),false)}
                 else{(state.pop_job(),false)};
@@ -659,6 +671,7 @@ fn decoder_allowance_with_budget(width:u32,height:u32,source_capacity:usize,pixe
         .filter(|remaining|*remaining>0)
 }
 fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize,comments:&super::png_comments::SharedComments)->LoadStep{
+    super::emote_source_cache::reclaim(budget);
     if let Some(bytes)=resume{return decode_source(bytes,cancelled,should_yield,budget);}
     let bytes=(||{
     for suffix in [".png", "", ".jpg", ".jpeg"] {
@@ -768,6 +781,12 @@ fn worker(comments:super::png_comments::SharedComments)->Option<Arc<Loader>> {
     Some(worker)
 }
 pub(super) fn bind(path:&str,asynchronous:bool,comments:super::png_comments::SharedComments){if let Some(w)=worker(comments){w.bind(path,asynchronous);}}
+pub(super) fn wake_models(comments:super::png_comments::SharedComments){if let Some(w)=worker(comments){
+    let mut s=w.shared.state.lock().unwrap();s.model_pending=true;w.shared.wake.notify_one();
+}}
+pub(super) fn model_should_yield()->bool{handle().is_some_and(|w|{
+    let s=w.shared.state.lock().unwrap();s.stop||s.urgent.is_some()||!s.scene_priority.is_empty()
+})}
 pub(super) fn preload(paths:&[String],kind:Kind,chapter:Option<&str>,comments:super::png_comments::SharedComments){
     if let Some(w)=worker(comments){
         if let Some(chapter)=chapter{w.begin_chapter(chapter);}
@@ -787,7 +806,7 @@ pub(super) fn prioritize_scene(paths:&[String]){
 }
 pub(super) fn loading(path:Option<&str>)->bool{handle().is_some_and(|l|l.loading(path))}
 pub(super) fn unbind(path:&str){if let Some(l)=handle(){l.unbind(path);}}
-pub(super) fn cancel(){if let Some(l)=handle(){l.cancel();}}
+pub(super) fn cancel(){super::emote_source_cache::cancel_plan();if let Some(l)=handle(){l.cancel();}}
 pub(super) fn shutdown(){let loader=LOADER.lock().unwrap().take();if let Some(l)=loader{l.shutdown();}}
 
 #[cfg(test)]
