@@ -48,6 +48,7 @@ unsafe extern "C" {
     fn art3m1s_gxm_group_mask_begin() -> i32;
     fn art3m1s_gxm_group_mask_revision() -> u64;
     fn art3m1s_gxm_group_mask_reuse(revision: u64) -> i32;
+    fn art3m1s_gxm_emote_composite_cache_enabled() -> i32;
     fn art3m1s_gxm_group_end(draw: *const EffectDraw);
     fn art3m1s_gxm_texture_is_opaque(id: u64) -> i32;
     fn art3m1s_gxm_texture_is_empty(id: u64) -> i32;
@@ -573,10 +574,15 @@ impl RetainedGroup {
 }
 fn retainable_group(frame:&DrawList,index:usize,width:u32,height:u32)->Option<&ShaderGroup>{
     let g=frame.shader_groups.get(index)?;let e=&g.effect;
+    let commands=frame.commands.get(g.start..g.end)?;
+    // This is an existing isolated character group, not a new isolation
+    // boundary. Exact command/mask/texture checks still invalidate every pose.
+    let native_pose=!commands.is_empty() && commands.iter().all(|c|c.native_emote.is_some()&&c.shader.is_none())
+        && unsafe{art3m1s_gxm_emote_composite_cache_enabled()!=0};
     if g.start>=g.end || g.end>frame.commands.len() || e.name!=GROUP_COMPOSITE_SHADER
         || super::stage_clip(g.clip_bounds,width,height).is_err()
         || !matches!(scalar(e,"blendMode",0.),0.0|2.0)
-        || frame.commands[g.start..g.end].iter().any(|c|c.mesh.is_some()||c.native_emote.is_some()||c.stencil.is_some())
+        || (!native_pose && commands.iter().any(|c|c.mesh.is_some()||c.native_emote.is_some()||c.stencil.is_some()))
         // Fused draws still run a nontrivial fragment program over the screen.
         // Let stable groups bake once; changing groups keep their direct route.
         || passthrough_group(frame,index,width,height){return None;}
@@ -1213,6 +1219,8 @@ mod tests {
         MASK_TOKEN.with(|v| v.get())
     }
     #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_emote_composite_cache_enabled() -> i32 { 1 }
+    #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_group_mask_reuse(token: u64) -> i32 {
         let ok = token != 0 && MASK_REUSE_ENABLED.with(|v|v.get()) && MASK_TOKEN.with(|v|v.get()) == token;
         if ok { event("reuse-mask".into()); }
@@ -1244,6 +1252,42 @@ mod tests {
         mask.native_emote = None;assert!(!draw(&mut cache,&mask,800));
         assert!(!draw(&mut cache,&mask,800));
         MASK_REUSE_ENABLED.with(|v|v.set(false));
+        CHANGED_TEXTURE.with(|v|v.set(0));
+    }
+    #[test]
+    fn native_composite_replays_only_the_exact_pose_and_mask() {
+        let mut frame=neutral_frame();
+        for c in &mut frame.commands {
+            c.native_emote=Some(NativeEmoteMaterial {
+                corner_colors:[[1.;4];4],uv_rect:[0.,0.,1.,1.],blend_mode:0,
+                clip_rect:[-1.0e30,-1.0e30,1.0e30,1.0e30],wipe:[0.;3],
+            });
+        }
+        let mut masked=frame.shader_groups[0].clone();masked.start=0;masked.end=1;
+        masked.effect.name=ALPHA_MASK_SHADER.into();masked.mask_range=Some([0,1]);
+        frame.mask_commands=vec![frame.commands[0].clone()];
+        frame.shader_groups.insert(0,masked);
+        let mut cache=RetainedGroups::default();
+        assert!(retainable_group(&frame,1,960,544).is_some());
+        for _ in 0..4{render_cached(&frame,960,544,&mut cache);}
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&frame,960,544,&mut cache);
+        EVENTS.with(|v|assert!(v.borrow().contains(&"cached".to_string())));
+        // A changed transform, expression/mask opacity, texture replacement, or
+        // disappearing actor must not replay an earlier expression.
+        for change in 0..4 {
+            match change {
+                0=>frame.commands[0].transform.translation.x+=5.,
+                1=>frame.mask_commands[0].opacity=0.25,
+                2=>frame.commands[1].native_emote.as_mut().unwrap().corner_colors[0][3]=0.5,
+                _=>CHANGED_TEXTURE.with(|v|v.set(frame.commands[0].texture.0)),
+            }
+            EVENTS.with(|v|v.borrow_mut().clear());render_cached(&frame,960,544,&mut cache);
+            EVENTS.with(|v|assert!(!v.borrow().contains(&"cached".to_string()),"change {change}"));
+            for _ in 0..4{render_cached(&frame,960,544,&mut cache);}
+        }
+        frame.commands.clear();frame.shader_groups.clear();frame.mask_commands.clear();
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&frame,960,544,&mut cache);
+        EVENTS.with(|v|assert!(!v.borrow().contains(&"cached".to_string())));
         CHANGED_TEXTURE.with(|v|v.set(0));
     }
     #[unsafe(no_mangle)]
