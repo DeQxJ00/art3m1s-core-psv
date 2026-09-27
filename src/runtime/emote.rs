@@ -17,6 +17,7 @@ use crate::render_pipeline::draw::{
 mod eluna;
 
 mod pose_cache;
+mod vertex_cache;
 
 pub(super) type SharedEmoteState = Arc<Mutex<EmoteState>>;
 
@@ -102,6 +103,9 @@ enum EmoteInstanceSlot {
 
 struct EmoteInstance {
     pose_cache: pose_cache::PoseCache,
+    vertex_cache: vertex_cache::VertexCache,
+    eval_total_us: u64,
+    draw_total_us: u64,
     evaluation_history: art3m1s_emote::EmoteEvaluationHistory,
     generation: u64,
     width: u32,
@@ -484,6 +488,9 @@ impl EmoteInstance {
             .collect();
         Ok(Self {
             pose_cache: Default::default(),
+            vertex_cache: Default::default(),
+            eval_total_us: 0,
+            draw_total_us: 0,
             evaluation_history: Default::default(),
             generation,
             width,
@@ -714,15 +721,25 @@ impl EmoteInstance {
                 return Ok(commands);
             }
         } else { self.pose_cache.invalidate(); }
+        let eval_started = std::time::Instant::now();
         let items = EmoteMotionEvaluator::new(&self.model)
             .evaluate_base_with_history(&state, &mut self.evaluation_history)
             .map_err(|error| error.to_string())?;
-        let commands = items.into_iter().filter_map(|item| self.draw_command(item)).collect::<Vec<_>>();
+        self.eval_total_us += eval_started.elapsed().as_micros() as u64;
+        let draw_started = std::time::Instant::now();
+        self.vertex_cache.begin(items.len());
+        let layer_transform = self.layer_transform();
+        let commands = items.into_iter().enumerate()
+            .filter_map(|(index, item)| self.draw_command(index, item, layer_transform)).collect::<Vec<_>>();
+        self.draw_total_us += draw_started.elapsed().as_micros() as u64;
         if complete {
             self.pose_cache.store(state, transform, &commands);
             if self.pose_cache.builds == 1 || self.pose_cache.builds % 600 == 0 {
                 let (hits, builds, bytes) = self.evaluation_history.deformation_cache_stats();
                 crate::core_info!("[E-Mote] mesh-cache hits={hits} builds={builds} cpu_bytes={bytes}");
+                crate::core_info!("[E-Mote] vertex-cache hits={} builds={} cpu_bytes={} eval_avg_us={} draw_avg_us={}",
+                    self.vertex_cache.hits, self.vertex_cache.builds, self.vertex_cache.bytes,
+                    self.eval_total_us / self.pose_cache.builds, self.draw_total_us / self.pose_cache.builds);
             }
         }
         Ok(commands)
@@ -742,24 +759,28 @@ impl EmoteInstance {
         state
     }
 
-    fn draw_command(&self, item: EmoteDrawItem) -> Option<DrawCommand> {
-        let texture = self.textures.get(&item.texture_id)?;
-        let (texture_id, texture_info) = texture.gpu?;
-        let native_material = native_emote_material(&item, texture_info);
-        let [atlas_x, atlas_y, width, height] = item.atlas_rect;
-        if width <= 0.0 || height <= 0.0 {
-            return None;
-        }
-
+    fn layer_transform(&self) -> Affine2 {
         let transform = self.player.transform();
         let scale = transform.scale[0];
         let coord = transform.coord;
         let model_origin = Vec2::new(self.width as f32 * 0.5, self.height as f32 * 0.5);
-        let layer_transform =
-            Affine2::from_translation(model_origin + Vec2::new(coord[0], coord[1]))
+        Affine2::from_translation(model_origin + Vec2::new(coord[0], coord[1]))
                 * Affine2::from_angle(coord[3].to_radians())
                 * Affine2::from_scale(Vec2::splat(scale))
-                * Affine2::from_translation(Vec2::new(-transform.scale[1], -transform.scale[2]));
+                * Affine2::from_translation(Vec2::new(-transform.scale[1], -transform.scale[2]))
+    }
+
+    fn draw_command(&mut self, index: usize, item: EmoteDrawItem, layer_transform: Affine2) -> Option<DrawCommand> {
+        let Some((texture_id, texture_info)) = self.textures.get(&item.texture_id).and_then(|texture| texture.gpu) else {
+            self.vertex_cache.discard(index);
+            return None;
+        };
+        let native_material = native_emote_material(&item, texture_info);
+        let [atlas_x, atlas_y, width, height] = item.atlas_rect;
+        if width <= 0.0 || height <= 0.0 {
+            self.vertex_cache.discard(index);
+            return None;
+        }
         // The evaluator resolves the complete E-Mote layer chain (including
         // zoom, shear, flips and coordinate-plane inheritance). Keep the
         // public player transform as the outer operation and consume that
@@ -800,10 +821,7 @@ impl EmoteInstance {
             },
             clip_bounds: Some([0.0, 0.0, self.width as f32, self.height as f32]),
             shader: None,
-            mesh: item
-                .mesh
-                .as_ref()
-                .and_then(|mesh| draw_mesh(mesh.blend_points.as_deref(), width, height)),
+            mesh: self.vertex_cache.get(index, item.mesh.as_ref().and_then(|mesh| mesh.blend_points.as_deref()), width, height),
             stencil: Some(StencilMetadata {
                 namespace: self.generation,
                 source_label: item.layer_label,
