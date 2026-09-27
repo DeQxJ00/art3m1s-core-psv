@@ -60,6 +60,7 @@ pub(super) struct EmoteState {
     next_generation: u64,
     backend: EmoteBackend,
     profiling_enabled: bool,
+    default_mesh_ratio: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -85,6 +86,7 @@ impl Default for EmoteState {
             next_generation: 0,
             backend: EmoteBackend::Builtin,
             profiling_enabled: false,
+            default_mesh_ratio: 1.0,
         }
     }
 }
@@ -103,6 +105,7 @@ enum EmoteInstanceSlot {
 }
 
 struct EmoteInstance {
+    mesh_division_ratio: f32,
     pose_cache: pose_cache::PoseCache,
     vertex_cache: vertex_cache::VertexCache,
     eval_total_us: u64,
@@ -150,6 +153,23 @@ struct EmoteTextureState {
 }
 
 impl EmoteState {
+    fn set_mesh_ratio(&mut self, ratio: f32) -> bool {
+        if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 || self.backend != EmoteBackend::Builtin {
+            return false;
+        }
+        self.default_mesh_ratio = ratio;
+        for slots in self.layers.values_mut() {
+            for slot in [&mut slots.active, &mut slots.pending].into_iter().flatten() {
+                match slot {
+                    EmoteInstanceSlot::Builtin(instance) => instance.command(EmoteLayerCommand::SetMeshDivisionRatio { ratio }),
+                    #[cfg(feature = "experimental-eluna")]
+                    EmoteInstanceSlot::Eluna(_) => {}
+                }
+            }
+        }
+        true
+    }
+
     pub(super) fn set_backend(&mut self, backend: EmoteBackend) -> usize {
         if self.backend == backend {
             return 0;
@@ -212,9 +232,11 @@ impl EmoteState {
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
         let instance = match self.backend {
-            EmoteBackend::Builtin => EmoteInstanceSlot::Builtin(EmoteInstance::new(
-                generation, &path, bytes, width, height,
-            )?),
+            EmoteBackend::Builtin => {
+                let mut instance = EmoteInstance::new(generation, &path, bytes, width, height)?;
+                instance.command(EmoteLayerCommand::SetMeshDivisionRatio { ratio: self.default_mesh_ratio });
+                EmoteInstanceSlot::Builtin(instance)
+            }
             EmoteBackend::ElunaExperimental => {
                 #[cfg(feature = "experimental-eluna")]
                 {
@@ -301,6 +323,10 @@ impl EmoteState {
                 "E-Mote query unavailable for layer {id}, pending={next}"
             )),
         }
+    }
+
+    pub fn mesh_ratio(&self, id: &str, next: bool) -> Result<f32, String> {
+        Ok(self.builtin(id, next)?.mesh_division_ratio)
     }
 
     pub fn variable(&self, id: &str, next: bool, label: &str) -> Result<f32, String> {
@@ -489,6 +515,7 @@ impl EmoteInstance {
             .collect();
         Ok(Self {
             pose_cache: Default::default(),
+            mesh_division_ratio: 1.0,
             vertex_cache: Default::default(),
             eval_total_us: 0,
             draw_total_us: 0,
@@ -522,6 +549,13 @@ impl EmoteInstance {
 
     fn command(&mut self, command: EmoteLayerCommand) {
         match command {
+            EmoteLayerCommand::SetMeshDivisionRatio { ratio } => {
+                if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 && ratio != self.mesh_division_ratio {
+                    self.mesh_division_ratio = ratio;
+                    self.pose_cache.invalidate();
+                    crate::core_info!("[E-Mote] mesh-division ratio={ratio}");
+                }
+            }
             EmoteLayerCommand::SetScale {
                 scale,
                 origin_x,
@@ -724,6 +758,7 @@ impl EmoteInstance {
         } else { self.pose_cache.invalidate(); }
         let eval_started = std::time::Instant::now();
         let items = EmoteMotionEvaluator::new(&self.model)
+            .with_mesh_division_ratio(self.mesh_division_ratio)
             .evaluate_base_with_history(&state, &mut self.evaluation_history)
             .map_err(|error| error.to_string())?;
         self.eval_total_us += eval_started.elapsed().as_micros() as u64;
@@ -738,6 +773,8 @@ impl EmoteInstance {
             if self.pose_cache.builds == 1 || self.pose_cache.builds % 600 == 0 {
                 let (hits, builds, bytes) = self.evaluation_history.deformation_cache_stats();
                 crate::core_info!("[E-Mote] mesh-cache hits={hits} builds={builds} cpu_bytes={bytes}");
+                let vertices: usize = commands.iter().filter_map(|c| c.mesh.as_ref()).map(|m| m.vertices.len()).sum();
+                crate::core_info!("[E-Mote] mesh-division ratio={} vertices={vertices}", self.mesh_division_ratio);
                 crate::core_info!("[E-Mote] vertex-cache hits={} builds={} cpu_bytes={} eval_avg_us={} draw_avg_us={}",
                     self.vertex_cache.hits, self.vertex_cache.builds, self.vertex_cache.bytes,
                     self.eval_total_us / self.pose_cache.builds, self.draw_total_us / self.pose_cache.builds);
@@ -1091,6 +1128,15 @@ fn draw_mesh(points: Option<&[f32]>, width: f32, height: f32) -> Option<DrawMesh
 }
 
 impl CoreRuntime {
+    /// Host default survives scene resets/save restoration; explicit layer
+    /// commands can still change the ratio for a diagnostic comparison.
+    pub fn set_emote_mesh_ratio(&mut self, ratio: f32) -> bool {
+        let Ok(mut state) = self.emote.lock() else { return false; };
+        if !state.set_mesh_ratio(ratio) { return false; }
+        self.last_submitted_frame = None;
+        true
+    }
+
     /// Scene presence, not animation/redraw activity: a held pose still uses
     /// the scene clock, while retained models outside the scene do not.
     pub fn emote_active(&self) -> bool {

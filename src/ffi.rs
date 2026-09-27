@@ -1405,6 +1405,14 @@ pub unsafe extern "C" fn art3m1s_runtime_set_text_command_cache_enabled(
     }
 }
 
+/// Sets the built-in E-Mote mesh ratio for existing and future layers.
+/// Returns zero for invalid input or an unsupported backend. Owner thread only.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_emote_mesh_ratio(rt: *mut CoreRuntime, ratio: f32) -> c_int {
+    unsafe { rt.as_mut() }.map_or(0, |runtime| i32::from(runtime.set_emote_mesh_ratio(ratio)))
+}
+
 /// Hide only script-declared touch-toolbars; no game save properties change.
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]

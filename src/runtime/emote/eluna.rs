@@ -205,6 +205,9 @@ impl ElunaEmoteInstance {
 
     pub(super) fn command(&mut self, command: EmoteLayerCommand) -> Result<(), String> {
         match command {
+            EmoteLayerCommand::SetMeshDivisionRatio { .. } => {
+                return Err("mesh division ratio is only supported by the built-in E-Mote renderer".into());
+            }
             EmoteLayerCommand::SetScale {
                 scale,
                 origin_x,
@@ -603,6 +606,9 @@ fn apply_worker_command(
     command: EmoteLayerCommand,
 ) -> Result<(), String> {
     match command {
+        EmoteLayerCommand::SetMeshDivisionRatio { .. } => {
+            return Err("mesh division ratio must be handled by the renderer".into());
+        }
         EmoteLayerCommand::SetVariable {
             label,
             value,

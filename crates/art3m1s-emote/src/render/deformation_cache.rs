@@ -1,4 +1,6 @@
-use super::{apply_deformers, EmoteDrawItem, EmoteMesh, HashMap, MeshDeformer};
+use super::{apply_deformers_at_resolution, EmoteDrawItem, EmoteMesh, HashMap, MeshDeformer};
+#[cfg(test)]
+use super::apply_deformers;
 
 // One previous mesh per live layer path, bounded independently of model size.
 // No textures, model resources, or GPU targets are retained here.
@@ -7,6 +9,7 @@ const MAX_ENTRIES: usize = 256;
 
 #[derive(Debug)]
 struct Entry {
+    mesh_side: usize,
     generation: u64,
     size: [f32; 2],
     origin: [f32; 2],
@@ -19,8 +22,8 @@ struct Entry {
 }
 
 impl Entry {
-    fn matches(&self, item: &EmoteDrawItem, ancestors: &[MeshDeformer]) -> bool {
-        self.size == [item.atlas_rect[2], item.atlas_rect[3]]
+    fn matches(&self, item: &EmoteDrawItem, ancestors: &[MeshDeformer], mesh_side: usize) -> bool {
+        self.mesh_side == mesh_side && self.size == [item.atlas_rect[2], item.atlas_rect[3]]
             && self.origin == item.origin
             && self.offset == item.frame_offset
             && self.transform == item.world_transform
@@ -55,9 +58,14 @@ impl DeformationCache {
         });
     }
 
-    pub(super) fn apply(&mut self, item: &mut EmoteDrawItem, ancestors: &[MeshDeformer], path: &[usize], generation: u64) {
+    #[cfg(test)]
+    fn apply(&mut self, item: &mut EmoteDrawItem, ancestors: &[MeshDeformer], path: &[usize], generation: u64) {
+        self.apply_at_resolution(item, ancestors, path, generation, super::DEFORMED_MESH_SIDE);
+    }
+
+    pub(super) fn apply_at_resolution(&mut self, item: &mut EmoteDrawItem, ancestors: &[MeshDeformer], path: &[usize], generation: u64, mesh_side: usize) {
         if let Some(entry) = self.entries.get_mut(path) {
-            if entry.matches(item, ancestors) {
+            if entry.matches(item, ancestors, mesh_side) {
                 // Only geometry is reused. Opacity, color, texture, ordering,
                 // stencil references and all other evaluated channels stay live.
                 entry.generation = generation;
@@ -76,14 +84,14 @@ impl DeformationCache {
             + ancestors.iter().map(|ancestor| std::mem::size_of_val(ancestor.points.as_slice())).sum::<usize>();
         let admit = self.entries.len() < MAX_ENTRIES && base_bytes <= MAX_BYTES.saturating_sub(self.bytes);
         let authored = admit.then(|| item.mesh.clone());
-        apply_deformers(item, ancestors);
+        apply_deformers_at_resolution(item, ancestors, mesh_side);
         if let Some(authored) = authored {
             // Oversized authored grids may pass through unchanged; use actual
             // output size rather than assuming every result is tessellated.
             let bytes = base_bytes + mesh_bytes(item.mesh.as_ref());
             if bytes > MAX_BYTES.saturating_sub(self.bytes) { return; }
             self.entries.insert(path.to_vec(), Entry {
-                generation, size: [item.atlas_rect[2], item.atlas_rect[3]], origin: item.origin,
+                mesh_side, generation, size: [item.atlas_rect[2], item.atlas_rect[3]], origin: item.origin,
                 offset: item.frame_offset, transform: item.world_transform, authored,
                 ancestors: ancestors.to_vec(), result: item.mesh.clone(), bytes,
             });
@@ -119,6 +127,56 @@ mod tests {
         MeshDeformer { combine: false, transform: EmoteAffine::identity(), translation: [0.;2],
             angle: 0., size: [120.,120.], origin: [0.;2], offset: [0.;2],
             points: super::super::identity_grid(), side: 4 }
+    }
+
+    #[test]
+    fn resolution_changes_rebuild_geometry_and_preserve_patch_corners() {
+        let mut cache = DeformationCache::default();
+        let mut baseline = item();
+        apply_deformers(&mut baseline, &[ancestor()]);
+        let original = baseline.mesh.unwrap().blend_points.unwrap();
+        for (generation, side) in [8, 6, 5, 3, 2, 8].into_iter().enumerate() {
+            let mut value = item();
+            cache.apply_at_resolution(&mut value, &[ancestor()], &[1], generation as u64, side);
+            let points = value.mesh.unwrap().blend_points.unwrap();
+            assert_eq!(points.len(), side * side * 2);
+            for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let a = (y * (side - 1) * side + x * (side - 1)) * 2;
+                let b = (y * 7 * 8 + x * 7) * 2;
+                assert_eq!(&points[a..a+2], &original[b..b+2]);
+            }
+            if side == 8 { assert_eq!(points, original); }
+            assert_eq!(cache.hits, 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ART3M1S_FIXTURE_RGBA_EMOTE_MODEL"]
+    fn fixture_ratios_reduce_geometry_without_replaying_cached_resolution() {
+        let model = EmoteModel::open(std::env::var("ART3M1S_FIXTURE_RGBA_EMOTE_MODEL").unwrap()).unwrap();
+        let mut cached = EmoteEvaluationHistory::default();
+        let mut state = EmoteRenderState::default();
+        state.variables.insert("face_talk".into(), 2.5);
+        let baseline = EmoteMotionEvaluator::new(&model).evaluate_base_with_history(&state, &mut cached).unwrap();
+        let count = |items: &[EmoteDrawItem]| items.iter().filter_map(|i| i.mesh.as_ref())
+            .filter_map(|m| m.blend_points.as_ref()).map(|p| p.len()).sum::<usize>();
+        let mut previous = count(&baseline);
+        for ratio in [0.8, 0.6, 0.4, 0.25] {
+            let evaluator = EmoteMotionEvaluator::new(&model).with_mesh_division_ratio(ratio);
+            let warm = evaluator.evaluate_base_with_history(&state, &mut cached).unwrap();
+            assert_eq!(warm, evaluator.evaluate_base(&state).unwrap());
+            assert_eq!(warm.len(), baseline.len());
+            let points = count(&warm);
+            assert!(points < previous); previous = points;
+        }
+        let minimum = EmoteMotionEvaluator::new(&model).with_mesh_division_ratio(0.25)
+            .evaluate_base_with_history(&state, &mut cached).unwrap();
+        assert_eq!(EmoteMotionEvaluator::new(&model).with_mesh_division_ratio(0.20)
+            .evaluate_base_with_history(&state, &mut cached).unwrap(), minimum);
+        for ratio in [1.0, 0.0, -1.0, 2.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(EmoteMotionEvaluator::new(&model).with_mesh_division_ratio(ratio)
+                .evaluate_base_with_history(&state, &mut cached).unwrap(), baseline);
+        }
     }
 
     #[test]

@@ -33,6 +33,37 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires ART3M1S_FIXTURE_RGBA_EMOTE_MODEL"]
+    fn host_mesh_setting_covers_pending_layers_and_survives_scene_reset() {
+        use super::super::EmoteState;
+        let bytes=std::fs::read(std::env::var("ART3M1S_FIXTURE_RGBA_EMOTE_MODEL").unwrap()).unwrap();
+        let mut state=EmoteState::default();
+        assert!(state.set_mesh_ratio(0.4));
+        for _ in 0..2 {
+            state.create_layer("1",vec![("model.psb".into(),bytes.clone())],960,544).unwrap();
+        }
+        let both=|state: &EmoteState,ratio| {
+            let slots=&state.layers["1"];
+            for slot in [&slots.active,&slots.pending].into_iter().flatten() {
+                assert_eq!(slot.as_builtin().mesh_division_ratio,ratio);
+            }
+        };
+        both(&state,0.4);
+        assert_eq!(state.mesh_ratio("1",false).unwrap(),0.4);
+        assert_eq!(state.mesh_ratio("1",true).unwrap(),0.4);
+        assert!(state.set_mesh_ratio(0.8));both(&state,0.8);
+        for ratio in [0.,-1.,2.,f32::NAN,f32::INFINITY] {
+            assert!(!state.set_mesh_ratio(ratio));both(&state,0.8);
+        }
+        state.clear();
+        state.create_layer("1",vec![("model.psb".into(),bytes)],960,544).unwrap();
+        both(&state,0.8);
+        assert_eq!(state.default_mesh_ratio,0.8);
+        assert_eq!(state.mesh_ratio("1",false).unwrap(),0.8);
+        assert!(state.mesh_ratio("1",true).is_err());
+    }
+
+    #[test]
     fn changed_pose_transform_and_nonfinite_inputs_do_not_hit() {
         let mut cache=PoseCache::default();let mut state=EmoteRenderState::default();
         let transform=EmoteTransform::default();
@@ -68,6 +99,10 @@ mod tests {
                 20=>Some(EmoteLayerCommand::SetScale{scale:0.6,origin_x:3.,origin_y:-2.}),
                 30=>Some(EmoteLayerCommand::SetCoord{x:4.,y:10.,z:0.,angle:12.}),
                 40=>Some(EmoteLayerCommand::PlayTimeline{label:cached.model.timelines().keys().next().unwrap().clone(),flags:1}),
+                50=>Some(EmoteLayerCommand::SetMeshDivisionRatio{ratio:0.6}),
+                55=>Some(EmoteLayerCommand::SetMeshDivisionRatio{ratio:0.25}),
+                60=>Some(EmoteLayerCommand::SetMeshDivisionRatio{ratio:0.20}),
+                70=>Some(EmoteLayerCommand::SetMeshDivisionRatio{ratio:1.0}),
                 _=>None,
             };
             if let Some(command)=command{cached.command(command.clone());fresh.command(command);}

@@ -14,6 +14,7 @@ pub(crate) const TAG_FILTER_REGISTRY_KEY: &str = "__art3m1s_tag_filter";
 /// A typed command sent from an Artemis E-Mote layer userdata to the host.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EmoteLayerCommand {
+    SetMeshDivisionRatio { ratio: f32 },
     SetScale {
         scale: f32,
         origin_x: f32,
@@ -294,6 +295,10 @@ pub trait EngineCallbacks: Send + Sync {
         None
     }
 
+    fn emote_mesh_ratio(&self, _id: &str, _next: bool) -> crate::Result<f32> {
+        Err(unsupported_emote())
+    }
+
     fn emote_variable(&self, _id: &str, _next: bool, _label: &str) -> crate::Result<f32> {
         Err(unsupported_emote())
     }
@@ -475,6 +480,16 @@ impl EmoteLayerApi {
 
 impl UserData for EmoteLayerApi {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("setMeshDivisionRatio", |_lua, this, ratio: f32| {
+            if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
+                return Err(mlua::Error::external("mesh division ratio must be finite and in (0, 1]"));
+            }
+            this.command(EmoteLayerCommand::SetMeshDivisionRatio { ratio })
+        });
+        methods.add_method("getMeshDivisionRatio", |_lua, this, ()| {
+            this.ctx.lock().unwrap().callbacks.emote_mesh_ratio(&this.id, this.next)
+                .map_err(mlua::Error::external)
+        });
         methods.add_method("getVariable", |_lua, this, label: String| {
             this.ctx
                 .lock()
@@ -1728,6 +1743,11 @@ mod tests {
             (id == "1.0").then_some(false)
         }
 
+        fn emote_mesh_ratio(&self, id: &str, next: bool) -> crate::Result<f32> {
+            assert_eq!((id, next), ("1.0", false));
+            Ok(0.6)
+        }
+
         fn emote_variable(&self, id: &str, next: bool, label: &str) -> crate::Result<f32> {
             assert_eq!((id, next, label), ("1.0", false, "face_talk"));
             Ok(0.5)
@@ -2066,6 +2086,11 @@ mod tests {
             layer:playTimeline("笑顔_ボイス再生用", 1)
             local current = __engine:getEmoteLayer{id="1.0", next=true}
             current:setVariable("face_talk", 0.5, 0, 0)
+            current:setMeshDivisionRatio(0.6)
+            assert(math.abs(current:getMeshDivisionRatio() - 0.6) < 0.00001)
+            for _, value in ipairs({0, -1, 2, 0/0, math.huge}) do
+                assert(not pcall(function() current:setMeshDivisionRatio(value) end))
+            end
             assert(current:getVariable("face_talk") == 0.5)
             assert(current:isTimelinePlaying("active"))
             assert(current:isTimelinePlaying())
@@ -2080,7 +2105,8 @@ mod tests {
             &[("1.0".to_string(), vec!["a.psb".to_string()], 1600, 1350)]
         );
         let commands = observed.commands.lock().unwrap();
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[3], (commands[2].0.clone(), commands[2].1, EmoteLayerCommand::SetMeshDivisionRatio { ratio: 0.6 }));
         assert!(matches!(
             commands[0].2,
             EmoteLayerCommand::SetScale { scale, .. } if (scale - 0.6).abs() < f32::EPSILON
