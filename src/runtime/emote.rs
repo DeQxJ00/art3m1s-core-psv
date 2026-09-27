@@ -16,6 +16,8 @@ use crate::render_pipeline::draw::{
 #[cfg(feature = "experimental-eluna")]
 mod eluna;
 
+mod pose_cache;
+
 pub(super) type SharedEmoteState = Arc<Mutex<EmoteState>>;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -99,6 +101,7 @@ enum EmoteInstanceSlot {
 }
 
 struct EmoteInstance {
+    pose_cache: pose_cache::PoseCache,
     evaluation_history: art3m1s_emote::EmoteEvaluationHistory,
     generation: u64,
     width: u32,
@@ -480,6 +483,7 @@ impl EmoteInstance {
             })
             .collect();
         Ok(Self {
+            pose_cache: Default::default(),
             evaluation_history: Default::default(),
             generation,
             width,
@@ -698,13 +702,24 @@ impl EmoteInstance {
         }
 
         let state = self.render_state();
+        let transform = self.player.transform();
+        // Keep texture uploads/retries and retention above the cache lookup.
+        // Missing textures must never freeze a partially rendered character.
+        let complete = self.textures.values().all(|texture| texture.gpu.is_some());
+        if complete {
+            if let Some(commands) = self.pose_cache.get(&state, transform) {
+                if self.pose_cache.hits == 1 || self.pose_cache.hits % 600 == 0 {
+                    crate::core_info!("[E-Mote] pose-cache hits={} builds={} commands={}",self.pose_cache.hits,self.pose_cache.builds,commands.len());
+                }
+                return Ok(commands);
+            }
+        } else { self.pose_cache.invalidate(); }
         let items = EmoteMotionEvaluator::new(&self.model)
             .evaluate_base_with_history(&state, &mut self.evaluation_history)
             .map_err(|error| error.to_string())?;
-        Ok(items
-            .into_iter()
-            .filter_map(|item| self.draw_command(item))
-            .collect())
+        let commands = items.into_iter().filter_map(|item| self.draw_command(item)).collect::<Vec<_>>();
+        if complete { self.pose_cache.store(state, transform, &commands); }
+        Ok(commands)
     }
 
     fn render_state(&self) -> EmoteRenderState {
