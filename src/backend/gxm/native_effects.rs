@@ -46,6 +46,8 @@ unsafe extern "C" {
     fn art3m1s_gxm_overlay_cache_enabled() -> i32;
     fn art3m1s_gxm_overlay_end_cached(slot:u32, bounds:*const f32) -> i32;
     fn art3m1s_gxm_group_mask_begin() -> i32;
+    fn art3m1s_gxm_group_mask_revision() -> u64;
+    fn art3m1s_gxm_group_mask_reuse(revision: u64) -> i32;
     fn art3m1s_gxm_group_end(draw: *const EffectDraw);
     fn art3m1s_gxm_texture_is_opaque(id: u64) -> i32;
     fn art3m1s_gxm_texture_is_empty(id: u64) -> i32;
@@ -475,13 +477,7 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
                     stats[0]+=passes.len() as u32;
                 }
                 if let Some([start, end]) = group.mask_range {
-                    if unsafe { art3m1s_gxm_group_mask_begin() } != 0 {
-                        for cmd in frame.mask_commands.get(start..end).unwrap_or_default() {
-                            if let Some(draw) = encode(cmd, width, height) {
-                                unsafe { art3m1s_gxm_draw_effect(&draw) };
-                            }
-                        }
-                    } else {
+                    if !nodes.masks.draw(frame.mask_commands.get(start..end).unwrap_or_default(), width, height) {
                         crate::core_warn!("GXM mask target allocation failed");
                     }
                 }
@@ -500,6 +496,7 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
     }
 }
 mod input_snapshot;
+mod mask_reuse;
 use input_snapshot::InputSnapshot;
 mod node_cache;
 use node_cache::NodeCache;
@@ -803,14 +800,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
                 && (restored || unsafe {art3m1s_gxm_group_begin()!=0}) {
                 if !restored {render_range(frame,g.start,g.end,gi,width,height,&mut stats,enabled,&mut caches.nodes,true);}
                 let mask_ready = if let Some([start, end]) = g.mask_range {
-                    if unsafe { art3m1s_gxm_group_mask_begin() } != 0 {
-                        for cmd in frame.mask_commands.get(start..end).unwrap_or_default() {
-                            if let Some(mask_draw) = encode(cmd, width, height) {
-                                unsafe { art3m1s_gxm_draw_effect(&mask_draw) };
-                            }
-                        }
-                        true
-                    } else { false }
+                    caches.nodes.masks.draw(frame.mask_commands.get(start..end).unwrap_or_default(), width, height)
                 } else { true };
                 if !mask_ready {
                     crate::core_warn!("GXM retained mask target allocation failed");
@@ -1211,7 +1201,50 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_group_mask_begin() -> i32 {
         event("begin-mask".into());
+        MASK_TOKEN.with(|v|v.set(v.get()+1));
         1
+    }
+    thread_local! {
+        static MASK_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static MASK_REUSE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_group_mask_revision() -> u64 {
+        MASK_TOKEN.with(|v| v.get())
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_group_mask_reuse(token: u64) -> i32 {
+        let ok = token != 0 && MASK_REUSE_ENABLED.with(|v|v.get()) && MASK_TOKEN.with(|v|v.get()) == token;
+        if ok { event("reuse-mask".into()); }
+        i32::from(ok)
+    }
+    #[test]
+    fn native_mask_reuse_rejects_content_target_texture_size_and_frame_changes() {
+        let mut mask = neutral_frame().commands.remove(0);
+        mask.shader = None;
+        mask.native_emote = Some(NativeEmoteMaterial {
+            corner_colors: [[1.;4];4], uv_rect: [0.,0.,1.,1.], blend_mode: 0,
+            clip_rect: [-1.0e30,-1.0e30,1.0e30,1.0e30], wipe: [0.;3],
+        });
+        let mut cache = mask_reuse::MaskReuse::default();
+        MASK_REUSE_ENABLED.with(|v|v.set(true));
+        let draw = |cache: &mut mask_reuse::MaskReuse, mask: &DrawCommand, width| {
+            EVENTS.with(|v|v.borrow_mut().clear());
+            assert!(cache.draw(std::slice::from_ref(mask), width, 544));
+            EVENTS.with(|v|v.borrow().contains(&"reuse-mask".to_string()))
+        };
+        assert!(!draw(&mut cache,&mask,960));
+        assert!(draw(&mut cache,&mask,960));
+        mask.opacity = 0.5;assert!(!draw(&mut cache,&mask,960));
+        mask.transform.translation.x += 4.;assert!(!draw(&mut cache,&mask,960));
+        MASK_TOKEN.with(|v|v.set(v.get()+1));assert!(!draw(&mut cache,&mask,960));
+        CHANGED_TEXTURE.with(|v|v.set(41));assert!(!draw(&mut cache,&mask,960));
+        assert!(!draw(&mut cache,&mask,800));
+        cache.clear();assert!(!draw(&mut cache,&mask,800));
+        mask.native_emote = None;assert!(!draw(&mut cache,&mask,800));
+        assert!(!draw(&mut cache,&mask,800));
+        MASK_REUSE_ENABLED.with(|v|v.set(false));
+        CHANGED_TEXTURE.with(|v|v.set(0));
     }
     #[unsafe(no_mangle)]
     unsafe extern "C" fn art3m1s_gxm_group_end(draw: *const EffectDraw) {
