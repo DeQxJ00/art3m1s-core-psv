@@ -1,6 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+mod deformation_cache;
+use deformation_cache::DeformationCache;
+
 use crate::{
     AtlasIcon, EmoteBezierPath, EmoteEasingCurve, EmoteError, EmoteFrameContent, EmoteLayer,
     EmoteMesh, EmoteModel, EmoteMotionParameter, EmoteMotionRef, Result,
@@ -298,7 +301,7 @@ impl Default for TransformContext {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct MeshDeformer {
     #[cfg(test)]
     combine: bool,
@@ -320,7 +323,7 @@ pub struct EmoteRenderState {
     pub variables: BTreeMap<String, f32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EmoteDrawItem {
     pub layer_label: String,
     pub texture_id: String,
@@ -344,13 +347,14 @@ pub struct EmoteDrawItem {
     pub stencil_mask_layers: Vec<String>,
 }
 
-/// Per-instance local frame history. Only layers containing a HOLD key need
-/// storage; ordinary layers remain stateless and do not allocate history.
+/// Per-instance HOLD frame history and bounded deformation reuse. Ordinary
+/// layers need no frame history; unchanged geometry can still be reused.
 #[derive(Default, Debug)]
 pub struct EmoteEvaluationHistory {
     model: std::sync::Weak<()>,
     generation: u64,
     frames: HashMap<Vec<usize>, (u64, EmoteFrameContent)>,
+    deformations: DeformationCache,
 }
 
 impl EmoteEvaluationHistory {
@@ -358,10 +362,17 @@ impl EmoteEvaluationHistory {
         let identity = std::sync::Arc::downgrade(model.evaluation_identity());
         if !self.model.ptr_eq(&identity) || self.generation == u64::MAX {
             self.frames.clear();
+            self.deformations.clear();
             self.generation = 0;
         }
         self.model = identity;
         self.generation += 1;
+    }
+
+    /// Reused meshes, recomputed meshes, and bounded CPU storage in bytes.
+    /// Textures and final GPU composites are accounted for by the renderer.
+    pub fn deformation_cache_stats(&self) -> (u64, u64, usize) {
+        self.deformations.stats()
     }
 }
 
@@ -447,6 +458,7 @@ impl<'a> EmoteMotionEvaluator<'a> {
         history
             .frames
             .retain(|_, (generation, _)| *generation == history.generation);
+        history.deformations.finish(history.generation);
         items.sort_by(|left, right| {
             left.translation[2]
                 .total_cmp(&right.translation[2])
@@ -757,7 +769,7 @@ impl<'a> EmoteMotionEvaluator<'a> {
                 stencil_mask_layers,
                 draw_order,
             );
-            apply_deformers(&mut item, deformers);
+            history.deformations.apply(&mut item, deformers, history_path, history.generation);
             items.push(item);
             return Ok(());
         }

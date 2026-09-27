@@ -718,7 +718,13 @@ impl EmoteInstance {
             .evaluate_base_with_history(&state, &mut self.evaluation_history)
             .map_err(|error| error.to_string())?;
         let commands = items.into_iter().filter_map(|item| self.draw_command(item)).collect::<Vec<_>>();
-        if complete { self.pose_cache.store(state, transform, &commands); }
+        if complete {
+            self.pose_cache.store(state, transform, &commands);
+            if self.pose_cache.builds == 1 || self.pose_cache.builds % 600 == 0 {
+                let (hits, builds, bytes) = self.evaluation_history.deformation_cache_stats();
+                crate::core_info!("[E-Mote] mesh-cache hits={hits} builds={builds} cpu_bytes={bytes}");
+            }
+        }
         Ok(commands)
     }
 
