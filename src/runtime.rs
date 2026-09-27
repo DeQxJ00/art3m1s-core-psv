@@ -46,6 +46,7 @@ mod render;
 mod save_io;
 mod script;
 mod text;
+mod toolbar;
 
 impl CoreRuntime {
     pub fn effect_pan_active(&self) -> bool {
@@ -124,6 +125,7 @@ pub struct CoreRuntime {
     message_cache_enabled: bool,
     text_epoch_enabled: bool,
     gxm_keyless_enabled: bool,
+    toolbar: toolbar::ToolbarVisibility,
     emote: emote::SharedEmoteState,
 
     stage_w: u32,
@@ -307,6 +309,7 @@ impl CoreRuntime {
             last_pointer_hit_position: None,
             last_pointer_hit_texture_revision: 0,
             pointer_hit_test_dirty: true,
+            toolbar: toolbar::ToolbarVisibility::default(),
             volumes: Arc::new(Mutex::new(HashMap::new())),
             exit_requested: Arc::new(AtomicBool::new(false)),
             project_savepath: None,

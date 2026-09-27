@@ -1398,6 +1398,15 @@ pub unsafe extern "C" fn art3m1s_runtime_set_text_command_cache_enabled(
     }
 }
 
+/// Hide only script-declared touch-toolbars; no game save properties change.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_toolbar_hidden(rt: *mut CoreRuntime, hidden: c_int) {
+    if let Some(runtime) = unsafe { rt.as_mut() } {
+        runtime.set_toolbar_hidden(hidden != 0);
+    }
+}
+
 /// Changes host presentation only; original script font tags remain unchanged.
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]

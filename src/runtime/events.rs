@@ -59,6 +59,7 @@ impl CoreRuntime {
             .iter()
             .any(|runtime_event| self.event_invalidates_pointer_hit_test(&runtime_event.event));
         self.dispatch_events(&collected, profile);
+        if !collected.is_empty() { self.sync_toolbar_visibility(); }
         profile.events_ns += crate::profiler::FrameProfile::elapsed(started);
     }
 

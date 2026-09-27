@@ -26,6 +26,9 @@ pub struct Layer {
     // Local mutation serial, never part of a save or script-visible property.
     #[serde(skip)]
     pub(crate) query_revision: u64,
+    /// Host presentation override; never persisted into game saves.
+    #[serde(skip)]
+    pub(crate) host_hidden: bool,
     /// 完整点分 ID，如 `"1.0.-1"`。
     pub id: String,
     /// 绑定的逻辑资源名；`None` 表示纯分组节点。
@@ -168,6 +171,7 @@ impl Scene {
             root_props: self.root_props.clone(),
             nodes: self.nodes.iter().map(|(id, layer)| (id.clone(), Layer {
                 query_revision: layer.query_revision,
+                host_hidden: layer.host_hidden,
                 id: layer.id.clone(), file: layer.file.clone(), mask: layer.mask.clone(),
                 solid_color: layer.solid_color, props: layer.props.clone(),
                 tweens: layer.tweens.clone(), children: layer.children.clone(),
@@ -285,7 +289,7 @@ impl Scene {
         while let Some(node_id) = current {
             // 未物化的中间祖先按"未显式隐藏"处理，继续上溯。
             if let Some(layer) = self.nodes.get(node_id)
-                && layer.props.visible == Some(false)
+                && (layer.host_hidden || layer.props.visible == Some(false))
             {
                 return false;
             }
