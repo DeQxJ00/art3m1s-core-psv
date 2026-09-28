@@ -16,11 +16,23 @@ impl CacheParts {
 // counter, not residency: successful payload handoff/reclamation preserves it.
 #[derive(Clone,Copy,Default,Debug,PartialEq,Eq)]
 pub(crate) struct ScriptPreloadCounts { pub planned:usize,pub completed:usize,pub pixels:usize,pub encoded:usize }
-pub(crate) struct CacheBudget { pub limit:usize,pub ready:usize,pub idle:usize,pub emote:usize,pub ready_goal:usize,pub ready_parts:CacheParts,pub mask_parts:CacheParts,pub animation_parts:CacheParts,pub script_preload:ScriptPreloadCounts }
+pub(crate) struct CacheBudget { pub limit:usize,pub ready:usize,pub idle:usize,pub emote:usize,pub emote_scratch:usize,emote_request:Option<(usize,std::time::Instant)>,pub ready_goal:usize,pub ready_parts:CacheParts,pub mask_parts:CacheParts,pub animation_parts:CacheParts,pub script_preload:ScriptPreloadCounts }
 impl CacheBudget {
-    pub fn new(limit:usize)->SharedCacheBudget{Arc::new(Mutex::new(Self{limit,ready:0,idle:0,emote:0,ready_goal:0,ready_parts:CacheParts::default(),mask_parts:CacheParts::default(),animation_parts:CacheParts::default(),script_preload:ScriptPreloadCounts::default()}))}
-    pub fn ready_limit(&self)->usize{self.limit.saturating_sub(self.idle+self.emote)}
-    pub fn idle_limit(&self,maximum:usize)->usize{maximum.min(self.limit.saturating_sub(self.ready.max(self.ready_goal)+self.emote))}
+    pub fn new(limit:usize)->SharedCacheBudget{Arc::new(Mutex::new(Self{limit,ready:0,idle:0,emote:0,emote_scratch:0,emote_request:None,ready_goal:0,ready_parts:CacheParts::default(),mask_parts:CacheParts::default(),animation_parts:CacheParts::default(),script_preload:ScriptPreloadCounts::default()}))}
+    pub fn ready_limit(&self)->usize{
+        let physical=self.limit.saturating_sub(self.idle+self.emote+self.emote_scratch);
+        physical.min(self.ready.max(self.limit.saturating_sub(self.idle+self.emote_goal())))
+    }
+    fn emote_goal(&self)->usize{
+        (self.emote+self.emote_scratch).max(self.emote_request.filter(|(_,until)|*until>std::time::Instant::now()).map_or(0,|(n,_)|n))
+    }
+    pub fn request_emote(&mut self,goal:usize){
+        // Promise headroom, never spend bytes still owned by IDLE. Renewed by
+        // a deferred worker; abandoned foreground requests expire promptly.
+        self.emote_request=Some((goal.min(self.limit),std::time::Instant::now()+std::time::Duration::from_secs(1)));
+    }
+    pub fn clear_emote_request(&mut self){self.emote_request=None;}
+    pub fn idle_limit(&self,maximum:usize)->usize{maximum.min(self.limit.saturating_sub(self.ready.max(self.ready_goal)+self.emote_goal()))}
     // Request one bounded growth window beyond actual ready allocations, not
     // the entire chapter allowance as soon as one async job is queued. The
     // former 5/6 reservation evicted warm backgrounds with >100 MiB still free.
@@ -34,7 +46,7 @@ impl CacheBudget {
     pub fn set_ready_parts(&mut self,parts:CacheParts){let bytes=parts.total();debug_assert!(bytes<=self.ready_limit());self.ready=bytes;self.ready_parts=parts;}
     #[cfg(test)]
     pub fn set_ready(&mut self,bytes:usize){self.set_ready_parts(CacheParts{decoded:bytes,..Default::default()});}
-    pub fn set_idle(&mut self,bytes:usize){debug_assert!(bytes<=self.limit.saturating_sub(self.ready+self.emote));self.idle=bytes;}
+    pub fn set_idle(&mut self,bytes:usize){debug_assert!(bytes<=self.limit.saturating_sub(self.ready+self.emote+self.emote_scratch));self.idle=bytes;}
 }
 // Like the existing loader, one game session owns these accounts. Shutdown and
 // provider Drop release their respective counters, including a project reload.
@@ -45,6 +57,14 @@ pub(crate) fn session_budget()->SharedCacheBudget{
 
 #[cfg(test)] mod tests{
     use super::*;
+    #[test] fn model_claim_preserves_published_ready_and_expires_without_spending_idle(){
+        let shared=CacheBudget::new(100);let mut b=shared.lock().unwrap();
+        b.set_ready(50);b.set_idle(40);b.request_emote(24);
+        assert_eq!(b.ready_limit(),50);assert_eq!(b.idle_limit(100),26);
+        assert_eq!(b.idle,40);assert_eq!(b.emote,0);
+        b.emote_request=Some((24,std::time::Instant::now()-std::time::Duration::from_secs(1)));
+        assert_eq!(b.idle_limit(100),50);assert_eq!(b.ready_limit(),60);
+    }
     #[test] fn pending_prefetch_grows_reservation_without_purging_warm_images(){
         const M:usize=1024*1024;
         let shared=CacheBudget::new(192*M);let mut b=shared.lock().unwrap();

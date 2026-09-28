@@ -74,8 +74,18 @@ pub(crate) fn build_frame_reusing(
     text_for: Option<&mut LayerDrawSource<'_>>,
     file_overrides: Option<&std::collections::HashMap<String, String>>,
     record_command_keys: bool,
-    mut frame: DrawList,
+    frame: DrawList,
 ) -> DrawList {
+    build_frame_reusing_cached(scene,now_ms,provider,content_for,text_for,file_overrides,record_command_keys,frame,None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_frame_reusing_cached(
+    scene: &Scene, now_ms:u64, provider:&mut dyn TextureProvider,
+    content_for:Option<&mut LayerDrawSource<'_>>, text_for:Option<&mut LayerDrawSource<'_>>,
+    file_overrides:Option<&std::collections::HashMap<String,String>>, record_command_keys:bool,
+    mut frame:DrawList, mut cache:Option<&mut super::build_cache::SceneBuildCache>,
+)->DrawList {
     frame.clear_for_rebuild();
     let mut content_for = content_for;
     let mut text_for = text_for;
@@ -101,6 +111,7 @@ pub(crate) fn build_frame_reusing(
             &mut content_for,
             &mut text_for,
             file_overrides,
+            &mut cache,
         );
     }
     frame
@@ -130,6 +141,35 @@ fn visit(
     content_for: &mut Option<&mut LayerDrawSource<'_>>,
     text_for: &mut Option<&mut LayerDrawSource<'_>>,
     file_overrides: Option<&std::collections::HashMap<String, String>>,
+    cache: &mut Option<&mut super::build_cache::SceneBuildCache>,
+) {
+    if cache.is_none() {
+        visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,
+            provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
+        return;
+    }
+    let parent=super::build_cache::ParentState {transform:parent_transform,opacity:parent_opacity,
+        clip:parent_clip,shader:inherited_shader.clone(),keys:record_command_keys};
+    if let Some(c)=cache.as_deref_mut() {
+        if c.replay(scene,id,&parent,file_overrides,frame){return;}
+    }
+    let remember=cache.as_ref().is_some_and(|c|c.candidate(scene,id));
+    let start=[frame.commands.len(),frame.mask_commands.len(),frame.shader_groups.len()];
+    // A cached parent owns the complete fragment; avoid duplicating every child.
+    let mut held=if remember {cache.take()} else {None};
+    visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,
+        provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
+    if let Some(c)=held.as_deref_mut(){c.store(scene,id,parent,file_overrides,frame,start);}
+    if remember {*cache=held;}
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_uncached(
+    scene:&Scene,id:&str,now_ms:u64,parent_transform:Affine2,parent_opacity:f32,
+    parent_clip:Option<[f32;4]>,inherited_shader:Option<ShaderEffect>,provider:&mut dyn TextureProvider,
+    frame:&mut DrawList,record_command_keys:bool,content_for:&mut Option<&mut LayerDrawSource<'_>>,
+    text_for:&mut Option<&mut LayerDrawSource<'_>>,file_overrides:Option<&std::collections::HashMap<String,String>>,
+    cache:&mut Option<&mut super::build_cache::SceneBuildCache>,
 ) {
     let Some(layer) = scene.get(id) else {
         return;
@@ -303,6 +343,7 @@ fn visit(
             content_for,
             text_for,
             file_overrides,
+            cache,
         );
     }
 

@@ -1,6 +1,6 @@
 use art3m1s_emote::{
-    EmoteDrawItem, EmoteEyeControl, EmoteModel, EmoteMotionEvaluator, EmotePlayer,
-    EmoteRenderState, PsbDocument, PsbResourceData,
+    EmoteDrawItem, EmoteEyeControl, EmoteMotionEvaluator, EmotePlayer,
+    EmoteRenderState, PsbResourceData,
 };
 use asb_interpreter::EmoteLayerCommand;
 use glam::{Affine2, Vec2};
@@ -114,7 +114,7 @@ struct EmoteInstance {
     generation: u64,
     width: u32,
     height: u32,
-    model: EmoteModel,
+    model: Arc<super::emote_source_cache::ParsedModel>,
     player: EmotePlayer,
     eye_blinks: Vec<EmoteEyeBlink>,
     textures: BTreeMap<String, EmoteTextureState>,
@@ -489,13 +489,9 @@ impl EmoteInstance {
     }
 
     fn new_shared(generation:u64,path:&str,source:Arc<super::emote_source_cache::Source>,width:u32,height:u32)->Result<Self,String>{
-        let document = PsbDocument::from_shared_bytes(source.bytes.clone())
-            .map_err(|error| format!("failed to parse E-Mote model {path}: {error}"))?;
-        let mut model = EmoteModel::from_document(document)
-            .map_err(|error| format!("failed to load E-Mote model {path}: {error}"))?;
-        let (texture_source_bytes, mut texture_data) = model
-            .take_texture_data()
-            .map_err(|error| format!("failed to detach E-Mote textures {path}: {error}"))?;
+        let model=super::emote_source_cache::parsed(&source,path)?;
+        let texture_source_bytes=source.bytes.len();
+        let mut texture_data=model.texture_data(&source)?;
         crate::core_info!(
             "[E-Mote] model={path} surface={width}x{height} textures={} source_bytes={texture_source_bytes}",
             model.atlas().textures().len()
@@ -624,6 +620,11 @@ impl EmoteInstance {
                         texture.height,
                         compressed,
                     );
+                    if texture.gpu.is_none() && provider.dxt5_upload_is_deferred(){
+                        // Expanding to RGBA needs more GPU memory and repeated
+                        // CPU decoding cannot repair temporary allocation pressure.
+                        continue;
+                    }
                 }
 
                 #[cfg(any(
@@ -1250,6 +1251,28 @@ mod tests {
                 "set ART3M1S_FIXTURE_NEKOMIKO_DIR or ART3M1S_FIXTURES_DIR before running ignored compatibility tests",
             );
         root.join("image/fhd/fg/aya/tay_0.psb")
+    }
+
+    #[test]
+    #[ignore = "requires EMOTE_CACHE_TEST_MODEL external fixture"]
+    fn bc3_pressure_preserves_source_and_does_not_decode_rgba_every_frame(){
+        use crate::render_pipeline::draw::{TextureProvider,TextureId,TextureInfo};
+        struct Pressure(bool);
+        impl TextureProvider for Pressure {
+            fn resolve(&mut self,_:&str)->Option<(TextureId,TextureInfo)>{None}
+            fn upload_rgba(&mut self,_:&str,_:u32,_:u32,_:&[u8])->Option<(TextureId,TextureInfo)>{panic!("must not expand BC3 under pressure")}
+            fn upload_dxt5_render_only(&mut self,_:&str,w:u32,h:u32,_:&[u8])->Option<(TextureId,TextureInfo)>{
+                (!self.0).then_some((TextureId(1),TextureInfo{width:w,height:h}))
+            }
+            fn dxt5_upload_is_deferred(&self)->bool{self.0}
+        }
+        let path=std::env::var("EMOTE_CACHE_TEST_MODEL").unwrap();
+        let mut state=EmoteState::default();state.create_layer("10.0",vec![(path.clone(),std::fs::read(path).unwrap())],960,544).unwrap();
+        let mut provider=Pressure(true);
+        for _ in 0..3 {let _=state.build_commands(&mut provider);}
+        assert!(state.builtin("10.0",false).unwrap().textures.values().all(|t|t.source.is_some()&&t.gpu.is_none()));
+        provider.0=false;let _=state.build_commands(&mut provider);
+        assert!(state.builtin("10.0",false).unwrap().textures.values().all(|t|t.source.is_none()&&t.gpu.is_some()));
     }
 
     #[test]

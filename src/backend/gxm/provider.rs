@@ -148,6 +148,7 @@ pub struct GxmTextureProvider {
     timing: TextureTiming,
     timing_started: Instant,
     upload_retry_pending: bool,
+    dxt5_upload_deferred: bool,
     upload_reclaim_bytes: usize,
     transient_save_directory: Option<String>,
     warm: warm::WarmState,
@@ -196,6 +197,7 @@ impl GxmTextureProvider {
         for (_,name) in idle {
             if released>=requested{break;}
             let e=self.entries.remove(&name).unwrap();self.ids.remove(&e.id);
+            self.revision=self.revision.wrapping_add(1).max(1);
             unsafe{art3m1s_gxm_delete_texture(e.id.0)};
             let gpu=e.gpu_bytes();
             released=released.saturating_add((gpu+0x3ffff)&!0x3ffff);count+=1;
@@ -210,7 +212,13 @@ impl GxmTextureProvider {
         crate::core_info!("[{}] textures={} gpu_est_bytes={} requested={} idle_after={}; active pinned, encoded retained",reason,count,released,requested,idle_bytes);
         released
     }
-    pub fn needs_upload_retry(&self)->bool { self.upload_retry_pending }
+    pub fn needs_upload_retry(&self)->bool {
+        // A static/reused frame must still reach retain when a model asks IDLE
+        // for space. GPU reclamation stays on the render thread after pinning.
+        self.upload_retry_pending || self.cache_budget.as_ref().is_some_and(|b|{
+            let b=b.lock().unwrap();b.idle>b.idle_limit(self.idle_budget)
+        })
+    }
     pub fn begin_scene_build(&mut self) {
         self.upload_retry_pending=false;
         self.upload_reclaim_bytes=0;
@@ -263,6 +271,7 @@ impl GxmTextureProvider {
             timing: TextureTiming::default(),
             timing_started: Instant::now(),
             upload_retry_pending:false,
+            dxt5_upload_deferred:false,
             upload_reclaim_bytes:0,
             transient_save_directory:None,
             warm:Default::default(),
@@ -374,7 +383,7 @@ impl GxmTextureProvider {
         self.timing.uploads += 1;
         self.timing.upload_bytes += rgba.len() as u64;
         if uploaded <= 0 {
-            if !video && retain_pixels {self.defer_upload(expected);}
+            if !video {self.defer_upload(expected);}
             self.timing.upload_errors += 1;
             self.timing.upload_us += host_us;
             self.timing.upload_max_us = self.timing.upload_max_us.max(host_us);
@@ -431,6 +440,7 @@ impl GxmTextureProvider {
     fn remove(&mut self, name: &str) {
         if let Some(entry) = self.entries.remove(name) {
             self.ids.remove(&entry.id);
+            self.revision=self.revision.wrapping_add(1).max(1);
             unsafe { art3m1s_gxm_delete_texture(entry.id.0) };
         }
     }
@@ -704,6 +714,7 @@ impl TextureProvider for GxmTextureProvider {
     }
 
     fn upload_dxt5_render_only(&mut self,name:&str,width:u32,height:u32,data:&[u8])->Option<(TextureId,TextureInfo)>{
+        self.dxt5_upload_deferred=false;
         if width==0||height==0||width>4096||height>4096||data.len()!=width.div_ceil(4) as usize*height.div_ceil(4) as usize*16{return None;}
         let info=TextureInfo{width,height};
         let id=self.entries.get(name).map_or(TextureId(self.next_id),|e|e.id);
@@ -712,7 +723,15 @@ impl TextureProvider for GxmTextureProvider {
         if ok<0{return None;} // Unsupported or failed device proof: caller decodes RGBA.
         let us=elapsed_us(started);self.timing.uploads+=1;self.timing.upload_us+=us;
         self.timing.upload_max_us=self.timing.upload_max_us.max(us);
-        if ok==0{self.timing.upload_errors+=1;return None;}
+        if ok==0{
+            self.timing.upload_errors+=1;self.dxt5_upload_deferred=true;
+            let bytes=width.div_ceil(4).next_power_of_two() as usize*height.div_ceil(4).next_power_of_two() as usize*16;
+            self.defer_upload(bytes);
+            if self.reported_failures.insert(name.into()){
+                crate::core_warn!("GXM BC3 upload deferred name={} bytes={}; keep compressed source, reclaim idle GPU after scene pinning",name,bytes);
+            }
+            return None;
+        }
         self.timing.upload_bytes+=data.len() as u64;
         if id.0==self.next_id{self.next_id+=1;}
         self.revision=self.revision.wrapping_add(1).max(1);
@@ -724,6 +743,7 @@ impl TextureProvider for GxmTextureProvider {
         Some((id,info))
     }
 
+    fn dxt5_upload_is_deferred(&self)->bool {self.dxt5_upload_deferred}
     fn upload_rgba_render_only_region(&mut self, name: &str, width: u32, height: u32, data: &[u8], region: [u32; 4]) -> Option<(TextureId, TextureInfo)> {
         let [x, y, w, h] = region;
         if width == 0 || height == 0 || data.len() != width as usize * height as usize * 4 ||
@@ -889,6 +909,7 @@ impl TextureProvider for GxmTextureProvider {
             }
             if tier==0 {
                 let entry=self.entries.remove(&name).unwrap();self.ids.remove(&entry.id);
+                self.revision=self.revision.wrapping_add(1).max(1);
                 idle_gpu=idle_gpu.saturating_sub(entry.cache_bytes()-entry.rgba.capacity());
                 unsafe {art3m1s_gxm_delete_texture(entry.id.0)};
                 if entry.shared&&entry.rgba.is_empty(){
@@ -989,6 +1010,56 @@ mod tests {
     use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
     static LOCK: Mutex<()> = Mutex::new(());
+    #[test] fn model_headroom_rebuilds_static_frame_and_reclaims_only_idle(){
+        let _guard=LOCK.lock().unwrap();let budget=crate::image_cache_budget::CacheBudget::new(40000);
+        let mut p=GxmTextureProvider::new().with_cache_budget(budget.clone());
+        for name in ["idle","active"] {
+            p.upload(name,64,64,&vec![255;64*64*4]).unwrap();
+            p.entries.get_mut(name).unwrap().cacheable=true;
+        }
+        let live=HashSet::from(["active".into()]);p.retain(&live);
+        budget.lock().unwrap().request_emote(32000);
+        assert!(p.needs_upload_retry());p.retain(&live);
+        assert!(!p.needs_upload_retry());assert!(p.entries.contains_key("active"));
+        assert!(!p.entries.contains_key("idle"));assert!(budget.lock().unwrap().idle<=8000);
+    }
+    #[test] fn bc3_pressure_reclaims_idle_only_after_pinning_current_scene(){
+        let _guard=LOCK.lock().unwrap();let mut p=GxmTextureProvider::new();
+        for name in ["idle-background","current-background"]{
+            p.upload(name,64,64,&vec![255;64*64*4]).unwrap();
+            p.entries.get_mut(name).unwrap().cacheable=true;
+        }
+        p.retain(&HashSet::new());p.begin_scene_build();
+        let data=[0;96];FAIL_UPLOAD.store(1,Ordering::Relaxed);
+        let failed=p.upload_dxt5_render_only("emote-atlas",12,8,&data);
+        FAIL_UPLOAD.store(0,Ordering::Relaxed);
+        assert!(failed.is_none());assert!(p.needs_upload_retry());
+        assert_eq!(p.entries.len(),2); // No eviction during traversal.
+        p.resolve("current-background").unwrap();
+        let live=HashSet::from(["current-background".into(),"emote-atlas".into()]);
+        p.retain(&live);
+        assert!(!p.entries.contains_key("idle-background"));
+        assert!(p.entries.contains_key("current-background"));
+        p.begin_scene_build();
+        assert!(p.upload_dxt5_render_only("emote-atlas",12,8,&data).is_some());
+        assert!(!p.needs_upload_retry());p.retain(&live);
+        assert_eq!(p.entries.len(),2);
+    }
+    #[test] fn bc3_pressure_defers_without_requesting_rgba_fallback(){
+        let _guard=LOCK.lock().unwrap();let mut p=GxmTextureProvider::new();
+        let data=[0;96];FAIL_UPLOAD.store(1,Ordering::Relaxed);
+        assert!(p.upload_dxt5_render_only("atlas",12,8,&data).is_none());
+        FAIL_UPLOAD.store(0,Ordering::Relaxed);
+        assert!(p.dxt5_upload_is_deferred());assert!(p.needs_upload_retry());
+        assert_eq!(p.upload_reclaim_bytes,128);
+        p.begin_scene_build();
+        assert!(p.upload_dxt5_render_only("atlas",12,8,&data).is_some());
+        assert!(!p.dxt5_upload_is_deferred());
+        BC3_UNSUPPORTED.store(1,Ordering::Relaxed);
+        assert!(p.upload_dxt5_render_only("other",12,8,&data).is_none());
+        BC3_UNSUPPORTED.store(0,Ordering::Relaxed);
+        assert!(!p.dxt5_upload_is_deferred());
+    }
     #[test] fn bc3_render_only_lifetime_accounting_and_rgba_replacement(){
         let _guard=LOCK.lock().unwrap();let mut p=GxmTextureProvider::new();
         assert!(p.upload_dxt5_render_only("atlas",0,8,&[]).is_none());

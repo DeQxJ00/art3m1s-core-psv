@@ -76,11 +76,19 @@ impl<'a> RenderPipeline<'a> {
         text_for: Option<&mut LayerDrawSource<'_>>,
         reusable: DrawList,
     ) -> DrawList {
+        self.build_composited_cached(provider,content_for,text_for,reusable,None)
+    }
+
+    pub(crate) fn build_composited_cached(
+        &self,provider:&mut dyn TextureProvider,content_for:Option<&mut LayerDrawSource<'_>>,
+        text_for:Option<&mut LayerDrawSource<'_>>,reusable:DrawList,
+        cache:Option<&mut crate::compositor::build_cache::SceneBuildCache>,
+    )->DrawList {
         let compositor = self.compositor;
         // [lyedit] 像素加工在进入帧构建前落地（需要 provider 才能读写像素）。
         compositor.process_layer_edits(provider);
         let overrides = compositor.layer_edit_overrides();
-        let mut frame = crate::compositor::build::build_frame_reusing(
+        let mut frame = crate::compositor::build::build_frame_reusing_cached(
             &compositor.scene,
             compositor.clock_ms,
             provider,
@@ -93,6 +101,7 @@ impl<'a> RenderPipeline<'a> {
             },
             self.record_command_keys,
             reusable,
+            cache,
         );
 
         transition::overlay_old_frame(

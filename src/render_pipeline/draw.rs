@@ -87,6 +87,9 @@ pub trait TextureProvider {
     fn supports_astc_4x4(&self) -> bool {
         false
     }
+    /// Temporary compressed upload failure: retain source and retry after
+    /// retirement. Unsupported backends still permit decoding to RGBA.
+    fn dxt5_upload_is_deferred(&self)->bool {false}
 
     /// Uploads raw ASTC 4x4 blocks. Mobile backends use this for persistent
     /// E-Mote transcode caches; unsupported GPUs return `None`.

@@ -62,6 +62,13 @@ pub struct EmoteEyeControl {
     pub edges: Vec<[f32; 2]>,
     pub nodes: Vec<Vec<f32>>,
 }
+impl crate::memory::HeapBytes for EmoteKeyframe {fn heap_bytes(&self)->usize{0}}
+crate::memory::fields!(EmoteTimelineTrack,label,frames);
+crate::memory::fields!(EmoteTimeline,label,tracks);
+crate::memory::fields!(EmoteVariable,label,named_frames);
+crate::memory::fields!(EmoteSelectorOption,label);
+crate::memory::fields!(EmoteSelectorControl,label,options);
+crate::memory::fields!(EmoteEyeControl,label,edges,nodes);
 
 impl EmoteTimeline {
     pub(crate) fn parse(value: &PsbValue) -> Option<Self> {

@@ -174,6 +174,17 @@ pub struct EmoteMotionRef {
     pub mask: i64,
     pub time_offset: f32,
 }
+crate::memory::fields!(EmoteMotionLibrary,characters,easing);
+crate::memory::fields!(EmoteEasingCurve,x,y,p);
+crate::memory::fields!(EmoteBezierPath,x,y,t,splines);
+crate::memory::fields!(EmoteMotion,character,label,parameters,inline_parameter,priorities,layers,layer_index_map);
+crate::memory::fields!(EmoteMotionParameter,id);
+crate::memory::fields!(EmoteLayer,label,transform_order,stencil_mask_layers,inline_parameter,frames,children);
+crate::memory::fields!(EmoteMotionPriority,ranks);
+crate::memory::fields!(EmoteLayerFrame,content);
+crate::memory::fields!(EmoteFrameContent,source,icon,coord,curves,color,mesh);
+crate::memory::fields!(EmoteFrameCurves,coordinate,angle,zoom,shear,opacity,color,path);
+crate::memory::fields!(EmoteMesh,blend_points,control_coordinates);
 
 impl EmoteMotionLibrary {
     pub fn parse(root: &PsbValue) -> Result<Self> {

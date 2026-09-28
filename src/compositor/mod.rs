@@ -16,6 +16,7 @@
 
 pub mod anim;
 pub mod build;
+pub(crate) mod build_cache;
 pub mod events;
 pub(crate) mod effect_motion;
 pub(crate) mod lyedit;
