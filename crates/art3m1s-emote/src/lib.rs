@@ -6,6 +6,7 @@
 mod atlas;
 mod error;
 mod model;
+mod memory;
 mod motion;
 mod player;
 mod psb;

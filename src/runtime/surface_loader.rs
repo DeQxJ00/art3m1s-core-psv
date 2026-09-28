@@ -201,9 +201,14 @@ impl Loader {
             if state.model_pending && state.urgent.is_none() && state.scene_priority.is_empty()
                 && (!state.model_last || state.queue_len()==0) {
                 state.model_pending=false;state.model_last=true;drop(state);
-                super::emote_source_cache::process_one();
+                let deferred=super::emote_source_cache::process_one();
                 let mut state=s.state.lock().unwrap();
                 state.model_pending|=super::emote_source_cache::pending();
+                if deferred && state.queue_len()==0 && !state.stop {
+                    // Let the render thread reclaim IDLE; demand/cancellation
+                    // can wake us early. Never spin or block the render thread.
+                    drop(s.wake.wait_timeout(state,std::time::Duration::from_millis(16)).unwrap());
+                }
                 continue;
             }
             state.model_last=false;

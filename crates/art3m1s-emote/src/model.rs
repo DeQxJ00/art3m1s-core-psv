@@ -46,6 +46,16 @@ pub struct EmoteModel {
 }
 
 impl EmoteModel {
+    /// Retained model structure only, after detaching texture data. Conservative
+    /// BTree node accounting; source bytes, players and GPU storage are excluded.
+    pub fn retained_bytes_estimate(&self)->usize {
+        use crate::memory::HeapBytes;
+        assert!(self.document.is_none(), "detach PSB document before accounting");
+        std::mem::size_of::<Self>()+2*std::mem::size_of::<usize>()+
+            self.info.heap_bytes()+self.atlas.heap_bytes()+self.motions.heap_bytes()+
+            self.timelines.heap_bytes()+self.variables.heap_bytes()+self.selectors.heap_bytes()+
+            self.eye_controls.heap_bytes()+self.clamp_controls.heap_bytes()
+    }
     pub(crate) fn evaluation_identity(&self) -> &std::sync::Arc<()> {
         &self.evaluation_identity
     }
@@ -216,6 +226,9 @@ impl EmoteModel {
         }
     }
 }
+
+crate::memory::fields!(EmoteModelInfo,type_id,spec,base_chara,base_motion,characters,motions,timelines,variables);
+crate::memory::fields!(EmoteClampControl,var_lr,var_ud);
 
 fn inspect_model(
     root: &PsbValue,

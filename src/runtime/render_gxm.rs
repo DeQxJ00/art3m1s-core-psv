@@ -127,10 +127,12 @@ impl CoreRuntime {
         if rebuild {
             // An incomplete draw list must not freeze missing images on an
             // otherwise static page. Retry after the host's normal GPU fence.
+            if self.texture_provider.needs_upload_retry() { self.scene_build_cache.clear(); }
             self.texture_provider.begin_scene_build();
             let backlog_started = profile.mark();
             self.sync_backlog_snapshot();
             profile.frame_backlog_ns = crate::profiler::FrameProfile::elapsed(backlog_started);
+            if self.last_submitted_frame.is_none(){self.scene_build_cache.clear();}
             let reusable = self.last_submitted_frame.take().unwrap_or_default();
             let (frame, _, _) = self.build_bound_scene(true, None, Some(profile), reusable);
             profile.draw_list_commands = (frame.commands.len() + frame.mask_commands.len()) as u64;
@@ -185,6 +187,12 @@ impl CoreRuntime {
         if let Some(p) = profile.as_deref_mut() {
             p.frame_emote_ns = crate::profiler::FrameProfile::elapsed(emote_started);
         }
+        // A video changes the provider generation on every decoded frame.
+        // Avoid building fragments that cannot survive until the next frame.
+        let cache_static_images = self.video.video_state().video_layers.is_empty();
+        if !cache_static_images { self.scene_build_cache.clear(); }
+        self.scene_build_cache.begin(self.texture_provider.content_revision(),self.texture_provider.needs_upload_retry(),
+            text_map.keys().chain(emote_map.keys()).cloned());
         let scene_started = profile.as_ref().and_then(|p| p.mark());
         let has_emote_commands = !emote_map.is_empty();
         let has_text_commands = !text_map.is_empty();
@@ -208,15 +216,20 @@ impl CoreRuntime {
                 text_for,
             )
         } else if include_transition {
-            pipeline.build_composited_reusing(
+            pipeline.build_composited_cached(
                 &mut self.texture_provider,
                 content_for,
                 text_for,
                 reusable,
+                cache_static_images.then_some(&mut self.scene_build_cache),
             )
         } else {
             pipeline.build_with_content(&mut self.texture_provider, content_for, text_for)
         };
+        self.scene_build_cache.finish();
+        if let Some((hits,builds,entries))=self.scene_build_cache.sample() {
+            crate::core_info!("[scene-fragments] hits={} builds={} entries={}",hits,builds,entries);
+        }
         frame.materialize_stencil_groups(crate::render_pipeline::shader::ALPHA_MASK_SHADER);
         if let Some(p) = profile.as_deref_mut() {
             p.frame_scene_ns = crate::profiler::FrameProfile::elapsed(scene_started);

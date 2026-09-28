@@ -102,6 +102,8 @@ pub struct CoreRuntime {
     /// advances every tick, but identical visual frames skip GPU work/readback.
     last_submitted_frame: Option<crate::render_pipeline::draw::DrawList>,
     last_submitted_texture_revision: u64,
+    #[cfg(all(target_os="vita",feature="gxm-backend"))]
+    scene_build_cache: crate::compositor::build_cache::SceneBuildCache,
     text_renderer: Option<Box<dyn TextRenderer>>,
     /// core 内部文本注入链。宿主 FFI 注入在该链之前执行。
     text_inject: crate::text::InjectionChain,
@@ -278,6 +280,8 @@ impl CoreRuntime {
             last_rendered_clock_ms: 0,
             last_submitted_frame: None,
             last_submitted_texture_revision: 0,
+            #[cfg(all(target_os="vita",feature="gxm-backend"))]
+            scene_build_cache: Default::default(),
             text_renderer: None,
             text_inject: crate::text::InjectionChain::new(),
             pending_text_translations: HashMap::new(),

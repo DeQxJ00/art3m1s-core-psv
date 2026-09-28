@@ -84,6 +84,14 @@ pub struct PsbResourceData {
 }
 
 impl PsbResourceData {
+    /// A descriptor can be retained without keeping a texture source alive.
+    pub fn source_range(&self)->Range<usize>{self.range.clone()}
+    pub fn from_shared_range(data:Arc<Vec<u8>>,range:Range<usize>)->Result<Self>{
+        if range.start>range.end || range.end>data.len(){
+            return Err(EmoteError::InvalidFormat("texture range outside shared PSB".into()));
+        }
+        Ok(Self{data,range})
+    }
     pub fn as_bytes(&self) -> &[u8] {
         &self.data[self.range.clone()]
     }
@@ -143,6 +151,19 @@ impl PsbDocument {
 
     /// Parse without copying a retained model source. Resource views keep this
     /// same immutable allocation alive until the last texture consumer exits.
+    /// Conservative scheduling headroom, not a hard allocator limit.
+    pub fn parse_scratch_estimate(data: &[u8]) -> Result<usize> {
+        let header = parse_header(data)?;
+        let mut metadata = header.offset_chunk_data as usize;
+        if let Some(extra) = header.offset_extra_chunk_data.filter(|&n| n != 0) {
+            metadata = metadata.min(extra as usize);
+        }
+        // Unusual layouts with metadata after resources use the full length.
+        if header.offset_entries as usize >= metadata { metadata = data.len(); }
+        Ok(metadata.saturating_mul(32).saturating_add(4 * 1024 * 1024)
+            .max(16 * 1024 * 1024))
+    }
+
     pub fn from_shared_bytes(data: Arc<Vec<u8>>) -> Result<Self> {
         let header = parse_header(&data)?;
         validate_body_start(&data, &header)?;

@@ -40,6 +40,12 @@ pub struct EmoteAtlas {
     textures: BTreeMap<String, EmoteTexture>,
     icons: BTreeMap<String, AtlasIcon>,
 }
+impl crate::memory::HeapBytes for TextureFormat {
+    fn heap_bytes(&self)->usize{match self{Self::Other(s)=>s.capacity(),_=>0}}
+}
+crate::memory::fields!(EmoteTexture,id,format);
+crate::memory::fields!(AtlasIcon,id,texture_id);
+crate::memory::fields!(EmoteAtlas,textures,icons);
 
 impl EmoteAtlas {
     pub fn from_document(document: &PsbDocument) -> Result<Self> {
