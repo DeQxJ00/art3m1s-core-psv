@@ -16,6 +16,22 @@ fn id(value: Value) -> Option<String> {
 }
 
 impl Interpreter {
+    /// Dialogue volume slider only; configuration-page sliders are unrelated.
+    pub fn query_dialogue_volume_layer_ids(&self) -> Vec<String> {
+        let resolve = || -> Option<String> {
+            let buttons = self.lua().globals().raw_get::<Value>("btn").ok().and_then(table)?;
+            let group = buttons.raw_get::<Value>("adv").ok().and_then(table)?;
+            let prefix = group.raw_get::<Value>("id").ok().and_then(id)?;
+            let params = group.raw_get::<Value>("p").ok().and_then(table)?;
+            let slider = params.raw_get::<Value>("sl_vol").ok().and_then(table)?;
+            let kind = slider.raw_get::<String>("com").ok()?;
+            if kind != "yslider" && kind != "xslider" { return None; }
+            let suffix = slider.raw_get::<Value>("id").ok().and_then(id)?;
+            Some(format!("{prefix}{suffix}"))
+        };
+        resolve().into_iter().collect()
+    }
+
     pub fn query_toolbar_layer_ids(&self) -> Vec<String> {
         let globals = self.lua().globals();
         let Some(init) = globals.raw_get::<Value>("init").ok().and_then(table) else {
