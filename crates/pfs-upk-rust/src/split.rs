@@ -1,12 +1,12 @@
 //! 分卷读取：把 `base.pfs`、`base.pfs.000`、`base.pfs.001` … 串联成一个逻辑
 //! 字节流。分卷归档的头部与索引在基卷内，条目数据偏移相对串联后的整体流。
 
-use std::fs::File;
+use crate::archive_file::ArchiveFile;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub struct VolumeReader {
-    volumes: Vec<File>,
+    volumes: Vec<ArchiveFile>,
     /// 各卷在逻辑流中的起始偏移（单调递增）。
     offsets: Vec<u64>,
     total: u64,
@@ -21,9 +21,11 @@ impl VolumeReader {
         let mut total = 0u64;
         let mut path = base.to_path_buf();
         loop {
-            let file = File::open(&path)?;
+            let mut file = ArchiveFile::open(&path)?;
             offsets.push(total);
-            total += file.metadata()?.len();
+            total = total.checked_add(file.seek(SeekFrom::End(0))?)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "archive size overflow"))?;
+            file.seek(SeekFrom::Start(0))?;
             volumes.push(file);
             let mut next = base.as_os_str().to_owned();
             next.push(format!(".{:03}", volumes.len() - 1));
@@ -91,6 +93,7 @@ impl Seek for VolumeReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
 
     #[test]

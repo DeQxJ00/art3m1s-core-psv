@@ -90,6 +90,45 @@ fn build_pf6(files: &[(&[u8], &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+fn archive_entries_beyond_signed_32_bit_offsets() {
+    use std::io::{Seek, SeekFrom, Write};
+    let temp = TempDir::new("large_offset");
+    let path = temp.0.join("root.pfs");
+    let name = b"system.ini";
+    let payload = b"[VITA]\nWIDTH=960\nHEIGHT=540\nBOOT=system/first.iet\n";
+    let mut header = build_pf6(&[(name, payload)]);
+    header.truncate(header.len() - payload.len());
+    // Sparse file: exercises real seek/read without allocating 2 GiB of data.
+    let offset = i32::MAX as u32 + 0x1001;
+    let field = 11 + 4 + name.len() + 4;
+    header[field..field + 4].copy_from_slice(&offset.to_le_bytes());
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&header).unwrap();
+    file.seek(SeekFrom::Start(offset as u64)).unwrap();
+    file.write_all(payload).unwrap();
+    drop(file);
+    let cpath = cstring(path.to_str().unwrap());
+    unsafe {
+        // Both the independent-package and chained-volume entry points use
+        // the same platform file reader, including 64-bit length queries.
+        for handle in [
+            pfs_upk::pfs_open_single(cpath.as_ptr(), cstring("auto").as_ptr()),
+            pfs_upk::pfs_open(cpath.as_ptr()),
+        ] {
+            assert!(!handle.is_null());
+            assert_eq!(read_all(handle, "system.ini"), payload);
+            let mut tail = [0; 4];
+            assert_eq!(pfs_upk::pfs_read(handle, cstring("system.ini").as_ptr(),
+                (payload.len()-4) as u64, tail.as_mut_ptr(), 4), 4);
+            assert_eq!(&tail, &payload[payload.len()-4..]);
+            assert_eq!(pfs_upk::pfs_read(handle, cstring("system.ini").as_ptr(),
+                payload.len() as u64, tail.as_mut_ptr(), 4), 0);
+            pfs_upk::pfs_close(handle);
+        }
+    }
+}
+
+#[test]
 fn encrypted_pf8_roundtrip_via_builder() {
     let temp = TempDir::new("pf8");
     let input = temp.0.join("input");

@@ -10,6 +10,7 @@
 //! - 条目查找大小写不敏感、`\` 与 `/` 等价（pf8 侧统一）。
 //! - 支持分卷归档（`root.pfs` + `root.pfs.000`… 串联读取）。
 
+mod archive_file;
 mod split;
 pub mod reader;
 
@@ -94,11 +95,15 @@ pub unsafe extern "C" fn pfs_open_single(path: *const c_char, encoding: *const c
     let (Some(path), Some(encoding)) = (unsafe { read_cstr(path) }, unsafe { read_cstr(encoding) }) else {
         return std::ptr::null_mut();
     };
-    let reader = if encoding.eq_ignore_ascii_case("auto") {
-        Pf8Reader::open(path)
-    } else {
-        Pf8Reader::open_with_encoding(path, encoding_from_name(encoding))
+    let Ok(file) = archive_file::ArchiveFile::open(path) else {
+        return std::ptr::null_mut();
     };
+    let encoding = if encoding.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        Some(encoding_from_name(encoding))
+    };
+    let reader = Pf8Reader::open_reader_with_encoding(Box::new(file), encoding);
     let Ok(reader) = reader else {
         return std::ptr::null_mut();
     };
