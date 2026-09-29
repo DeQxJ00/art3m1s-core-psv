@@ -20,6 +20,8 @@ mod profile_clock;
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 mod image_decode;
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+mod launcher_exe_icon;
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 mod image_proof;
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 mod image_cache_budget;
@@ -306,7 +308,11 @@ impl Project {
             interpreter.set_file_loader(Box::new(move |name| {
                 let bytes = crate::ffi::request_file(name).map_err(|m| {
                     asb_interpreter::Error::IoError(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
+                        if m.starts_with("not found: ") {
+                            std::io::ErrorKind::NotFound
+                        } else {
+                            std::io::ErrorKind::Other
+                        },
                         m,
                     ))
                 })?;

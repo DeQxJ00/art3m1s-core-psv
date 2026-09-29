@@ -809,8 +809,25 @@ impl UserData for EngineApi {
                 return Ok(());
             };
 
-            let bytes = reader(&path)
-                .map_err(|e| mlua::Error::external(format!("include 读取 {path} 失败: {e}")))?;
+            let bytes = match reader(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let missing = match &error {
+                        crate::Error::IoError(e) => e.kind() == std::io::ErrorKind::NotFound,
+                        crate::Error::ScriptNotFound(_) => true,
+                        _ => false,
+                    };
+                    if missing {
+                        this.ctx.lock().unwrap().callbacks.debug(
+                            1,
+                            &format!("[include:missing] {path}: {error}; skipped, continuing script"),
+                            true,
+                        );
+                        return Ok(());
+                    }
+                    return Err(mlua::Error::external(format!("include 读取 {path} 失败: {error}")));
+                }
+            };
 
             let hints=this.ctx.lock().unwrap().callbacks.preload_hints_enabled();
             let old=if hints{crate::preload_hints::data_table(lua,&path)}else{None};
@@ -1657,6 +1674,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn include_missing_logs_and_continues_in_same_vm() {
+        let lua = Lua::new();
+        let probe = EmoteProbe::default();
+        let logs = probe.logs.clone();
+        let mut ctx = EngineContext::new(Box::new(probe));
+        ctx.file_reader = Some(Arc::new(|path| match path {
+            "outer.lua" => Ok(br#"
+                before = 1
+                __engine:include("missing.lua")
+                __engine:include("missing-script.lua")
+                __engine:include("present.lua")
+                after = before + loaded
+            "#.to_vec()),
+            "present.lua" => Ok(b"loaded = 2".to_vec()),
+            "missing-script.lua" => Err(crate::Error::ScriptNotFound(path.into())),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, path).into()),
+        }));
+        init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
+        lua.load("__engine:include('outer.lua')").exec().unwrap();
+        assert_eq!(lua.globals().get::<i32>("after").unwrap(), 3);
+        let logs = logs.lock().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs[0].contains("[include:missing] missing.lua"));
+        assert!(logs[1].contains("[include:missing] missing-script.lua"));
+    }
+
+    #[test]
+    fn include_nonmissing_errors_still_abort() {
+        for path in ["denied.lua", "short.lua", "syntax.lua", "runtime.lua"] {
+            let lua = Lua::new();
+            let probe = EmoteProbe::default();
+            let logs = probe.logs.clone();
+            let mut ctx = EngineContext::new(Box::new(probe));
+            ctx.file_reader = Some(Arc::new(|path| match path {
+                "denied.lua" => Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, path).into()),
+                "short.lua" => Err(std::io::Error::other("short read").into()),
+                "syntax.lua" => Ok(b"local =".to_vec()),
+                _ => Ok(b"error('runtime failure')".to_vec()),
+            }));
+            init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
+            lua.globals().set("path", path).unwrap();
+            assert!(lua.load("__engine:include(path); after = true").exec().is_err(), "{path}");
+            assert!(lua.globals().get::<Value>("after").unwrap().is_nil());
+            assert!(logs.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn file_accepts_legacy_japanese_paths_without_transcoding_contents() {
         let lua = Lua::new();
         let mut ctx = EngineContext::new(Box::new(EmoteProbe::default()));
@@ -1676,12 +1741,15 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct EmoteProbe {
+        logs: Arc<Mutex<Vec<String>>>,
         created: Arc<Mutex<Vec<(String, Vec<String>, u32, u32)>>>,
         commands: Arc<Mutex<Vec<(String, bool, EmoteLayerCommand)>>>,
     }
 
     impl EngineCallbacks for EmoteProbe {
-        fn debug(&self, _level: i32, _data: &str, _raw: bool) {}
+        fn debug(&self, _level: i32, data: &str, _raw: bool) {
+            self.logs.lock().unwrap().push(data.to_owned());
+        }
         fn enqueue_tag(&self, _tag: String, _params: HashMap<String, String>) {}
         fn set_event_handler(&self, _handlers: HashMap<String, String>) {}
         fn get_script_status(&self) -> u8 {

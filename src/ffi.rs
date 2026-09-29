@@ -795,6 +795,41 @@ pub fn query_asset_size(path: &str) -> Option<u64> {
 
 // ── File operations ──────────────────────────────────────────────
 
+/// Decode a bounded optional launcher PNG into a fixed 48x48 RGBA tile.
+/// The caller owns both buffers; zero means invalid input or decode failure.
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_launcher_decode_icon(
+    png: *const u8, png_len: usize, output: *mut u8, output_len: usize,
+) -> c_int {
+    if png.is_null() || output.is_null() || png_len < 8 || png_len > 2 * 1024 * 1024
+        || output_len != crate::image_decode::LAUNCHER_ICON_SIDE.pow(2) * 4 {
+        return 0;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let bytes = unsafe { std::slice::from_raw_parts(png, png_len) };
+        let rgba = unsafe { std::slice::from_raw_parts_mut(output, output_len) };
+        i32::from(crate::image_decode::launcher_icon(bytes, rgba))
+    })).unwrap_or(0)
+}
+
+/// Extract a PE RT_GROUP_ICON/RT_ICON into a fixed 48x48 RGBA tile.
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_launcher_extract_exe_icon(
+    exe: *const u8, exe_len: usize, output: *mut u8, output_len: usize,
+) -> c_int {
+    if exe.is_null() || output.is_null() || exe_len < 64 || exe_len > 32 * 1024 * 1024
+        || output_len != crate::image_decode::LAUNCHER_ICON_SIDE.pow(2) * 4 {
+        return 0;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let bytes = unsafe { std::slice::from_raw_parts(exe, exe_len) };
+        let rgba = unsafe { std::slice::from_raw_parts_mut(output, output_len) };
+        i32::from(crate::launcher_exe_icon::extract(bytes, rgba))
+    })).unwrap_or(0)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_file_exists(path: *const c_char) -> c_int {
     if path.is_null() {
