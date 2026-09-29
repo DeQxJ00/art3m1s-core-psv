@@ -2,14 +2,51 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct MessageFontSizes { enabled: bool, name: u32, dialogue: u32 }
+pub(super) struct MessageFontSizes { enabled: bool, name: u32, dialogue: u32, subtitle: u32 }
 impl Default for MessageFontSizes {
-    fn default() -> Self { Self { enabled: false, name: 100, dialogue: 100 } }
+    fn default() -> Self { Self { enabled: false, name: 100, dialogue: 100, subtitle: 100 } }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
+    fn subtitle_size_is_independent_and_restores_existing_pages() {
+        let mut r = GlyphTextRenderer::new();
+        r.set_named_font_bytes("fixture", std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap()).unwrap();
+        r.set_message_font_roles(Some(asb_interpreter::MessageLayerIds {
+            name: Some("speaker".into()), dialogue: Some("body".into()), subtitle: Some("sub".into()) }));
+        for id in ["speaker", "body", "sub", "backlog"] {
+            r.state.active_layer = Some(id.into());
+            r.state.active_layer_mut().font.size = Some(24.0);
+            r.push_text("ABC", false);
+            r.ruby_start("ab"); r.push_text("CD", false); r.ruby_end();
+        }
+        let original = r.state.layers.clone();
+        assert!(r.set_message_font_sizes_separate(true, 100, 100, 150));
+        for id in ["speaker", "body", "backlog"] {
+            assert_eq!(r.state.layers[id].text_buffer, original[id].text_buffer);
+        }
+        assert!(r.state.layers["sub"].text_buffer[0].advance_x > original["sub"].text_buffer[0].advance_x);
+        let larger_sub = r.state.layers["sub"].text_buffer.clone();
+        assert!(r.set_message_font_sizes_separate(true, 100, 125, 150));
+        assert_eq!(r.state.layers["sub"].text_buffer, larger_sub);
+        assert!(r.state.layers["body"].text_buffer[0].advance_x > original["body"].text_buffer[0].advance_x);
+        assert!(!r.set_message_font_sizes_separate(true, 100, 125, 151));
+        assert_eq!(r.message_sizes.subtitle, 150);
+        assert!(r.set_message_font_sizes_separate(false, 100, 125, 150));
+        for (id, old) in original {
+            assert_eq!(r.state.layers[&id].text_buffer, old.text_buffer);
+            assert_eq!(r.state.layers[&id].rubies, old.rubies);
+            assert_eq!(r.state.layers[&id].font, old.font);
+            assert_eq!(r.state.layers[&id].page_tags, old.page_tags);
+        }
+        let sizes = MessageFontSizes { enabled: true, name: 100, dialogue: 125, subtitle: 150 };
+        assert_eq!(sizes.scale("1.80.mw.adv_adv", None), 1.25);
+        assert_eq!(sizes.scale("1.80.mw.adv_sub", None), 1.5);
+        assert_eq!(sizes.scale("1.80.mw.adv_name", None), 1.0);
+    }
     #[test]
     #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
     fn position_changes_cached_commands_links_and_restores_script_state() {
@@ -94,7 +131,7 @@ mod tests {
     }
     #[test]
     fn roles_and_disabled_values_are_independent() {
-        let s = MessageFontSizes { enabled: true, name: 125, dialogue: 150 };
+        let s = MessageFontSizes { enabled: true, name: 125, dialogue: 150, subtitle: 150 };
         assert_eq!(s.scale("100.mw.name", None), 1.25);
         assert_eq!(s.scale("100.mw.adv", None), 1.5);
         assert_eq!(s.scale("100.mw.sub", None), 1.5);
@@ -111,7 +148,7 @@ mod tests {
     }
     #[test]
     fn exact_roles_override_spelling_and_never_match_children() {
-        let s=MessageFontSizes{enabled:true,name:125,dialogue:150};
+        let s=MessageFontSizes{enabled:true,name:125,dialogue:150,subtitle:150};
         let roles=asb_interpreter::MessageLayerIds{name:Some("panel.speaker".into()),
             dialogue:Some("panel.paragraph".into()),subtitle:Some("translation".into())};
         assert_eq!(s.scale("panel.speaker",Some(&roles)),1.25);
@@ -248,8 +285,8 @@ impl MessageFontSizes {
         if !self.enabled { return 1.0; }
         if let Some(roles) = roles {
             let percent = if roles.name.as_deref() == Some(id) { self.name }
-                else if roles.dialogue.as_deref() == Some(id) || roles.subtitle.as_deref() == Some(id)
-                    || id == DEFAULT_MESSAGE_LAYER { self.dialogue }
+                else if roles.dialogue.as_deref() == Some(id) || id == DEFAULT_MESSAGE_LAYER { self.dialogue }
+                else if roles.subtitle.as_deref() == Some(id) { self.subtitle }
                 else { 100 };
             return percent as f32 / 100.0;
         }
@@ -259,7 +296,8 @@ impl MessageFontSizes {
         let role = id.rsplit_once(".mw.").map(|(_, role)| role);
         let percent = match role {
             Some("name" | "adv_name") => self.name,
-            Some("adv" | "sub" | "adv_adv" | "adv_sub") => self.dialogue,
+            Some("adv" | "adv_adv") => self.dialogue,
+            Some("sub" | "adv_sub") => self.subtitle,
             _ if id == DEFAULT_MESSAGE_LAYER => self.dialogue,
             _ => 100,
         };
@@ -285,8 +323,11 @@ impl GlyphTextRenderer {
         m
     }
     pub(super) fn update_message_sizes(&mut self, enabled: bool, name: u32, dialogue: u32) -> bool {
-        if !(75..=150).contains(&name) || !(75..=150).contains(&dialogue) { return false; }
-        let next = MessageFontSizes { enabled, name, dialogue };
+        self.update_message_sizes_separate(enabled, name, dialogue, dialogue)
+    }
+    pub(super) fn update_message_sizes_separate(&mut self, enabled: bool, name: u32, dialogue: u32, subtitle: u32) -> bool {
+        if [name, dialogue, subtitle].iter().any(|v| !(75..=150).contains(v)) { return false; }
+        let next = MessageFontSizes { enabled, name, dialogue, subtitle };
         self.update_message_presentation(next, self.message_roles.clone())
     }
     pub(super) fn update_message_presentation(&mut self, next: MessageFontSizes,

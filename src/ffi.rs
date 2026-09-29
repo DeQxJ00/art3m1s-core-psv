@@ -1473,6 +1473,14 @@ pub unsafe extern "C" fn art3m1s_runtime_set_message_font_sizes(rt: *mut CoreRun
     unsafe { rt.as_mut() }.map_or(0, |r| i32::from(r.set_message_font_sizes(enabled != 0, name, dialogue)))
 }
 
+/// Independent speaker, main dialogue and secondary dialogue scales.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_message_font_sizes_separate(rt: *mut CoreRuntime,
+    enabled: c_int, name: u32, dialogue: u32, subtitle: u32) -> c_int {
+    unsafe { rt.as_mut() }.map_or(0, |r| i32::from(r.set_message_font_sizes_separate(enabled != 0, name, dialogue, subtitle)))
+}
+
 /// Main and secondary dialogue offsets, in logical stage pixels; host-only.
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]
