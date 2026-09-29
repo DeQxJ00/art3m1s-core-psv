@@ -699,6 +699,13 @@ impl CoreRuntime {
         ok
     }
 
+    pub fn set_message_font_sizes_separate(&mut self, enabled: bool, name: u32, dialogue: u32, subtitle: u32) -> bool {
+        self.sync_message_font_roles();
+        let ok = self.text_renderer.as_mut().is_some_and(|r| r.set_message_font_sizes_separate(enabled, name, dialogue, subtitle));
+        if ok { self.frame_visual_dirty = true; self.pointer_hit_test_dirty = true; }
+        ok
+    }
+
     pub fn set_message_position(&mut self, value: crate::text::message_position::MessagePosition) -> bool {
         self.sync_message_font_roles();
         let ok = self.text_renderer.as_mut().is_some_and(|r| r.set_message_position(value));
