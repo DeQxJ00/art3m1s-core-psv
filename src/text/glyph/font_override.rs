@@ -11,6 +11,88 @@ impl Default for MessageFontSizes {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
+    fn position_changes_cached_commands_links_and_restores_script_state() {
+        use crate::text::message_position::MessagePosition;
+        struct Provider;
+        impl TextureProvider for Provider {
+            fn resolve(&mut self, _: &str) -> Option<(TextureId, TextureInfo)> {
+                Some((TextureId(1), TextureInfo { width: ATLAS_SZ, height: ATLAS_SZ }))
+            }
+            fn upload_rgba(&mut self, name: &str, _: u32, _: u32, _: &[u8]) -> Option<(TextureId, TextureInfo)> {
+                self.resolve(name)
+            }
+        }
+        let mut r = GlyphTextRenderer::new();
+        r.set_named_font_bytes("fixture", std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap()).unwrap();
+        let roles = asb_interpreter::MessageLayerIds { name: Some("speaker".into()),
+            dialogue: Some("body".into()), subtitle: Some("sub".into()) };
+        r.set_message_font_roles(Some(roles.clone()));
+        for id in ["body", "sub", "speaker", "backlog"] {
+            r.state.active_layer = Some(id.into());
+            let layer = r.state.active_layer_mut();
+            layer.font.size = Some(24.0);
+            layer.font.outline_size = Some(1.0);
+            layer.font.shadow_size = Some(2.0);
+            layer.font.entire_xscale = Some(120.0);
+            layer.left = 100.0; layer.top = 80.0; layer.width = 400.0;
+            r.link_start(Some("file"), Some("target"), 1, None, None, None);
+            r.push_text("ABC", false);
+            r.link_end();
+            r.ruby_start("ab"); r.push_text("CD", false); r.ruby_end();
+        }
+        let original = r.state.layers.clone();
+        let mut provider = Provider;
+        let before = r.build_text_commands(&mut provider);
+        assert_eq!(r.build_text_commands(&mut provider), before); // Warm command cache.
+        let links = r.link_hit_areas();
+        let pos = MessagePosition { enabled: true, hide_subtitle: false,
+            dialogue: [15, -25], subtitle: [-10, 30] };
+        assert!(r.set_message_position(pos));
+        let after = r.build_text_commands(&mut provider);
+        for (id, commands) in &before {
+            let delta = match id.as_str() { "body" => Vec2::new(15.0, -25.0), "sub" => Vec2::new(-10.0, 30.0), _ => Vec2::ZERO };
+            assert!(!commands.is_empty());
+            assert_eq!(commands.len(), after[id].len());
+            for (a, b) in commands.iter().zip(&after[id]) {
+                let mut expected = a.clone();
+                expected.transform = Affine2::from_translation(delta) * expected.transform;
+                assert!(expected.transform.abs_diff_eq(b.transform, 0.0001));
+                expected.transform = b.transform; // Matrix association has normal f32 roundoff.
+                assert_eq!(&expected, b); // Includes outline, shadow, ruby, UVs and alpha.
+            }
+        }
+        assert_eq!(r.build_text_commands(&mut provider), after);
+        for area in r.link_hit_areas() {
+            let old = links.iter().find(|l| l.layer_id == area.layer_id && l.link_index == area.link_index).unwrap();
+            let (_, delta) = pos.layer(&area.layer_id, Some(&roles));
+            assert_eq!(area.left, old.left + delta[0] as f32);
+            assert_eq!(area.top, old.top + delta[1] as f32);
+        }
+        assert!(r.set_message_position(MessagePosition { hide_subtitle: true, ..pos }));
+        assert!(!r.build_text_commands(&mut provider).contains_key("sub"));
+        assert!(!r.link_hit_areas().iter().any(|a| a.layer_id == "sub"));
+        // Role changes invalidate cached commands even without a font size change.
+        let mut swapped = roles.clone();
+        std::mem::swap(&mut swapped.dialogue, &mut swapped.subtitle);
+        r.set_message_font_roles(Some(swapped));
+        let swapped_commands = r.build_text_commands(&mut provider);
+        assert!(!swapped_commands.contains_key("body"));
+        assert!(swapped_commands.contains_key("sub"));
+        r.set_message_font_roles(Some(roles));
+        assert!(!r.set_message_position(MessagePosition { dialogue: [501, 0], ..pos }));
+        assert!(r.set_message_position(MessagePosition::default()));
+        assert_eq!(r.build_text_commands(&mut provider), before);
+        for (id, old) in original {
+            let current = &r.state.layers[&id];
+            assert_eq!(current.text_buffer, old.text_buffer);
+            assert_eq!(current.page_tags, old.page_tags);
+            assert_eq!(current.font, old.font);
+            assert_eq!((current.left, current.top, current.width), (old.left, old.top, old.width));
+            assert_eq!(current.reveal_clock_ms, old.reveal_clock_ms);
+        }
+    }
+    #[test]
     fn roles_and_disabled_values_are_independent() {
         let s = MessageFontSizes { enabled: true, name: 125, dialogue: 150 };
         assert_eq!(s.scale("100.mw.name", None), 1.25);

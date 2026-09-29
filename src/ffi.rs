@@ -1448,6 +1448,15 @@ pub unsafe extern "C" fn art3m1s_runtime_set_emote_mesh_ratio(rt: *mut CoreRunti
     unsafe { rt.as_mut() }.map_or(0, |runtime| i32::from(runtime.set_emote_mesh_ratio(ratio)))
 }
 
+/// Hide the dialogue volume slider without changing mixer levels or save data.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_dialogue_volume_hidden(rt: *mut CoreRuntime, hidden: c_int) {
+    if let Some(runtime) = unsafe { rt.as_mut() } {
+        runtime.set_dialogue_volume_hidden(hidden != 0);
+    }
+}
+
 /// Hide only script-declared touch-toolbars; no game save properties change.
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]
@@ -1462,6 +1471,18 @@ pub unsafe extern "C" fn art3m1s_runtime_set_toolbar_hidden(rt: *mut CoreRuntime
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_runtime_set_message_font_sizes(rt: *mut CoreRuntime, enabled: c_int, name: u32, dialogue: u32) -> c_int {
     unsafe { rt.as_mut() }.map_or(0, |r| i32::from(r.set_message_font_sizes(enabled != 0, name, dialogue)))
+}
+
+/// Main and secondary dialogue offsets, in logical stage pixels; host-only.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_message_position(rt: *mut CoreRuntime,
+    enabled: c_int, hide_subtitle: c_int, dx: c_int, dy: c_int, sx: c_int, sy: c_int) -> c_int {
+    let value = crate::text::message_position::MessagePosition {
+        enabled: enabled != 0, hide_subtitle: hide_subtitle != 0,
+        dialogue: [dx, dy], subtitle: [sx, sy],
+    };
+    unsafe { rt.as_mut() }.map_or(0, |r| i32::from(r.set_message_position(value)))
 }
 
 /// Controls text layout memoization for same-scene diagnostic comparisons.

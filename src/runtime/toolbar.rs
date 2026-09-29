@@ -7,19 +7,25 @@ use asb_interpreter::Interpreter;
 #[derive(Default)]
 pub(super) struct ToolbarVisibility {
     pub hidden: bool,
+    pub volume_hidden: bool,
     ids: Vec<String>,
 }
 
 impl ToolbarVisibility {
     fn sync(&mut self, it: &Interpreter, scene: &mut Scene) -> bool {
-        if !self.hidden && self.ids.is_empty() {
+        if !self.hidden && !self.volume_hidden && self.ids.is_empty() {
             return false;
         }
-        let next = if self.hidden {
+        let mut next = if self.hidden {
             it.query_toolbar_layer_ids()
         } else {
             vec![]
         };
+        if self.volume_hidden {
+            for id in it.query_dialogue_volume_layer_ids() {
+                if !next.contains(&id) { next.push(id); }
+            }
+        }
         let mut changed = false;
         for key in self.ids.iter().chain(next.iter()) {
             let hidden = next.contains(key);
@@ -38,6 +44,11 @@ impl ToolbarVisibility {
 }
 
 impl CoreRuntime {
+    pub fn set_dialogue_volume_hidden(&mut self, hidden: bool) {
+        self.toolbar.volume_hidden = hidden;
+        self.sync_toolbar_visibility();
+    }
+
     pub fn set_toolbar_hidden(&mut self, hidden: bool) {
         self.toolbar.hidden = hidden;
         self.sync_toolbar_visibility();
@@ -63,6 +74,39 @@ mod tests {
         build::{build_frame, resolved_props},
         mock::MockProvider,
     };
+
+    #[test]
+    fn dialogue_volume_override_is_independent_and_preserves_audio_state() {
+        let it = Interpreter::default();
+        it.lua().load(r#"
+            init={mwtabid='ui.strip'}
+            conf={master=73}
+            btn={name='config',adv={id='dialogue.',p={sl_vol={id='volume',com='yslider'}}},
+                 config={id='settings.',p={sl_vol={id='volume',com='yslider'}}}}
+        "#).exec().unwrap();
+        let mut scene = Scene::new();
+        for key in ["dialogue.volume.10", "dialogue.text", "settings.volume", "ui.strip"] {
+            scene.ensure(key);
+        }
+        let mut v = ToolbarVisibility::default();
+        v.volume_hidden = true;
+        assert!(v.sync(&it, &mut scene));
+        assert!(!scene.is_effectively_visible("dialogue.volume.10"));
+        assert!(scene.is_effectively_visible("settings.volume"));
+        assert!(scene.is_effectively_visible("dialogue.text"));
+        assert!(scene.is_effectively_visible("ui.strip"));
+        v.hidden = true;
+        assert!(v.sync(&it, &mut scene));
+        v.volume_hidden = false;
+        assert!(v.sync(&it, &mut scene));
+        assert!(scene.is_effectively_visible("dialogue.volume.10"));
+        assert!(!scene.is_effectively_visible("ui.strip"));
+        assert_eq!(it.lua().load("return conf.master").eval::<i32>().unwrap(), 73);
+        // Invalid/missing role must not hide arbitrary layers.
+        it.lua().load("btn.adv.p.sl_vol.com='btn'").exec().unwrap();
+        v.volume_hidden = true;
+        assert!(!v.sync(&it, &mut scene));
+    }
 
     #[test]
     fn toolbar_override_preserves_script_visibility_and_saves() {

@@ -22,6 +22,7 @@ pub mod backlog;
 pub mod glyph;
 pub mod inject;
 pub mod render;
+pub mod message_position;
 
 pub use backlog::{Backlog, BacklogPage, BacklogSettings, BacklogTag};
 pub use glyph::GlyphTextRenderer;

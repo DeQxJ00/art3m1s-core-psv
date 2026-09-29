@@ -171,6 +171,7 @@ use font_override::MessageFontSizes;
 
 pub struct GlyphTextRenderer {
     message_sizes: MessageFontSizes,
+    message_position: crate::text::message_position::MessagePosition,
     message_roles: Option<asb_interpreter::MessageLayerIds>,
     #[cfg(feature = "gxm-text-epoch")]
     snapshot_revision: snapshot_revision::SnapshotRevision,
@@ -532,6 +533,7 @@ impl GlyphTextRenderer {
     pub fn new() -> Self {
         Self {
             message_sizes: MessageFontSizes::default(),
+            message_position: Default::default(),
             message_roles: None,
             state: FontState::new(),
             #[cfg(feature = "gxm-text-epoch")]
@@ -652,6 +654,17 @@ impl GlyphTextRenderer {
 impl TextRenderer for GlyphTextRenderer {
     fn set_message_font_sizes(&mut self, enabled: bool, name: u32, dialogue: u32) -> bool {
         self.update_message_sizes(enabled, name, dialogue)
+    }
+    fn set_message_position(&mut self, value: crate::text::message_position::MessagePosition) -> bool {
+        if !value.valid() { return false; }
+        if value != self.message_position {
+            self.message_position = value;
+            let enabled = self.command_cache.enabled;
+            self.command_cache = CommandCache::default();
+            self.command_cache.enabled = enabled;
+            self.mark_snapshot_changed();
+        }
+        true
     }
     fn set_message_font_roles(&mut self, roles: Option<asb_interpreter::MessageLayerIds>) -> bool {
         self.update_message_presentation(self.message_sizes, roles)
@@ -1145,6 +1158,8 @@ impl TextRenderer for GlyphTextRenderer {
             if ly.links.is_empty() || ly.text_buffer.is_empty() {
                 continue;
             }
+            let (hidden, offset) = self.message_position.layer(lid, self.message_roles.as_ref());
+            if hidden { continue; }
             let sz = ly.font.size.unwrap_or(DEFAULT_FONT_SIZE);
             // 未加载字体时以字号近似行高（与 push_line_break 的近似一致）
             let body_height = scaled(&self.font, PxScale::from(sz))
@@ -1168,8 +1183,8 @@ impl TextRenderer for GlyphTextRenderer {
                     out.push(LinkHitArea {
                         layer_id: lid.clone(),
                         link_index: idx,
-                        left: ly.left + x,
-                        top: ly.top + metrics.body_top + y,
+                        left: ly.left + x + offset[0] as f32,
+                        top: ly.top + metrics.body_top + y + offset[1] as f32,
                         width: w,
                         height: h,
                         file: link.file.clone(),
@@ -1285,6 +1300,9 @@ impl TextRenderer for GlyphTextRenderer {
                 continue;
             }
 
+            let (hidden, offset) = self.message_position.layer(lid, self.message_roles.as_ref());
+            if hidden { continue; }
+
             if let Some(commands) = self.command_cache.get(lid, ly) {
                 if !commands.is_empty() { out.insert(lid.clone(), commands); }
                 continue;
@@ -1331,7 +1349,8 @@ impl TextRenderer for GlyphTextRenderer {
             let has_shadow =
                 st.contains("shadow") || ly.font.shadow_size.is_some_and(|size| size > 0.0);
             let page_alpha = ly.font.entire_alpha.unwrap_or(255) as f32 / 255.0;
-            let page_transform = message_page_transform(ly);
+            let page_transform = Affine2::from_translation(Vec2::new(offset[0] as f32, offset[1] as f32))
+                * message_page_transform(ly);
 
             // 统一走排版函数：禁则 / wordparts / 缩进 / 注音不可拆行都在这里生效
             let keep_ranges = ly.keep_ranges();
