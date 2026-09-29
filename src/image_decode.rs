@@ -2,6 +2,51 @@
 //! This does not replace codec-internal allocators or provide a process-wide memory limit.
 use image::{ColorType, ImageDecoder, ImageError, ImageResult, RgbaImage};
 
+pub(crate) const LAUNCHER_ICON_SIDE: usize = 48;
+
+pub(crate) fn launcher_icon(png: &[u8], output: &mut [u8]) -> bool {
+    if output.len() != LAUNCHER_ICON_SIDE * LAUNCHER_ICON_SIDE * 4
+        || png.len() > 2 * 1024 * 1024
+        || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return false;
+    }
+    let Ok(decoder) = image::codecs::png::PngDecoder::new(std::io::Cursor::new(png)) else {
+        return false;
+    };
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 || width > 2048 || height > 2048 {
+        return false;
+    }
+    let Ok(source) = rgba(decoder, 16 * 1024 * 1024) else {
+        return false;
+    };
+    launcher_rgba_icon(&source, output)
+}
+
+pub(crate) fn launcher_rgba_icon(source: &RgbaImage, output: &mut [u8]) -> bool {
+    if output.len() != LAUNCHER_ICON_SIDE * LAUNCHER_ICON_SIDE * 4 {
+        return false;
+    }
+    let (width, height) = source.dimensions();
+    if width == 0 || height == 0 || width > 2048 || height > 2048 {
+        return false;
+    }
+    let scale = (LAUNCHER_ICON_SIDE as f64 / width as f64)
+        .min(LAUNCHER_ICON_SIDE as f64 / height as f64);
+    let w = (width as f64 * scale).round().max(1.0) as u32;
+    let h = (height as f64 * scale).round().max(1.0) as u32;
+    let thumb = image::imageops::resize(source, w, h, image::imageops::FilterType::Triangle);
+    output.fill(0);
+    let x = (LAUNCHER_ICON_SIDE - w as usize) / 2;
+    let y = (LAUNCHER_ICON_SIDE - h as usize) / 2;
+    for row in 0..h as usize {
+        let dst = ((y + row) * LAUNCHER_ICON_SIDE + x) * 4;
+        let src = row * w as usize * 4;
+        output[dst..dst + w as usize * 4].copy_from_slice(&thumb.as_raw()[src..src + w as usize * 4]);
+    }
+    true
+}
+
 fn memory_error() -> ImageError {
     ImageError::Limits(image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory))
 }
@@ -69,6 +114,18 @@ pub(crate) fn rgba_into(decoder: impl ImageDecoder, data:&mut [u8], limit:usize)
 mod tests {
     use super::*;
     use image::ImageEncoder;
+    #[test]
+    fn launcher_icon_centers_png_and_preserves_alpha() {
+        let mut png = Vec::new();
+        let pixels = [255, 0, 0, 128, 0, 255, 0, 255];
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&pixels, 2, 1, ColorType::Rgba8.into()).unwrap();
+        let mut output = [0x55; LAUNCHER_ICON_SIDE * LAUNCHER_ICON_SIDE * 4];
+        assert!(launcher_icon(&png, &mut output));
+        assert_eq!(&output[..4], &[0, 0, 0, 0]);
+        assert!(output.chunks_exact(4).any(|p| p[3] != 0));
+        assert!(!launcher_icon(&png[..8], &mut output));
+    }
     #[test]
     fn png_depths_match_reference_and_allocation_rejection_is_recoverable() {
         for color in [ColorType::L8,ColorType::La8,ColorType::Rgb8,ColorType::Rgba8,

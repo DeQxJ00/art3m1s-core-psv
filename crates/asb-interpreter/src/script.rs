@@ -5,6 +5,7 @@
 //! [`preprocess`] 模块），预处理保持行号一一对应。
 
 mod binary;
+mod comments;
 pub mod preprocess;
 
 use crate::error::{Error, Result};
@@ -67,6 +68,8 @@ impl Script {
     /// [`preprocess::install_tag_ini`]），再解析。预处理是「一行进一行出」，
     /// 指令行号不受影响。
     pub fn parse(name: &str, content: &str) -> Result<Self> {
+        let cleaned=comments::strip_blocks(content)?;
+        let content=cleaned.as_ref();
         // 快路径：预处理指令都以 "[&" 开头，全文没有就跳过整条管线
         if !content.contains("[&") {
             return Self::parse_preprocessed(name, content);
@@ -77,6 +80,8 @@ impl Script {
 
     /// 从文本解析脚本，显式指定 tag.ini（绕开全局注册表；测试/宿主定制用）
     pub fn parse_with_tag_ini(name: &str, content: &str, tag_ini: Option<&TagIni>) -> Result<Self> {
+        let cleaned=comments::strip_blocks(content)?;
+        let content=cleaned.as_ref();
         if !content.contains("[&") {
             return Self::parse_preprocessed(name, content);
         }
@@ -559,6 +564,39 @@ mod tests {
         let script = Script::parse("test", "[rt] // 注释 [rp]").unwrap();
         let tags: Vec<&str> = script.instructions.iter().map(|i| i.tag.as_str()).collect();
         assert_eq!(tags, vec!["rt"]);
+    }
+
+    #[test]
+    fn block_comments_remove_text_commands_labels_and_preserve_lines() {
+        let src="*top\n/*\n[var name=bad data=1]\n*hidden\n[lua]\nnot lua\n*/\n[stop] /* trailing */\n/* inline */ [return]\n";
+        let script=Script::parse("test",src).unwrap();
+        assert_eq!(script.instructions.iter().map(|i|(i.tag.as_str(),i.line)).collect::<Vec<_>>(),vec![("stop",8),("return",9)]);
+        assert!(!script.labels.contains_key("hidden"));
+        assert_eq!(script.get_label_line("top"),Some(0));
+    }
+
+    #[test]
+    fn block_comments_are_removed_before_preprocessor_directives() {
+        let src="[&autoinsert target=\"blankline\" command=\"[blank]\"]\n/*\n\n[&autoinsert target=\"linehead\" command=\"[bad]\"]\n*/\nvisible\n\n[stop]";
+        for script in [Script::parse("test",src).unwrap(),Script::parse_with_tag_ini("test",src,None).unwrap()] {
+            assert_eq!(script.instructions.iter().map(|i|(i.tag.as_str(),i.line)).collect::<Vec<_>>(),vec![("__text",6),("blank",7),("stop",8)]);
+            assert_eq!(script.instructions[0].get("text"),Some("visible"));
+        }
+    }
+
+    #[test]
+    fn block_comment_markers_in_lua_tag_values_and_line_comments_are_literal() {
+        let src="// /* ignored\n; /* ignored\n[var data=\"/* literal */\"] // /* ignored\n/* before Lua */[lua]\nlocal text = '/* literal */'\nlocal glob = 'image/*'\n[/lua]\n[stop]";
+        let script=Script::parse("test",src).unwrap();
+        assert_eq!(script.instructions.iter().map(|i|i.tag.as_str()).collect::<Vec<_>>(),vec!["var","__lua_block","stop"]);
+        assert_eq!(script.instructions[0].get("data"),Some("/* literal */"));
+        assert_eq!(script.instructions[1].get("code"),Some("local text = '/* literal */'\nlocal glob = 'image/*'"));
+        assert_eq!(script.instructions[2].line,8);
+    }
+
+    #[test]
+    fn block_comment_unterminated_reports_opening_line() {
+        assert!(matches!(Script::parse("test","[stop]\n/* hidden\n[exit]"),Err(Error::ParseError{line:2,..})));
     }
 
     #[test]

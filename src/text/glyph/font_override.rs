@@ -99,6 +99,22 @@ mod tests {
     }
     #[test]
     #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
+    fn bootstrap_font_remains_available_for_existing_message_resize() {
+        let bytes=std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap();
+        let mut r=GlyphTextRenderer::new();
+        r.set_named_font_bytes("bootstrap",bytes.clone()).unwrap();
+        r.state.active_layer=Some(DEFAULT_MESSAGE_LAYER.into());
+        r.state.active_layer_mut().font.size=Some(24.0);
+        r.push_text("/AB",false);
+        let before=r.state.layers[DEFAULT_MESSAGE_LAYER].text_buffer.clone();
+        r.set_named_font_bytes("dialogue",bytes).unwrap();
+        assert!(r.update_message_sizes(true,100,130));
+        assert!(r.state.layers[DEFAULT_MESSAGE_LAYER].text_buffer[0].advance_x>before[0].advance_x);
+        assert!(r.update_message_sizes(false,100,130));
+        assert_eq!(r.state.layers[DEFAULT_MESSAGE_LAYER].text_buffer,before);
+    }
+    #[test]
+    #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
     fn font_override_reraster_reflow_restore_and_logical_state() {
         let bytes = std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap();
         let mut r = GlyphTextRenderer::new();
@@ -203,15 +219,24 @@ impl GlyphTextRenderer {
                 let ratio = next.scale(&layer.id, roles.as_ref());
                 for glyph in layer.text_buffer.iter_mut().chain(layer.rubies.iter_mut().flat_map(|r| r.glyphs.iter_mut())) {
                     if glyph.character == "\n" { continue; }
-                    if glyph.logical_size <= 0.0 { return false; }
+                    if glyph.logical_size <= 0.0 {
+                        crate::core_warn!("font resize failed: layer={} glyph={:?} invalid logical_size={}",layer.id,glyph.character,glyph.logical_size);
+                        return false;
+                    }
                     if glyph.font_generation != self.font_generation {
                         if glyph.font_generation == old_generation { self.font = old_font.clone(); self.font_generation = old_generation; }
                         else if let Some((font, generation)) = self.fonts.values().find(|(_, g)| *g == glyph.font_generation) {
                             self.font = Some(font.clone()); self.font_generation = *generation;
-                        } else { return false; }
+                        } else {
+                            crate::core_warn!("font resize failed: layer={} glyph={:?} missing font generation={} current={}",layer.id,glyph.character,glyph.font_generation,old_generation);
+                            return false;
+                        }
                     }
                     let Some(c) = glyph.character.chars().next() else { return false; };
-                    let Some(replacement) = self.rasterize_message_glyph(c, glyph.logical_size, ratio) else { return false; };
+                    let Some(replacement) = self.rasterize_message_glyph(c, glyph.logical_size, ratio) else {
+                        crate::core_warn!("font resize failed: layer={} glyph={:?} rasterize size={} ratio={} generation={}",layer.id,glyph.character,glyph.logical_size,ratio,glyph.font_generation);
+                        return false;
+                    };
                     *glyph = replacement;
                 }
             }

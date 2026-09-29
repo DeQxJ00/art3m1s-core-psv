@@ -7,7 +7,7 @@ use crate::backend::gl::GlTextureProvider;
 #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
 use crate::backend::gxm::GxmTextureProvider;
 use crate::runtime::save_io;
-use crate::text::GlyphTextRenderer;
+use crate::text::{GlyphTextRenderer, TextRenderer};
 use asb_interpreter::{CallbackResult, Event};
 use std::sync::Arc;
 
@@ -143,7 +143,11 @@ impl CoreRuntime {
                 let resolved = magic_path::resolve_path(&magic_paths_loader, name);
                 crate::ffi::request_file(&resolved).map_err(|m| {
                     asb_interpreter::Error::IoError(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
+                        if m.starts_with("not found: ") {
+                            std::io::ErrorKind::NotFound
+                        } else {
+                            std::io::ErrorKind::Other
+                        },
                         m,
                     ))
                 })
@@ -260,7 +264,12 @@ impl CoreRuntime {
         for candidate in std::iter::once(Self::DEFAULT_FONT_PATH.to_string()).chain(
             super::text::font_fallback_candidates(Self::DEFAULT_FONT_PATH),
         ) {
-            match crate::load_font_ffi(&candidate).and_then(|font| text.set_font_owned(font)) {
+            // Bootstrap glyphs can survive later script font changes (including
+            // hidden message layers). Keep their generation discoverable when
+            // host font sizing re-rasterizes existing pages. Use the logical
+            // default name for fallbacks too, as load_script_font does.
+            match crate::load_font_ffi(&candidate)
+                .and_then(|font| text.set_named_font_bytes(Self::DEFAULT_FONT_PATH, font)) {
                 Ok(()) => {
                     if candidate != Self::DEFAULT_FONT_PATH {
                         crate::core_info!(
