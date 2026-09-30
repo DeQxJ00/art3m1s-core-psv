@@ -90,6 +90,8 @@ pub struct CoreRuntime {
 
     renderer: RuntimeRenderer,
     texture_provider: RuntimeTextureProvider,
+    #[cfg(all(target_os="vita",feature="gxm-backend"))]
+    ignore_background_alpha: bool,
     surface_timeline_cursor: asb_interpreter::SurfaceTimelineCursor,
     emote_timeline_cursor: asb_interpreter::EmoteTimelineCursor,
     png_comments: png_comments::SharedComments,
@@ -272,6 +274,8 @@ impl CoreRuntime {
             fbo_tex,
             renderer,
             texture_provider,
+            #[cfg(all(target_os="vita",feature="gxm-backend"))]
+            ignore_background_alpha: true,
             surface_timeline_cursor: Default::default(),
             emote_timeline_cursor: Default::default(),
             png_comments: Default::default(),

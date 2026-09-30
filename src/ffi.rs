@@ -1448,6 +1448,14 @@ pub unsafe extern "C" fn art3m1s_runtime_set_emote_mesh_ratio(rt: *mut CoreRunti
     unsafe { rt.as_mut() }.map_or(0, |runtime| i32::from(runtime.set_emote_mesh_ratio(ratio)))
 }
 
+/// Set the PSV BG alpha policy before project loading. Returns zero for live
+/// cache changes or unsupported backends; script/layer opacity is unchanged.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_ignore_background_alpha(rt: *mut CoreRuntime, enabled: c_int) -> c_int {
+    unsafe { rt.as_mut() }.map_or(0, |r| i32::from(r.set_ignore_background_alpha(enabled != 0)))
+}
+
 /// Hide the dialogue volume slider without changing mixer levels or save data.
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]

@@ -21,6 +21,10 @@ impl TileProof {
     // Call only after a successful decode; RGBA expansion of RGB8 writes A=255.
     pub fn for_rgb24(width:u32,height:u32,color:image::ColorType)->Option<Self>{
         if color!=image::ColorType::Rgb8{return None;}
+        Self::for_opaque_pixels(width,height)
+    }
+    // Caller has successfully decoded/converted every alpha byte to 255.
+    pub fn for_opaque_pixels(width:u32,height:u32)->Option<Self>{
         let mut proof=Self::allocate(width,height)?;
         for (i,v) in [MAGIC,width,height,0,0,width,height,1].into_iter().enumerate(){
             proof.cells[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
