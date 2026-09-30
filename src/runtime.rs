@@ -275,7 +275,7 @@ impl CoreRuntime {
             renderer,
             texture_provider,
             #[cfg(all(target_os="vita",feature="gxm-backend"))]
-            ignore_background_alpha: true,
+            ignore_background_alpha: false,
             surface_timeline_cursor: Default::default(),
             emote_timeline_cursor: Default::default(),
             png_comments: Default::default(),
