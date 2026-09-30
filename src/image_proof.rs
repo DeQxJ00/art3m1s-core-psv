@@ -73,6 +73,9 @@ impl TileProof {
         self.certificate_for_size(width,height).map(|c|c[28]==1)
     }
     pub fn bytes(&self)->usize{self.cells.capacity()}
+    pub fn rgba_bytes(&self)->Option<usize>{
+        (self.width as usize).checked_mul(self.height as usize)?.checked_mul(4)
+    }
     pub fn transfer(&mut self,owner:Owner){self.cells.transfer(owner);}
 }
 #[cfg(test)] mod tests {

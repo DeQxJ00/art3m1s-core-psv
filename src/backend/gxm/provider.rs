@@ -449,11 +449,14 @@ impl GxmTextureProvider {
         // Reuse already-owned compressed data only for large static images.
         // Sources share the existing idle budget, with an additional 1/4 cap;
         // no separate cache allowance, reads, copies, workers or waits here.
-        let Some(info)=self.entries.get(name).map(|e|e.info) else{return;};
-        if u64::from(info.width)*u64::from(info.height)*4<1024*1024{return;}
+        let deferred=self.decoded.contains_key(name);
+        let Some(info)=self.entries.get(name).map(|e|e.info).or_else(||self.decoded.get(name).map(|e|e.info)) else{return;};
+        if !deferred&&u64::from(info.width)*u64::from(info.height)*4<1024*1024{return;}
         let cap=(self.idle_budget/4).min(4*1024*1024);
         let cost=bytes.capacity()+proof.as_ref().map_or(0,TileProof::bytes);
-        if bytes.is_empty()||cost>cap{return;}
+        // Preserve a full-budget retry pixel buffer before its optional source.
+        if self.decoded.get(name).is_some_and(|e|e.rgba.capacity().saturating_add(cost)>self.idle_budget){return;}
+        if (bytes.is_empty()&&proof.is_none())||cost>cap{return;}
         self.encoded.remove(name);
         let mut used=self.encoded.values().map(EncodedEntry::capacity).sum::<usize>();
         while used+cost>cap{
@@ -561,10 +564,12 @@ impl TextureProvider for GxmTextureProvider {
             let started=Instant::now();let info=entry.info;
             let result=if entry.gray{self.upload_gray(name,info.width,info.height,entry.rgba)}else{
                 self.upload_prepared(name,info.width,info.height,PixelStorage::Owned(entry.rgba),false,true,source.as_ref().and_then(|s|s.proof.as_ref()))};
+            // A deferred upload retains CPU pixels. Keep the matching alpha
+            // certificate/source too, so its retry never scans uncached VRAM.
+            if let Some(source)=source{self.keep_encoded(name,source.bytes,source.proof);}
             if result.is_some(){
                 self.entries.get_mut(name).unwrap().cacheable=true;self.decoded_hits+=1;
                 self.share_static_pixels(name);
-                if let Some(source)=source{self.keep_encoded(name,source.bytes,source.proof);}
                 crate::core_info!("GXM decoded-cache-hit name={} size={}x{} upload_us={}",name,info.width,info.height,elapsed_us(started));
                 return result;
             }
@@ -578,6 +583,7 @@ impl TextureProvider for GxmTextureProvider {
         let ready = self.prefetch.as_ref().and_then(|f|f(name));
         let ready = ready.or_else(|| {
             let source=self.encoded.remove(name)?;
+            if source.bytes.is_empty(){return None;}
             self.encoded_hits+=1;
             crate::core_info!("GXM encoded-cache-hit name={} bytes={} hits={}",name,source.bytes.len(),self.encoded_hits);
             Some((Err(source.bytes),source.proof,None))
@@ -589,10 +595,10 @@ impl TextureProvider for GxmTextureProvider {
                 let gray=image.is_gray();
                 let result = if gray{self.upload_gray(name,w,h,image.into_raw())}else{
                     self.upload_prepared(name,w,h,PixelStorage::Owned(image.into_raw()),false,true,proof.as_ref())};
+                if source.is_some()||proof.is_some(){self.keep_encoded(name,source.unwrap_or_else(||Tracked::bytes(Vec::new(),Owner::Provider)),proof);}
                 if result.is_some() {
                     self.entries.get_mut(name).unwrap().cacheable = true;
                     self.share_static_pixels(name);
-                    if let Some(source)=source{self.keep_encoded(name,source,proof);}
                     crate::core_info!("GXM prefetch-hit name={} size={}x{}",name,w,h);
                     return result;
                 }
@@ -648,7 +654,10 @@ impl TextureProvider for GxmTextureProvider {
             return result;
         }
         let logical=u64::from(width)*u64::from(height)*4;
-        if self.shared_surfaces&&logical>=256*256*4&&logical<=16*1024*1024&&decoder.total_bytes()<=logical{
+        // PNG filtering reads previously decoded rows. Transparent sprites use
+        // cached CPU memory, then one sequential GPU copy; decoding them into
+        // uncached GPU memory also made alpha bounds preparation very costly.
+        if self.shared_surfaces&&color==image::ColorType::Rgb8&&logical>=256*256*4&&logical<=16*1024*1024&&decoder.total_bytes()<=logical{
             if let Some(mut surface)=PrivateSurface::new(width,height){
                 if let Err(error)=crate::image_decode::rgba_into(decoder,surface.bytes(),16*1024*1024){
                     self.timing.decode_errors+=1;crate::core_warn!("GXM shared-surface decode failure: {name}: {error}");return None;
@@ -692,12 +701,17 @@ impl TextureProvider for GxmTextureProvider {
             crate::core_info!("GXM texture-slow-decode name={} size={}x{} decode_us={}", name, image.width(), image.height(), decode_us);
         }
         let (width, height) = image.dimensions();
-        if proof.is_none(){proof=TileProof::for_rgb24(width,height,color);}
+        let alpha_started=Instant::now();
+        if proof.is_none(){proof=TileProof::for_rgb24(width,height,color).or_else(||TileProof::for_prepared_upload(&image));}
+        let alpha_us=elapsed_us(alpha_started);
+        if decode_us+alpha_us>=10000{
+            crate::core_info!("GXM texture-cpu-prepare name={} size={}x{} decode_us={} alpha_us={} prepared_alpha={}",name,width,height,decode_us,alpha_us,proof.is_some());
+        }
         let result = self.upload_prepared(name, width, height, PixelStorage::Owned(image.into_raw()), false, true,proof.as_ref());
+        self.keep_encoded(name,bytes,proof);
         if result.is_some() {
             self.entries.get_mut(name).unwrap().cacheable = true;
             self.share_static_pixels(name);
-            self.keep_encoded(name,bytes,proof);
         }
         if result.is_none() && self.reported_failures.insert(name.to_owned()) {
             crate::core_warn!("GXM texture upload failure: {name}: {}x{}", width, height);
@@ -1420,9 +1434,9 @@ mod tests {
         unsafe{*stride=s.stride;}s.data.as_ptr()
     }
     #[unsafe(no_mangle)]
-    extern "C" fn art3m1s_gxm_upload_texture_proof(_:u64,w:u32,h:u32,rgba:*const u8,length:usize,cells:*const u8,count:usize)->i32{
+    extern "C" fn art3m1s_gxm_upload_texture_proof(id:u64,w:u32,h:u32,rgba:*const u8,length:usize,cells:*const u8,count:usize)->i32{
         PROOF_UPLOADS.fetch_add(1,Ordering::Relaxed);
-        if FAIL_PROOF.swap(0,Ordering::Relaxed)!=0{return 0;}
+        if FAIL_PROOF.swap(0,Ordering::Relaxed)!=0||FAIL_UPLOAD.load(Ordering::Relaxed)!=0{return 0;}
         let pixels=unsafe{std::slice::from_raw_parts(rgba,length)};
         let certificate=unsafe{std::slice::from_raw_parts(cells,count)};
         let columns=(w as usize+63)/64;
@@ -1441,6 +1455,10 @@ mod tests {
             for y in y0..(y0+64).min(h as usize){for x in x0..(x0+64).min(w as usize){expected&=pixels[(y*w as usize+x)*4+3]==255;}}
             if flag!=expected as u8{return 0;}
         }
+        let stride=(w as usize+7)&!7;
+        let mut data=vec![0;stride*h as usize*4];
+        for y in 0..h as usize{data[y*stride*4..y*stride*4+w as usize*4].copy_from_slice(&pixels[y*w as usize*4..(y+1)*w as usize*4]);}
+        NATIVE.lock().unwrap().get_or_insert_with(HashMap::new).insert(id,MockSurface{w:w as usize,h:h as usize,stride,data});
         UPLOADS.fetch_add(1,Ordering::Relaxed);1
     }
     #[cfg(feature = "gxm-builtin-effects")]
@@ -1538,7 +1556,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_decode_uses_one_surface_and_preserves_odd_width_reads_and_eviction(){
+    fn cached_sprite_decode_preserves_odd_width_reads_alpha_and_eviction(){
         let _guard=LOCK.lock().unwrap();
         let mut image=image::RgbaImage::new(513,512);
         for (x,y,p) in image.enumerate_pixels_mut(){*p=image::Rgba([x as u8,y as u8,17,if x%7==0{0}else{128}]);}
@@ -1556,9 +1574,10 @@ mod tests {
     #[test]
     fn shared_allocation_falls_back_and_failed_publish_releases_private_storage(){
         let _guard=LOCK.lock().unwrap();
-        let mut out=Cursor::new(Vec::new());image::RgbaImage::new(512,512).write_to(&mut out,image::ImageFormat::Png).unwrap();let bytes=out.into_inner();
+        let mut out=Cursor::new(Vec::new());image::RgbImage::new(512,512).write_to(&mut out,image::ImageFormat::Png).unwrap();let bytes=out.into_inner();
         let mut p=GxmTextureProvider::new().with_source(move |_|Some(bytes.clone()));p.shared_surfaces=true;
-        FAIL_SURFACE.store(1,Ordering::Relaxed);assert!(p.resolve("fallback").is_some());assert!(!p.entries["fallback"].shared);
+        FAIL_SURFACE.store(1,Ordering::Relaxed);assert!(p.resolve("fallback").is_some());
+        assert!(p.encoded["fallback"].proof.is_some()); // CPU fallback can still share its completed upload.
         let before=ABORTED.load(Ordering::Relaxed);FAIL_SURFACE.store(2,Ordering::Relaxed);
         assert!(p.resolve("failed").is_none());FAIL_SURFACE.store(0,Ordering::Relaxed);
         assert_eq!(ABORTED.load(Ordering::Relaxed),before+1);assert!(!p.entries.contains_key("failed"));
@@ -1567,7 +1586,7 @@ mod tests {
     #[test]
     fn incomplete_decode_drops_private_surface_without_publishing(){
         let _guard=LOCK.lock().unwrap();
-        let mut png=Cursor::new(Vec::new());image::RgbaImage::new(512,512).write_to(&mut png,image::ImageFormat::Png).unwrap();
+        let mut png=Cursor::new(Vec::new());image::RgbImage::new(512,512).write_to(&mut png,image::ImageFormat::Png).unwrap();
         let mut bytes=png.into_inner();bytes.truncate(bytes.len()/2);
         let before=ABORTED.load(Ordering::Relaxed);
         let mut p=GxmTextureProvider::new().with_source(move |_|Some(bytes.clone()));p.shared_surfaces=true;
@@ -1627,8 +1646,11 @@ mod tests {
         let before=PROOF_UPLOADS.load(Ordering::Relaxed);FAIL_PROOF.store(1,Ordering::Relaxed);
         assert!(p.resolve("changed").is_none());
         assert_eq!(p.decoded["changed"].rgba.len(),960*540*4);
+        assert!(p.encoded["changed"].proof.is_some());
+        FAIL_PROOF.store(1,Ordering::Relaxed);assert!(p.resolve("changed").is_none());
+        assert!(p.encoded["changed"].proof.is_some(),"retry must preserve the certificate again");
         let (id,_)=p.resolve("changed").unwrap();
-        assert_eq!(p.pixel_alpha(id,0,0),Some(255));assert_eq!(PROOF_UPLOADS.load(Ordering::Relaxed),before+1);
+        assert_eq!(p.pixel_alpha(id,0,0),Some(255));assert_eq!(PROOF_UPLOADS.load(Ordering::Relaxed),before+3);
     }
 
     #[test]
