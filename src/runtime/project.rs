@@ -12,6 +12,17 @@ use asb_interpreter::{CallbackResult, Event};
 use std::sync::Arc;
 
 impl CoreRuntime {
+    /// PSV startup option; a loaded texture cache must keep one alpha policy.
+    pub fn set_ignore_background_alpha(&mut self, enabled: bool) -> bool {
+        #[cfg(all(target_os="vita",feature="gxm-backend"))]
+        {
+            if !self.texture_provider.set_ignore_background_alpha(enabled) { return false; }
+            self.ignore_background_alpha=enabled;
+            true
+        }
+        #[cfg(not(all(target_os="vita",feature="gxm-backend")))]
+        { let _=enabled; false }
+    }
     /// Load a project from an in-memory system.ini string.
     pub fn load_project(&mut self, ini_content: &str, platform: &str) -> Result<(), String> {
         let project =
@@ -171,7 +182,9 @@ impl CoreRuntime {
         #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
         let provider = {
             let paths = Arc::clone(&self.magic_paths);
-            GxmTextureProvider::new().with_cache_budget(crate::image_cache_budget::session_budget()).with_tracked_prefetch(move |name| {
+            let mut provider=GxmTextureProvider::new();
+            provider.set_ignore_background_alpha(self.ignore_background_alpha);
+            provider.with_cache_budget(crate::image_cache_budget::session_budget()).with_tracked_prefetch(move |name| {
                 let resolved = magic_path::resolve_path(&paths, name);
                 super::surface_loader::take(&resolved).map(|p| match p {
                     super::surface_loader::Payload::Pixels(image, bytes,proof) => (Ok(image.into()),proof,Some(bytes)),

@@ -94,6 +94,12 @@ impl GxmTextureProvider {
             let info = TextureInfo {width:p.width(),height:p.height()};
             let mut pixels = p.into_raw(); pixels.transfer(Owner::Provider);
             let mut proof=proof; if let Some(p)=proof.as_mut(){p.transfer(Owner::Provider);}
+            if self.background_alpha_ignored(&name)
+                && proof.as_ref().and_then(|p|p.opaque_for_size(info.width,info.height))!=Some(true) {
+                background_alpha::make_opaque(&mut pixels);
+            }
+            // Keep the source certificate with the original encoded bytes.
+            // Generate the forced-alpha upload certificate only at publication.
             let mut source=source; if let Some(p)=source.as_mut(){p.transfer(Owner::Provider);}
             self.warm.job = Some(WarmUpload { name, info, pixels, proof, source, surface:None, row:0,steps:0,work_us:0,max_us:0 });
             self.update_warm_account();
@@ -130,8 +136,11 @@ impl GxmTextureProvider {
                 if y%8==7 && elapsed_us(started)>=750 {break;}
             }
         } else {
+            let force_opaque=self.background_alpha_ignored(&self.warm.job.as_ref().unwrap().name);
             let job = self.warm.job.as_mut().unwrap();
-            let Some(cells)=job.proof.as_ref().and_then(|p|p.certificate_for_size(job.info.width,job.info.height)) else {
+            let forced_proof=force_opaque.then(||TileProof::for_opaque_pixels(job.info.width,job.info.height)).flatten();
+            let proof=if force_opaque {forced_proof.as_ref()}else{job.proof.as_ref()};
+            let Some(cells)=proof.and_then(|p|p.certificate_for_size(job.info.width,job.info.height)) else {
                 self.cancel_warm_upload(); return;
             };
             let id = TextureId(self.next_id);
@@ -141,7 +150,7 @@ impl GxmTextureProvider {
             job.surface.as_mut().unwrap().handle=0;
             let job = self.warm.job.take().unwrap();
             self.next_id += 1; self.revision = self.revision.wrapping_add(1).max(1);
-            let opaque=job.proof.as_ref().and_then(|p|p.opaque_for_size(job.info.width,job.info.height)).unwrap_or(false);
+            let opaque=force_opaque || job.proof.as_ref().and_then(|p|p.opaque_for_size(job.info.width,job.info.height)).unwrap_or(false);
             self.entries.insert(job.name.clone(),Entry {id,info:job.info,rgba:job.pixels,opaque,revision:self.revision,
                 last_used:self.cache_clock,cacheable:true,reclaimable:true,shared:true,gray:false,alpha_only:false,bc3:false});
             self.ids.insert(id,job.name.clone());

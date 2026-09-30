@@ -1,4 +1,5 @@
 mod warm;
+mod background_alpha;
 use crate::render_pipeline::draw::{
     TextureId, TextureInfo, TextureProvider, masked_texture_name, solid_texture_name,
 };
@@ -144,6 +145,7 @@ pub struct GxmTextureProvider {
     retain_count: u64,
     idle_budget: usize,
     shared_surfaces: bool,
+    ignore_background_alpha: bool,
     cache_budget:Option<crate::image_cache_budget::SharedCacheBudget>,
     timing: TextureTiming,
     timing_started: Instant,
@@ -155,6 +157,17 @@ pub struct GxmTextureProvider {
 }
 
 impl GxmTextureProvider {
+    // Configure before loading a project. Changing policy on a live cache would
+    // mix original and forced-alpha entries; the launcher applies it next boot.
+    pub fn set_ignore_background_alpha(&mut self, enabled: bool) -> bool {
+        if self.ignore_background_alpha==enabled { return true; }
+        if !self.entries.is_empty() || !self.decoded.is_empty() || self.warm.job.is_some() { return false; }
+        self.ignore_background_alpha=enabled;
+        true
+    }
+    fn background_alpha_ignored(&self,name:&str)->bool {
+        self.ignore_background_alpha && background_alpha::background_source(name)
+    }
     fn low_priority_idle(&self, name: &str) -> bool {
         crate::ui_image_lifetime::save_load_menu_image(name)
             || self.transient_save_directory.as_deref().is_some_and(|p|
@@ -267,6 +280,7 @@ impl GxmTextureProvider {
             retain_count: 0,
             idle_budget: IDLE_TEXTURE_BUDGET,
             shared_surfaces: cfg!(target_os="vita"),
+            ignore_background_alpha: false,
             cache_budget:None,
             timing: TextureTiming::default(),
             timing_started: Instant::now(),
@@ -365,9 +379,21 @@ impl GxmTextureProvider {
     fn upload_prepared(&mut self,name:&str,width:u32,height:u32,mut pixels:PixelStorage<'_>,video:bool,retain_pixels:bool,proof:Option<&TileProof>)->Option<(TextureId,TextureInfo)>{
         if self.warm.job.as_ref().is_some_and(|j|j.name==name){self.cancel_warm_upload();}
         if let PixelStorage::Owned(p)=&mut pixels {p.transfer(Owner::Temporary);}
-        let rgba = pixels.as_ref();
         let expected = width as usize * height as usize * 4;
-        if width == 0 || height == 0 || rgba.len() != expected { return None; }
+        if width == 0 || height == 0 || pixels.as_ref().len() != expected { return None; }
+        let forced = !video && retain_pixels && self.background_alpha_ignored(name)
+            && proof.and_then(|p|p.opaque_for_size(width,height))!=Some(true);
+        let forced_proof = if forced {
+            if let PixelStorage::Borrowed(p)=pixels {
+                pixels=PixelStorage::Owned(Tracked::bytes(p.to_vec(),Owner::Temporary));
+            }
+            if let PixelStorage::Owned(p)=&mut pixels { background_alpha::make_opaque(p); }
+            TileProof::for_opaque_pixels(width,height)
+        } else { None };
+        // The source certificate describes the original PNG. Never reuse its
+        // transparency bounds after changing alpha, even on allocation failure.
+        let proof=if forced { forced_proof.as_ref() } else { proof };
+        let rgba = pixels.as_ref();
         let id = self.entries.get(name).map(|entry| entry.id).unwrap_or_else(|| {
             let id = TextureId(self.next_id);
             self.next_id += 1;
@@ -1121,6 +1147,59 @@ mod tests {
         assert!(!p.texture_is_opaque(id));
         assert_eq!(p.pixel_alpha(id,0,0),Some(0));assert_eq!(p.pixel_alpha(id,1,0),Some(255));
     }
+    #[test] fn background_alpha_option_preserves_rgb_and_isolated_sources(){
+        let _guard=LOCK.lock().unwrap();
+        let bytes=include_bytes!("../../image_decode_testdata/rgb24-trns.png");
+        for enabled in [false,true] {
+            let mut p=GxmTextureProvider::new().with_source(move |_|Some(bytes.to_vec()));
+            assert!(p.set_ignore_background_alpha(enabled));
+            for name in [":bg/room", "image/bg/room", "bg/room", ":fg/face", ":rule/iris", ":ui/bg/room"] {
+                let (id,_)=p.resolve(name).unwrap();
+                let forced=enabled && background_alpha::background_source(name);
+                assert_eq!(p.texture_is_opaque(id),forced);
+                assert_eq!(p.pixel_alpha(id,0,0),Some(if forced {255}else{0}));
+                assert_eq!(p.pixel_alpha(id,1,0),Some(255));
+                let original=image::load_from_memory(bytes).unwrap().to_rgba8();
+                let (_,_,pixels)=p.pixels_of(name).unwrap();
+                for (a,b) in pixels.chunks_exact(4).zip(original.as_raw().chunks_exact(4)) {
+                    assert_eq!(&a[..3],&b[..3]);
+                }
+            }
+            assert!(!p.set_ignore_background_alpha(!enabled));
+        }
+    }
+    #[test] fn background_alpha_ready_retry_and_idle_reuse_use_new_certificate(){
+        let _guard=LOCK.lock().unwrap();
+        let image=image::RgbaImage::from_pixel(65,17,image::Rgba([12,34,56,0]));
+        let proof=TileProof::for_prepared_upload(&image).unwrap();
+        let payload=std::cell::RefCell::new(Some((Ok(image.into()),Some(proof),None)));
+        let mut p=GxmTextureProvider::new().with_source(|_|panic!("must reuse READY/IDLE"))
+            .with_tracked_prefetch(move |_|payload.borrow_mut().take());
+        assert!(p.set_ignore_background_alpha(true));
+        FAIL_UPLOAD.store(1,Ordering::Relaxed);
+        let result=p.resolve(":bg/room");FAIL_UPLOAD.store(0,Ordering::Relaxed);
+        assert!(result.is_none());assert!(p.decoded.contains_key(":bg/room"));
+        let id=p.resolve(":bg/room").unwrap().0;
+        assert!(p.texture_is_opaque(id));assert_eq!(p.pixel_alpha(id,0,0),Some(255));
+        assert_eq!(p.resolve(":bg/room").unwrap().0,id);
+        p.idle_budget=65*17*4;p.retain(&HashSet::new());
+        assert!(p.decoded.contains_key(":bg/room"));
+        let id=p.resolve(":bg/room").unwrap().0;
+        assert!(p.texture_is_opaque(id));assert_eq!(p.pixel_alpha(id,64,16),Some(255));
+        assert_eq!((p.timing.reads,p.timing.decoded),(0,0));
+    }
+    #[test] fn background_alpha_keeps_explicit_mask_and_video_alpha(){
+        let _guard=LOCK.lock().unwrap();
+        let mut p=GxmTextureProvider::new().with_prefetch(|name|Some(Ok(
+            image::RgbaImage::from_pixel(4,4,image::Rgba(if name==":rule/iris" {[128,128,128,64]}else{[24,48,96,0]})))));
+        p.set_ignore_background_alpha(true);
+        let id=p.resolve_with_mask(":bg/room",":rule/iris").unwrap().0;
+        assert_eq!(p.pixel_alpha(id,0,0),Some(128));assert!(!p.texture_is_opaque(id));
+        let mask=p.resolve(":rule/iris").unwrap().0;
+        assert_eq!(p.pixel_alpha(mask,0,0),Some(64));
+        assert!(p.upload_video_rgba("bg/movie",1,1,&[3,5,7,93]));
+        let id=p.entries["bg/movie"].id;assert_eq!(p.pixel_alpha(id,0,0),Some(93));
+    }
     #[test] fn alpha_atlas_updates_preserve_identity_and_retry_without_cpu_mirror(){
         let _guard=LOCK.lock().unwrap();let mut p=GxmTextureProvider::new();let mut data=vec![0;512*512];
         data[7*512+5]=139;
@@ -1534,6 +1613,42 @@ mod tests {
         for y in 0..s.h {for x in 0..s.stride {
             let sx=x.min(s.w-1);assert_eq!(&s.data[(y*s.stride+x)*4..(y*s.stride+x+1)*4],&[sx as u8,y as u8,51,if sx==0{0}else{139}]);
         }}
+    }
+    #[test] fn background_alpha_warm_publish_and_cancellation_agree(){
+        let _guard=LOCK.lock().unwrap();
+        for cancel in [false,true] {
+            let mut p=warm_provider(":bg/future");p.set_ignore_background_alpha(true);
+            for _ in 0..6 {p.warm_step();}
+            if cancel {p.cancel_warm_upload();} else {
+                for _ in 0..64 {p.warm_step();if p.warm.job.is_none(){break;}}
+            }
+            let id=p.resolve(":bg/future").unwrap().0;
+            assert!(p.texture_is_opaque(id));
+            assert_eq!(p.pixel_alpha(id,0,20),Some(255));assert_eq!(p.pixel_alpha(id,396,462),Some(255));
+            let native=NATIVE.lock().unwrap();let s=&native.as_ref().unwrap()[&id.0];
+            for y in 0..s.h {for x in 0..s.w {
+                assert_eq!(&s.data[(y*s.stride+x)*4..(y*s.stride+x+1)*4],&[x as u8,y as u8,51,255]);
+            }}
+            assert_eq!((p.timing.reads,p.timing.decoded),(0,0));
+        }
+    }
+    #[test] fn background_alpha_warm_encoded_backup_keeps_original_certificate(){
+        let _guard=LOCK.lock().unwrap();
+        let name=":bg/future";
+        let mut p=warm_provider(name);p.set_ignore_background_alpha(true);
+        let image=image::RgbaImage::from_pixel(512,513,image::Rgba([12,34,56,0]));
+        let proof=TileProof::for_prepared_upload(&image).unwrap();
+        let mut out=Cursor::new(Vec::new());image.write_to(&mut out,image::ImageFormat::Png).unwrap();
+        let payload=std::cell::RefCell::new(Some((Ok(image.into()),Some(proof),Some(Tracked::bytes(out.into_inner(),Owner::Provider)))));
+        p=p.with_warm_prefetch(move |_|payload.borrow_mut().take());
+        for _ in 0..64 {p.warm_step();if p.entries.contains_key(name){break;}}
+        assert!(p.entries[name].opaque);
+        assert_eq!(p.encoded[name].proof.as_ref().unwrap().opaque_for_size(512,513),Some(false));
+        p.cache_budget=None;p.idle_budget=64*1024;p.retain(&HashSet::new());
+        assert!(!p.entries.contains_key(name));assert!(p.encoded.contains_key(name));
+        let id=p.resolve(name).unwrap().0;
+        assert_eq!(p.encoded_hits,1);assert!(p.texture_is_opaque(id));
+        assert_eq!(p.pixel_alpha(id,0,20),Some(255));assert_eq!(p.pixel_alpha(id,396,462),Some(255));
     }
     #[test]
     fn staged_warm_demand_cancellation_pressure_and_publish_failure_keep_cpu_pixels(){
