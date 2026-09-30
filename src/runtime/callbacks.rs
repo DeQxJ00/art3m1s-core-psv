@@ -595,10 +595,7 @@ impl EngineCallbacks for FfiCallbacks {
         surface_cache_bind(&mut cache, &resolved, || {
             // Match the texture provider's extension search, including the
             // extensionless surface keys used by Artemis scripts.
-            ffi::request_asset(&format!("{resolved}.png"))
-                .or_else(|| ffi::request_asset(&resolved))
-                .or_else(|| ffi::request_asset(&format!("{resolved}.jpg")))
-                .or_else(|| ffi::request_asset(&format!("{resolved}.jpeg")))
+            crate::native_texture::candidates(&resolved).find_map(|p|ffi::request_asset(&p))
         });
         }
     }
@@ -810,6 +807,8 @@ pub(super) fn prefetched_surface_bytes(path: &str) -> Option<Vec<u8>> {
         .or_else(|| cache.get(&format!("{path}.png")).and_then(|entry| entry.bytes.clone()))
         .or_else(|| cache.get(&format!("{path}.jpg")).and_then(|entry| entry.bytes.clone()))
         .or_else(|| cache.get(&format!("{path}.jpeg")).and_then(|entry| entry.bytes.clone()))
+        .or_else(|| cache.get(&format!("{path}.dds")).and_then(|entry| entry.bytes.clone()))
+        .or_else(|| cache.get(&format!("{path}.pvr")).and_then(|entry| entry.bytes.clone()))
 }
 
 /// bind：引用计数 +1；首次绑定时经 loader 预取字节。返回新的计数。

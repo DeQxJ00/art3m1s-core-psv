@@ -148,12 +148,13 @@ pub(super) fn asset_dimensions(
     }
     let resolved = super::magic_path::resolve_path(paths, file);
     // Match the texture provider's lookup order, but only read image headers.
-    for path in [format!("{resolved}.png"), resolved] {
+    for path in crate::native_texture::candidates(&resolved) {
         for limit in [4096, 65536, 1048576] {
             let Some(bytes) = crate::ffi::request_asset_range(&path, 0, limit) else {
                 break;
             };
             let short = bytes.len() < limit;
+            if let Some(size)=crate::native_texture::header_dimensions(&bytes){return Some(size);}
             if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()
                 && let Ok(size) = reader.into_dimensions()
             {

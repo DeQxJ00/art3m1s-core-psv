@@ -384,7 +384,7 @@ impl Loader {
         if state.stop{return 0;}
         let mut seen=std::collections::HashSet::new();
         for path in paths{
-            let Some(key)=[path.clone(),format!("{path}.png"),format!("{path}.jpg"),format!("{path}.jpeg")]
+            let Some(key)=[path.clone(),format!("{path}.png"),format!("{path}.jpg"),format!("{path}.jpeg"),format!("{path}.dds"),format!("{path}.pvr")]
                 .into_iter().find(|p|state.entries.contains_key(p)) else{continue;};
             let entry=&state.entries[&key];
             if !entry.pending||!seen.insert(key.clone()){continue;}
@@ -401,7 +401,7 @@ impl Loader {
     pub fn update_story_plan(&self,future:&[String],current:&[String]) {
         let mut state=self.shared.state.lock().unwrap();
         if state.stop{return;}
-        let key=|p:&String|[p.clone(),format!("{p}.png"),format!("{p}.jpg"),format!("{p}.jpeg")]
+        let key=|p:&String|[p.clone(),format!("{p}.png"),format!("{p}.jpg"),format!("{p}.jpeg"),format!("{p}.dds"),format!("{p}.pvr")]
             .into_iter().find(|p|state.entries.contains_key(p));
         let mut seen=std::collections::HashSet::new();
         let future:Vec<_>=future.iter().filter_map(&key).filter(|p|{
@@ -482,7 +482,7 @@ impl Loader {
     }
     fn key(&self, path: &str) -> Option<String> {
         let state = self.shared.state.lock().unwrap();
-        [path.to_string(), format!("{path}.png"), format!("{path}.jpg"), format!("{path}.jpeg")].into_iter().find(|p| state.entries.contains_key(p))
+        [path.to_string(), format!("{path}.png"), format!("{path}.jpg"), format!("{path}.jpeg"),format!("{path}.dds"),format!("{path}.pvr")].into_iter().find(|p| state.entries.contains_key(p))
     }
     pub fn take(&self, path: &str) -> Option<Payload> {
         let key = self.key(path)?;
@@ -518,7 +518,7 @@ impl Loader {
     /// Never starts a job, decodes, waits, or consumes masks/menu/encoded data.
     pub fn take_warm_pixels(&self, path: &str, max_bytes: usize) -> Option<Payload> {
         let mut state = self.shared.state.try_lock().ok()?;
-        let key = [path.to_owned(), format!("{path}.png"), format!("{path}.jpg"), format!("{path}.jpeg")]
+        let key = [path.to_owned(), format!("{path}.png"), format!("{path}.jpg"), format!("{path}.jpeg"),format!("{path}.dds"),format!("{path}.pvr")]
             .into_iter().find(|p| state.entries.contains_key(p))?;
         let entry = state.entries.get(&key)?;
         if state.stop || entry.pending || entry.demanded || entry.story_suppressed
@@ -736,9 +736,8 @@ fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,shou
     super::emote_source_cache::reclaim(budget);
     if let Some(bytes)=resume{return decode_source(bytes,cancelled,should_yield,budget);}
     let bytes=(||{
-    for suffix in [".png", "", ".jpg", ".jpeg"] {
+    for candidate in crate::native_texture::candidates(path) {
         if cancelled(){return None;}
-        let candidate = format!("{path}{suffix}");
         let metadata_epoch=super::png_comments::prepare_epoch(comments,&candidate);
         let Some(size) = crate::ffi::query_asset_size(&candidate) else { continue; };
         if cancelled(){return None;}
@@ -761,6 +760,12 @@ fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,shou
     match bytes{Some(b)=>decode_source(b,cancelled,should_yield,budget),None=>LoadStep::Complete(None)}
 }
 fn decode_source(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize)->LoadStep{
+        if crate::native_texture::recognized(&bytes){
+            if cancelled(){return LoadStep::Complete(None);}
+            if should_yield(bytes.capacity()){return LoadStep::Paused(bytes);}
+            let valid=crate::native_texture::parse(&bytes).is_ok();
+            return LoadStep::Complete(valid.then(||Payload::Encoded(bytes,None)));
+        }
         // Sticky interruption avoids restarting within the same decoder if the
         // scene changes again between its reads. Only compressed data survives.
         let yielded=std::cell::Cell::new(false);
@@ -873,6 +878,14 @@ pub(super) fn shutdown(){let loader=LOADER.lock().unwrap().take();if let Some(l)
 
 #[cfg(test)]
 mod tests {
+    #[test] fn native_compression_stays_encoded_and_honors_cancellation(){
+        let source=crate::native_texture::tests::pvr(11,0,32,16);
+        assert!(matches!(decode_source(source.clone().into(),&||false,&|_|false,BUDGET),LoadStep::Complete(Some(Payload::Encoded(_,None)))));
+        assert!(matches!(decode_source(source.clone().into(),&||true,&|_|false,BUDGET),LoadStep::Complete(None)));
+        assert!(matches!(decode_source(source.clone().into(),&||false,&|_|true,BUDGET),LoadStep::Paused(_)));
+        assert!(matches!(decode_source(source[..source.len()-1].to_vec().into(),&||false,&|_|false,BUDGET),LoadStep::Complete(None)));
+    }
+
     use super::*;
     fn story_entry(payload:Payload)->Entry{
         Entry{refs:1,ticket:1,bind_order:1,prepared:true,story_suppressed:false,pending:false,

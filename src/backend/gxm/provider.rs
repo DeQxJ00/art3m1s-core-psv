@@ -46,6 +46,8 @@ enum PixelStorage<'a>{Borrowed(&'a [u8]),Owned(Tracked<Vec<u8>>)}
 impl PixelStorage<'_>{fn as_ref(&self)->&[u8]{match self{Self::Borrowed(v)=>v,Self::Owned(v)=>v.as_slice()}}}
 
 
+mod native;
+
 struct Entry {
     id: TextureId,
     info: TextureInfo,
@@ -60,6 +62,7 @@ struct Entry {
     gray: bool,
     alpha_only: bool,
     bc3: bool,
+    native_bytes: usize, // DDS/PVR allocation; zero for legacy E-mote atlases.
 }
 struct DecodedEntry { gray:bool, info: TextureInfo, rgba: Tracked<Vec<u8>>, last_used: u64 }
 struct EncodedEntry { bytes:Tracked<Vec<u8>>,proof:Option<TileProof>,last_used:u64 }
@@ -74,7 +77,7 @@ const IDLE_GPU_BUDGET: usize = 32 * 1024 * 1024;
 
 impl Entry {
     fn gpu_bytes(&self) -> usize {
-        if self.bc3 {
+        if self.native_bytes!=0 { self.native_bytes } else if self.bc3 {
             self.info.width.max(4).next_power_of_two() as usize * self.info.height.max(4).next_power_of_two() as usize
         } else {
             ((self.info.width as usize + 7) & !7).saturating_mul(self.info.height as usize).saturating_mul(if self.gray||self.alpha_only{1}else{4})
@@ -84,6 +87,8 @@ impl Entry {
 }
 
 unsafe extern "C" {
+    fn art3m1s_gxm_upload_compressed(id:u64,w:u32,h:u32,format:u32,flags:u32,p:*const u8,len:usize)->i32;
+    fn art3m1s_gxm_read_texture_region(id:u64,x:u32,y:u32,w:u32,h:u32,p:*mut u8,len:usize)->i32;
     fn art3m1s_gxm_upload_bc3(id:u64,w:u32,h:u32,p:*const u8,len:usize)->i32;
     fn art3m1s_gxm_upload_alpha_region(id:u64,w:u32,h:u32,p:*const u8,len:usize,x:u32,y:u32,rw:u32,rh:u32)->i32;
     fn art3m1s_gxm_upload_luma(texture:u64,w:u32,h:u32,pixels:*const u8,length:usize)->i32;
@@ -256,7 +261,7 @@ impl GxmTextureProvider {
         let info = TextureInfo { width, height };
         self.decoded.remove(name);
         self.encoded.remove(name);
-        self.entries.insert(name.to_owned(), Entry { bc3:false, alpha_only:false, gray:false, id, info, rgba: Vec::new().into(), opaque: false,
+        self.entries.insert(name.to_owned(), Entry { native_bytes:0,bc3:false, alpha_only:false, gray:false, id, info, rgba: Vec::new().into(), opaque: false,
             revision: self.revision, last_used: self.cache_clock, cacheable: false,reclaimable:false, shared:false });
         self.ids.insert(id, name.to_owned());
         Some((id, info))
@@ -440,7 +445,7 @@ impl GxmTextureProvider {
         if let Some(entry) = self.entries.get_mut(name) {
             entry.info=info;entry.opaque=opaque;entry.revision=self.revision;
             entry.last_used=self.cache_clock;entry.cacheable=false;entry.reclaimable=false;
-            entry.shared=false;entry.gray=false;entry.alpha_only=false;entry.bc3=false;
+            entry.shared=false;entry.gray=false;entry.alpha_only=false;entry.bc3=false;entry.native_bytes=0;
             if retain_pixels {
                 match pixels {
                     PixelStorage::Owned(mut data) => {data.transfer(Owner::Provider);entry.rgba = data;},
@@ -451,7 +456,7 @@ impl GxmTextureProvider {
                 entry.rgba = Tracked::bytes(Vec::new(),Owner::Provider);
             }
         } else {
-            self.entries.insert(name.to_owned(), Entry { bc3:false, alpha_only:false, gray:false, id, info, rgba: if retain_pixels { match pixels {PixelStorage::Owned(mut p)=>{p.transfer(Owner::Provider);p},PixelStorage::Borrowed(p)=>Tracked::bytes(p.to_vec(),Owner::Provider)} } else { Tracked::bytes(Vec::new(),Owner::Provider) }, opaque, revision: self.revision, last_used: self.cache_clock, cacheable: false,reclaimable:false,shared:false });
+            self.entries.insert(name.to_owned(), Entry { native_bytes:0,bc3:false, alpha_only:false, gray:false, id, info, rgba: if retain_pixels { match pixels {PixelStorage::Owned(mut p)=>{p.transfer(Owner::Provider);p},PixelStorage::Borrowed(p)=>Tracked::bytes(p.to_vec(),Owner::Provider)} } else { Tracked::bytes(Vec::new(),Owner::Provider) }, opaque, revision: self.revision, last_used: self.cache_clock, cacheable: false,reclaimable:false,shared:false });
         }
         self.ids.insert(id, name.to_owned());
         let total_us = elapsed_us(started);
@@ -476,19 +481,26 @@ impl GxmTextureProvider {
         // Sources share the existing idle budget, with an additional 1/4 cap;
         // no separate cache allowance, reads, copies, workers or waits here.
         let deferred=self.decoded.contains_key(name);
-        let Some(info)=self.entries.get(name).map(|e|e.info).or_else(||self.decoded.get(name).map(|e|e.info)) else{return;};
-        if !deferred&&u64::from(info.width)*u64::from(info.height)*4<1024*1024{return;}
-        let cap=(self.idle_budget/4).min(4*1024*1024);
+        let native=crate::native_texture::parse(&bytes).ok();
+        let Some(info)=self.entries.get(name).map(|e|e.info).or_else(||self.decoded.get(name).map(|e|e.info))
+            .or_else(||native.map(|t|TextureInfo{width:t.width,height:t.height})) else{return;};
+        if native.is_none()&&!deferred&&u64::from(info.width)*u64::from(info.height)*4<1024*1024{return;}
+        let cap=self.idle_budget/4;
+        let ordinary_cap=cap.min(4*1024*1024);
         let cost=bytes.capacity()+proof.as_ref().map_or(0,TileProof::bytes);
         // Preserve a full-budget retry pixel buffer before its optional source.
         if self.decoded.get(name).is_some_and(|e|e.rgba.capacity().saturating_add(cost)>self.idle_budget){return;}
-        if (bytes.is_empty()&&proof.is_none())||cost>cap{return;}
+        if (bytes.is_empty()&&proof.is_none())||cost>cap||(native.is_none()&&cost>ordinary_cap){return;}
         self.encoded.remove(name);
         let mut used=self.encoded.values().map(EncodedEntry::capacity).sum::<usize>();
-        while used+cost>cap{
-            let oldest=self.encoded.iter().min_by_key(|(n,e)|(!self.low_priority_idle(n),e.last_used))
+        let mut ordinary_used=self.encoded.values().filter(|e|!crate::native_texture::recognized(&e.bytes)).map(EncodedEntry::capacity).sum::<usize>();
+        while used+cost>cap||(native.is_none()&&ordinary_used+cost>ordinary_cap){
+            let ordinary_pressure=native.is_none()&&ordinary_used+cost>ordinary_cap;
+            let oldest=self.encoded.iter().filter(|(_,e)|!ordinary_pressure||!crate::native_texture::recognized(&e.bytes))
+                .min_by_key(|(n,e)|(!self.low_priority_idle(n),e.last_used))
                 .map(|(name,_)|name.clone()).unwrap();
-            used-=self.encoded.remove(&oldest).unwrap().capacity();
+            let e=self.encoded.remove(&oldest).unwrap();used-=e.capacity();
+            if !crate::native_texture::recognized(&e.bytes){ordinary_used-=e.capacity();}
         }
         bytes.transfer(Owner::Provider);if let Some(p)=proof.as_mut(){p.transfer(Owner::Provider);}
         self.encoded.insert(name.into(),EncodedEntry{bytes,proof,last_used:self.cache_clock});
@@ -539,13 +551,18 @@ impl GxmTextureProvider {
         if id.0==self.next_id{self.next_id+=1;}
         self.revision=self.revision.wrapping_add(1).max(1);
         self.decoded.remove(name);self.encoded.remove(name);
-        self.entries.insert(name.into(),Entry{bc3:false,alpha_only:false,gray:true,id,info,rgba:pixels,opaque:true,
+        self.entries.insert(name.into(),Entry{native_bytes:0,bc3:false,alpha_only:false,gray:true,id,info,rgba:pixels,opaque:true,
             revision:self.revision,last_used:self.cache_clock,cacheable:true,reclaimable:false,shared:false});
         self.ids.insert(id,name.into());
         crate::core_info!("GXM gray8-upload name={} size={}x{} pixel_bytes={} upload_us={}",name,width,height,width as usize*height as usize,us);
         Some((id,info))
     }
     fn entry_pixels(&self,e:&Entry)->Option<Vec<u8>>{
+        if e.native_bytes!=0{
+            let n=(e.info.width as usize).checked_mul(e.info.height as usize)?.checked_mul(4)?;
+            let mut out=Vec::new();out.try_reserve_exact(n).ok()?;out.resize(n,0);
+            return (unsafe{art3m1s_gxm_read_texture_region(e.id.0,0,0,e.info.width,e.info.height,out.as_mut_ptr(),n)}>0).then_some(out);
+        }
         if e.bc3{return None;}
         if e.gray{
             let mut out=Vec::new();out.try_reserve_exact(e.rgba.len().checked_mul(4)?).ok()?;
@@ -655,6 +672,7 @@ impl TextureProvider for GxmTextureProvider {
             }
         };
         let mut bytes=bytes;bytes.transfer(Owner::Source);
+        if crate::native_texture::recognized(&bytes){return self.upload_native(name,bytes);}
         let started = Instant::now();
         let reader = match ImageReader::new(Cursor::new(bytes.as_slice())).with_guessed_format() {
             Ok(reader) => reader,
@@ -700,7 +718,7 @@ impl TextureProvider for GxmTextureProvider {
                 if id.0==self.next_id{self.next_id+=1;}
                 self.revision=self.revision.wrapping_add(1).max(1);
                 let info=TextureInfo{width,height};self.decoded.remove(name);
-                self.entries.insert(name.into(),Entry { bc3:false, alpha_only:false, gray:false, id,info,rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque,
+                self.entries.insert(name.into(),Entry { native_bytes:0,bc3:false, alpha_only:false, gray:false, id,info,rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque,
                     revision:self.revision,last_used:self.cache_clock,cacheable:true,reclaimable:false,shared:true});
                 self.ids.insert(id,name.into());self.keep_encoded(name,bytes,proof);
                 let publish_us=elapsed_us(upload_started);self.timing.uploads+=1;self.timing.upload_us+=publish_us;
@@ -776,7 +794,7 @@ impl TextureProvider for GxmTextureProvider {
         if id.0==self.next_id{self.next_id+=1;}
         self.revision=self.revision.wrapping_add(1).max(1);
         self.decoded.remove(name);self.encoded.remove(name);
-        let entry=Entry{bc3:true,alpha_only:false,gray:false,id,info,rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque:false,
+        let entry=Entry{native_bytes:0,bc3:true,alpha_only:false,gray:false,id,info,rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque:false,
             revision:self.revision,last_used:self.cache_clock,cacheable:false,reclaimable:false,shared:false};
         crate::core_info!("GXM bc3-atlas name={} size={}x{} source_bytes={} gpu_pixel_bytes={} cpu_mirror=0",name,width,height,data.len(),entry.gpu_bytes());
         self.entries.insert(name.into(),entry);self.ids.insert(id,name.into());
@@ -836,7 +854,7 @@ impl TextureProvider for GxmTextureProvider {
             return Some((id,info));
         }
         self.decoded.remove(name);self.encoded.remove(name);
-        self.entries.insert(name.into(),Entry{bc3:false,alpha_only:true,gray:false,id,info,rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque:false,
+        self.entries.insert(name.into(),Entry{native_bytes:0,bc3:false,alpha_only:true,gray:false,id,info,rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque:false,
             revision:self.revision,last_used:self.cache_clock,cacheable:false,reclaimable:false,shared:false});
         self.ids.insert(id,name.into());
         if !partial{crate::core_info!("GXM alpha-atlas name={} size={}x{} gpu_pixel_bytes={} cpu_mirror=0",name,width,height,data.len());}
@@ -846,6 +864,11 @@ impl TextureProvider for GxmTextureProvider {
     fn pixel_alpha(&self, texture: TextureId, x: u32, y: u32) -> Option<u8> {
         let entry = self.entries.get(self.ids.get(&texture)?)?;
         if x >= entry.info.width || y >= entry.info.height { return None; }
+        if entry.native_bytes!=0{
+            if entry.opaque{return Some(255);}
+            let mut pixel=[0u8;4];
+            return (unsafe{art3m1s_gxm_read_texture_region(texture.0,x,y,1,1,pixel.as_mut_ptr(),4)}>0).then_some(pixel[3]);
+        }
         if entry.gray{return Some(255);}
         if entry.shared&&entry.rgba.is_empty(){
             let mut stride=0;let p=unsafe{art3m1s_gxm_surface_view(texture.0,&mut stride)};
@@ -1050,6 +1073,42 @@ mod tests {
     use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
     static LOCK: Mutex<()> = Mutex::new(());
+    #[test] fn native_texture_retries_compressed_source_and_accounts_physical_blocks(){
+        let _guard=LOCK.lock().unwrap();
+        let reads=Rc::new(Cell::new(0));let counter=reads.clone();
+        let mut p=GxmTextureProvider::new().with_source(move |_|{counter.set(counter.get()+1);Some(crate::native_texture::tests::pvr(11,0,17,9))});
+        FAIL_UPLOAD.store(1,Ordering::Relaxed);assert!(p.resolve(":fg/body").is_none());FAIL_UPLOAD.store(0,Ordering::Relaxed);
+        assert!(p.needs_upload_retry());assert!(p.decoded.is_empty());assert_eq!(p.encoded.len(),1);
+        let (id,info)=p.resolve(":fg/body").unwrap();assert_eq!(reads.get(),1);
+        assert_eq!(info,TextureInfo{width:17,height:9});assert_eq!(p.entries[":fg/body"].gpu_bytes(),256*1024);
+        assert_eq!(p.entries[":fg/body"].rgba.capacity(),0);assert_eq!(p.timing.decoded,0);
+        assert_eq!(p.pixel_alpha(id,2,3),Some(127));assert_eq!(p.pixels_of(":fg/body").unwrap().2.len(),17*9*4);
+        p.remove(":fg/body");assert!(p.decoded.is_empty());
+        p.resolve(":fg/body").unwrap();assert_eq!(reads.get(),1);
+    }
+    #[test] fn png_backup_admission_does_not_shrink_native_source_retention(){
+        let _guard=LOCK.lock().unwrap();let mut p=GxmTextureProvider::new();
+        let mut native=crate::native_texture::tests::pvr(11,0,32,16);
+        for at in [24,28]{native[at..at+4].copy_from_slice(&2048u32.to_le_bytes());}
+        native.resize(52+2048*2048,0);p.keep_encoded("native",native.into(),None);
+        assert!(p.encoded.contains_key("native"));
+        p.upload("png",512,512,&vec![255;512*512*4]).unwrap();
+        p.keep_encoded("png",vec![1;100].into(),None);
+        assert!(p.encoded.contains_key("native"));assert!(p.encoded.contains_key("png"));
+        assert!(p.encoded.values().map(EncodedEntry::capacity).sum::<usize>()<=p.idle_budget/4);
+    }
+    #[test] fn native_background_policy_does_not_change_foreground_or_source_blocks(){
+        let _guard=LOCK.lock().unwrap();
+        let mut p=GxmTextureProvider::new().with_source(|_|Some(crate::native_texture::tests::pvr(11,0,32,16)));
+        p.set_ignore_background_alpha(true);
+        let (bg,_)=p.resolve(":bg/room").unwrap();let (fg,_)=p.resolve(":fg/body").unwrap();
+        assert!(p.texture_is_opaque(bg));assert!(!p.texture_is_opaque(fg));
+        assert_eq!(p.pixel_alpha(bg,0,0),Some(255));assert_eq!(p.pixel_alpha(fg,0,0),Some(127));
+        assert_eq!(p.encoded[":bg/room"].bytes.data,p.encoded[":fg/body"].bytes.data);
+        let (_,_,rgba)=p.pixels_of(":bg/room").unwrap();assert!(rgba.chunks_exact(4).all(|p|p[3]==255));
+        assert!(p.resolve_with_mask(":fg/body",":bg/room").is_some());
+        p.idle_budget=0;p.retain(&HashSet::new());assert!(p.entries.is_empty());assert!(p.encoded.is_empty());assert!(p.decoded.is_empty());
+    }
     #[test] fn model_headroom_rebuilds_static_frame_and_reclaims_only_idle(){
         let _guard=LOCK.lock().unwrap();let budget=crate::image_cache_budget::CacheBudget::new(40000);
         let mut p=GxmTextureProvider::new().with_cache_budget(budget.clone());
@@ -1546,6 +1605,20 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_capture_previous_texture(_: u64, _: u32, _: u32) -> i32 {
         CAPTURE_READY.load(Ordering::Relaxed) as i32
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_upload_compressed(id:u64,w:u32,h:u32,format:u32,flags:u32,_:*const u8,n:usize)->i32{
+        assert!((1..=14).contains(&format));assert!(n>0);
+        if FAIL_UPLOAD.load(Ordering::Relaxed)!=0{return 0;}
+        let mut data=vec![0;w as usize*h as usize*4];
+        for p in data.chunks_exact_mut(4){p.copy_from_slice(&[64,96,128,if flags!=0{255}else{127}]);}
+        NATIVE.lock().unwrap().get_or_insert_with(HashMap::new).insert(id,MockSurface{w:w as usize,h:h as usize,stride:w as usize,data});256*1024
+    }
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_read_texture_region(id:u64,x:u32,y:u32,w:u32,h:u32,out:*mut u8,n:usize)->i32{
+        assert_eq!(n,w as usize*h as usize*4);
+        let lock=NATIVE.lock().unwrap();let s=lock.as_ref().unwrap().get(&id).unwrap();
+        for row in 0..h as usize{unsafe{std::ptr::copy_nonoverlapping(s.data.as_ptr().add(((y as usize+row)*s.stride+x as usize)*4),out.add(row*w as usize*4),w as usize*4);}}1
     }
     static ALPHA_UNSUPPORTED:AtomicUsize=AtomicUsize::new(0);
     static BC3_UNSUPPORTED:AtomicUsize=AtomicUsize::new(0);
