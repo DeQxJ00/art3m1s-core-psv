@@ -43,6 +43,8 @@ pub mod runtime;
 pub mod save;
 pub mod text;
 pub mod video;
+#[cfg(feature="gxm-backend")]
+mod texture_study;
 
 pub use art3m1s_emote as emote;
 pub use asb_interpreter as script;
