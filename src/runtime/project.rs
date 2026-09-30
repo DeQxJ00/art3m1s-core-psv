@@ -212,12 +212,7 @@ impl CoreRuntime {
                 }
                 // Keep existing PNG/raw precedence. Construct JPEG candidates
                 // lazily so successful PNG loads do not allocate more strings.
-                for suffix in [".png", "", ".jpg", ".jpeg"] {
-                    let try_path = if suffix.is_empty() {
-                        std::borrow::Cow::Borrowed(resolved.as_str())
-                    } else {
-                        std::borrow::Cow::Owned(format!("{resolved}{suffix}"))
-                    };
+                for try_path in crate::native_texture::candidates(&resolved) {
                     match crate::ffi::request_asset(&try_path) {
                         Some(bytes) => {
                             return Some(bytes);

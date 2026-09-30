@@ -152,7 +152,7 @@ impl GxmTextureProvider {
             self.next_id += 1; self.revision = self.revision.wrapping_add(1).max(1);
             let opaque=force_opaque || job.proof.as_ref().and_then(|p|p.opaque_for_size(job.info.width,job.info.height)).unwrap_or(false);
             self.entries.insert(job.name.clone(),Entry {id,info:job.info,rgba:job.pixels,opaque,revision:self.revision,
-                last_used:self.cache_clock,cacheable:true,reclaimable:true,shared:true,gray:false,alpha_only:false,bc3:false});
+                last_used:self.cache_clock,cacheable:true,reclaimable:true,shared:true,gray:false,alpha_only:false,native_bytes:0,bc3:false});
             self.ids.insert(id,job.name.clone());
             // Keep the delivered source under the existing compressed cap.
             if let Some(source)=job.source {self.keep_encoded(&job.name,source,job.proof);}

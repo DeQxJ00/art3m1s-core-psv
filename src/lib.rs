@@ -24,6 +24,8 @@ mod launcher_exe_icon;
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 mod image_proof;
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+mod native_texture;
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 mod image_cache_budget;
 mod cache_hud;
 mod ui_image_lifetime;
