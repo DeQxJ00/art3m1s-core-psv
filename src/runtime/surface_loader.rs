@@ -14,7 +14,6 @@ const MAX_QUEUE: usize = 64;
 const SCRIPT_PREFETCH_BURST: usize = 4;
 const STORY_DECODE_WINDOW:usize=8;
 const STORY_DECODE_BYTES:usize=16*1024*1024;
-const STORY_IMAGE_BYTES:usize=4*1024*1024;
 // One suspended source only, charged to the existing 16 MiB working allowance.
 // Never suspend decoded pixels or introduce a second decoder/worker.
 const MAX_PAUSED_SOURCE:usize=2*1024*1024;
@@ -25,20 +24,22 @@ impl Kind {
     fn label(self)->&'static str{match self{Self::Image=>"image",Self::Mask=>"mask",Self::Animation=>"animation"}}
     fn cap(self)->usize{match self{Self::Image=>usize::MAX,Self::Mask=>16*1024*1024,Self::Animation=>32*1024*1024}}
 }
-pub(super) enum Payload { Gray(u32,u32,Tracked<Vec<u8>>,Tracked<Vec<u8>>), Pixels(Tracked<image::RgbaImage>, Tracked<Vec<u8>>,Option<TileProof>), Encoded(Tracked<Vec<u8>>,Option<TileProof>) }
+pub(super) enum Payload { Gray(u32,u32,Tracked<Vec<u8>>,Tracked<Vec<u8>>), Pixels(Tracked<image::RgbaImage>, Tracked<Vec<u8>>,Option<TileProof>), Encoded(Tracked<Vec<u8>>,Option<TileProof>), Sparse(Tracked<Vec<u8>>,TileProof) }
 impl Payload {
     #[cfg(test)] fn pixels(p:image::RgbaImage,b:Vec<u8>)->Self{Self::Pixels(p.into(),b.into(),None)}
     #[cfg(test)] fn encoded(b:Vec<u8>)->Self{Self::Encoded(b.into(),None)}
     fn ready(&mut self){match self{
         Self::Gray(_,_,p,b)=>{p.transfer(Owner::Ready);b.transfer(Owner::Ready);},
         Self::Pixels(p,b,proof)=>{p.transfer(Owner::Ready);b.transfer(Owner::Ready);if let Some(p)=proof{p.transfer(Owner::Ready);}},
-        Self::Encoded(b,proof)=>{b.transfer(Owner::Ready);if let Some(p)=proof{p.transfer(Owner::Ready);}}
+        Self::Encoded(b,proof)=>{b.transfer(Owner::Ready);if let Some(p)=proof{p.transfer(Owner::Ready);}},
+        Self::Sparse(b,proof)=>{b.transfer(Owner::Ready);proof.transfer(Owner::Ready);}
     }}
 
     fn parts(&self)->CacheParts {match self{
         Self::Gray(_,_,p,b)=>CacheParts{decoded:p.capacity(),encoded:b.capacity(),..Default::default()},
         Self::Pixels(p,b,proof)=>CacheParts{decoded:p.as_raw().capacity(),encoded:b.capacity(),proof:proof.as_ref().map_or(0,TileProof::bytes),gpu:0},
         Self::Encoded(b,proof)=>CacheParts{encoded:b.capacity(),proof:proof.as_ref().map_or(0,TileProof::bytes),..Default::default()},
+        Self::Sparse(b,proof)=>CacheParts{decoded:b.capacity(),proof:proof.bytes(),..Default::default()},
     }}
     fn bytes(&self) -> usize { self.parts().total() }
 }
@@ -53,8 +54,10 @@ fn demote(payload: &mut Option<Payload>) -> usize {
     *payload = Some(Payload::Encoded(encoded,proof)); released
 }
 struct Entry { refs: usize, ticket: u64, bind_order:u64, prepared:bool, story_suppressed:bool, pending: bool, deferred: bool, demanded: bool, speculative:bool, payload: Option<Payload>,kind:Kind,leased:bool,retry_bytes:usize }
+struct ReadyClaim { path:String,ticket:u64,bytes:usize,started:std::time::Instant }
 #[derive(Default)]
 struct State {
+    ready_claim:Option<ReadyClaim>,
     entries: HashMap<String, Entry>, queue: VecDeque<(String, u64)>,
     masks:VecDeque<(String,u64)>,animations:VecDeque<(String,u64)>,urgent:Option<String>,lane:usize,chapter:String,
     script_burst:usize,
@@ -102,9 +105,17 @@ impl State{
         if self.scene_priority.iter().any(|(p,t)|p==path&&*t==ticket){return false;}
         self.urgent.as_ref().is_some_and(|p|p!=path&&self.entries.get(p).is_some_and(|e|e.pending))
             ||self.scene_priority.iter().any(|(p,t)|p!=path&&live(p,*t))
+            ||self.ready_claim.as_ref().is_some_and(|c|c.path!=path&&live(&c.path,c.ticket))
     }
     fn pop_job(&mut self)->Option<(String,u64)>{
         if let Some(job)=self.pop_priority_job(){return Some(job);}
+        if let Some(c)=&self.ready_claim{
+            if self.entries.get(&c.path).is_some_and(|e|e.pending&&e.ticket==c.ticket)
+                &&!self.active.as_ref().is_some_and(|(p,t)|p==&c.path&&*t==c.ticket){
+                let job=(c.path.clone(),c.ticket);self.remove_queued(&job.0);
+                self.entries.get_mut(&job.0).unwrap().deferred=false;return Some(job);
+            }
+        }
         while self.script_burst<SCRIPT_PREFETCH_BURST && !self.story_priority.is_empty(){
             let (path,ticket)=self.story_priority.pop_front().unwrap();
             if !self.entries.get(&path).is_some_and(|e|e.pending&&e.ticket==ticket){continue;}
@@ -140,14 +151,24 @@ impl State{
         self.entries.get_mut(&path).unwrap().deferred=false;
         Some((path,ticket))
     }
-    fn clear_queues(&mut self){self.queue.clear();self.masks.clear();self.animations.clear();self.urgent=None;self.scene_priority.clear();self.story_priority.clear();self.story_managed.clear();self.story_order.clear();self.story_current.clear();self.story_redecoded.clear();self.script_burst=0;}
+    fn clear_queues(&mut self){self.ready_claim=None;self.queue.clear();self.masks.clear();self.animations.clear();self.urgent=None;self.scene_priority.clear();self.story_priority.clear();self.story_managed.clear();self.story_order.clear();self.story_current.clear();self.story_redecoded.clear();self.script_burst=0;}
     fn kind_parts(&self,kind:Kind)->CacheParts{
         self.entries.values().filter(|e|e.kind==kind).filter_map(|e|e.payload.as_ref()).fold(CacheParts::default(),|mut sum,p|{sum.add(p.parts());sum})
     }
     fn ready_parts(&self)->CacheParts{
         self.entries.values().filter_map(|e|e.payload.as_ref()).fold(CacheParts::default(),|mut sum,p|{sum.add(p.parts());sum})
     }
+    fn refresh_claim(&mut self){
+        if self.ready_claim.as_ref().is_some_and(|c|!self.entries.get(&c.path).is_some_and(|e|e.pending&&e.ticket==c.ticket)){
+            self.ready_claim=None;
+        }
+    }
+    fn claim_bytes(&self)->usize{
+        self.ready_claim.as_ref().map_or(0,|c|c.bytes.saturating_sub(self.entries.get(&c.path).and_then(|e|e.payload.as_ref()).map_or(0,Payload::bytes)))
+    }
     fn update_reservation(&mut self,account:&mut crate::image_cache_budget::CacheBudget){
+        self.refresh_claim();
+        account.ready_reserved=self.claim_bytes();
         account.mask_parts=self.kind_parts(Kind::Mask);
         account.animation_parts=self.kind_parts(Kind::Animation);
         account.script_preload=self.script_preload_counts();
@@ -160,7 +181,7 @@ impl State{
             counts.planned+=1;
             counts.completed+=usize::from(e.prepared);
             match e.payload{
-                Some(Payload::Gray(..)|Payload::Pixels(..))=>counts.pixels+=1,
+                Some(Payload::Gray(..)|Payload::Pixels(..)|Payload::Sparse(..))=>counts.pixels+=1,
                 Some(Payload::Encoded(..))=>counts.encoded+=1,
                 None=>{},
             }
@@ -219,10 +240,40 @@ impl Loader {
             }
             state.model_last=false;
             let (job,priority)=if let Some(job)=state.pop_priority_job(){(Some(job),true)}
+                else if state.ready_claim.is_some(){(state.pop_job(),false)}
                 else if let Some((p,t,_))=&paused{(Some((p.clone(),*t)),false)}
                 else{(state.pop_job(),false)};
             let Some((path,ticket))=job else{continue;};
             if !state.entries.get(&path).is_some_and(|e| e.pending && e.ticket == ticket) { continue; }
+            // A claim only asks the render thread to reclaim. Do not decode
+            // until the bytes are physically available. Foreground demand can
+            // use the existing fallback instead of waiting for a retain pass.
+            if state.ready_claim.as_ref().is_some_and(|c|c.path==path&&c.ticket==ticket){
+                let fits=s.cache.as_ref().is_none_or(|cache|{
+                    let b=cache.lock().unwrap();state.ready_parts().total().saturating_add(state.claim_bytes())<=b.ready_limit()
+                });
+                if !fits {
+                    let demanded=state.entries[&path].demanded||priority;
+                    let expired=state.ready_claim.as_ref().unwrap().started.elapsed()>=std::time::Duration::from_secs(1);
+                    if demanded||expired {
+                        let claim=state.ready_claim.take().unwrap();
+                        if !demanded {
+                            // Keep its source; another identical plan must not
+                            // repeatedly decode a job that cannot be admitted.
+                            let e=state.entries.get_mut(&path).unwrap();e.pending=false;
+                            if e.payload.is_none(){e.retry_bytes=claim.bytes;}
+                            state.story_redecoded.insert(path.clone());
+                            crate::core_info!("[surface-prefetch] reservation-timeout path={} required={}",path,claim.bytes);
+                            if let Some(cache)=&s.cache{state.update_reservation(&mut cache.lock().unwrap());}
+                            s.wake.notify_all();continue;
+                        }
+                        if let Some(cache)=&s.cache{state.update_reservation(&mut cache.lock().unwrap());}
+                    }else{
+                        state.entries.get_mut(&path).unwrap().deferred=true;refill(&mut state);
+                        drop(s.wake.wait_timeout(state,std::time::Duration::from_millis(16)).unwrap());continue;
+                    }
+                }
+            }
             let resume=if paused.as_ref().is_some_and(|(p,t,_)|p==&path&&*t==ticket){
                 state.parked=None;state.remove_queued(&path);
                 let (_,_,bytes)=paused.take().unwrap();
@@ -233,7 +284,7 @@ impl Loader {
                 // a source copy. Its allocation moves into the worker allowance.
                 let Some(Payload::Encoded(mut bytes,_))=state.entries.get_mut(&path).unwrap().payload.take() else{unreachable!()};
                 bytes.transfer(Owner::Decode);
-                if let Some(cache)=&s.cache{let mut b=cache.lock().unwrap();b.set_ready_parts(state.ready_parts());}
+                if let Some(cache)=&s.cache{let mut b=cache.lock().unwrap();b.set_ready_parts(state.ready_parts());state.update_reservation(&mut b);}
                 Some(bytes)
             }else{None};
             let work_budget=BUDGET-paused.as_ref().map_or(0,|(_,_,b)|b.capacity());
@@ -268,7 +319,9 @@ impl Loader {
                 // Lock order: loader state -> retention budget. Provider retain
                 // never takes loader state and never invokes a loader callback.
                 let mut account=s.cache.as_ref().map(|b|b.lock().unwrap());
-                let budget=account.as_ref().map_or(budget,|b|b.ready_limit());
+                let physical_budget=account.as_ref().map_or(budget,|b|b.ready_limit());
+                let own_claim=state.ready_claim.as_ref().is_some_and(|c|c.path==path&&c.ticket==ticket);
+                let budget=if own_claim{physical_budget}else{physical_budget.saturating_sub(state.claim_bytes()).max(state.ready_parts().total())};
                 let kind=state.entries[&path].kind;
                 let loaded_bytes=payload.as_ref().map_or(0,Payload::bytes);
                 let mut class_used=state.kind_parts(kind).total();
@@ -346,13 +399,14 @@ impl Loader {
                 if let Some(p)=payload.as_mut(){p.ready();}
                 if payload.is_some(){entry.prepared=true;}
                 entry.payload = payload;
-                let payload_kind=match &entry.payload {Some(Payload::Gray(..))=>"gray8",Some(Payload::Pixels(..))=>"pixels",Some(Payload::Encoded(..))=>"encoded",None if entry.retry_bytes>0=>"capacity-deferred",None=>"missing"};
+                let payload_kind=match &entry.payload {Some(Payload::Gray(..))=>"gray8",Some(Payload::Pixels(..))=>"pixels",Some(Payload::Sparse(..))=>"zero-span",Some(Payload::Encoded(..))=>"encoded",None if entry.retry_bytes>0=>"capacity-deferred",None=>"missing"};
                 let retained_bytes=entry.payload.as_ref().map_or(0,Payload::bytes);
                 let parts=state.ready_parts();let cache_bytes=parts.total();
                 if let Some(b)=account.as_mut(){b.set_ready_parts(parts);state.update_reservation(b);}
                 crate::core_info!("[surface-prefetch] ready path={} bytes={} elapsed_us={} payload={} retained_bytes={} cache_bytes={} cache_budget={} kind={} kind_bytes={} kind_limit={}",
                     path, bytes, start.elapsed().as_micros(),payload_kind,retained_bytes,cache_bytes,budget,kind.label(),state.kind_parts(kind).total(),kind.cap());
-                retry_capacity(&mut state,budget);
+                let reclaim_budget=account.as_ref().map_or(budget,|b|b.ready_reclaim_limit());
+                retry_capacity_with_reclaim(&mut state,physical_budget,reclaim_budget);
                 if let Some(b)=account.as_mut(){b.set_ready_parts(state.ready_parts());state.update_reservation(b);}
             }
             s.wake.notify_all();
@@ -367,7 +421,7 @@ impl Loader {
         let mut state=self.shared.state.lock().unwrap();
         if state.chapter==chapter{return;}
         state.chapter=chapter.into();
-        state.story_priority.clear();state.story_managed.clear();
+        state.story_priority.clear();state.story_managed.clear();state.story_order.clear();state.story_current.clear();state.story_redecoded.clear();state.ready_claim=None;
         state.script_burst=0;
         for e in state.entries.values_mut(){e.leased=false;}
         state.entries.retain(|_,e|e.refs>0);
@@ -524,9 +578,13 @@ impl Loader {
         if state.stop || entry.pending || entry.demanded || entry.story_suppressed
             || entry.refs == 0 || entry.kind != Kind::Image
             || crate::ui_image_lifetime::transient_menu_image(&key) { return None; }
-        let Some(Payload::Pixels(p, _, Some(_))) = &entry.payload else { return None; };
-        if p.width() == 0 || p.height() == 0 || p.width() > 4096 || p.height() > 4096
-            || entry.payload.as_ref()?.bytes() > max_bytes { return None; }
+        let(w,h)=match &entry.payload{
+            Some(Payload::Pixels(p,_,Some(_)))=>p.dimensions(),
+            Some(Payload::Sparse(b,_))=>crate::cpu_image_compression::dimensions(b)?,
+            _=>return None,
+        };
+        if w==0||h==0||w>4096||h>4096||w as usize*h as usize*4>max_bytes
+            ||entry.payload.as_ref()?.bytes()>max_bytes{return None;}
         let cache = self.shared.cache.as_ref()?;
         let mut account = cache.try_lock().ok()?;
         let result = state.entries.get_mut(&key)?.payload.take()?;
@@ -603,7 +661,8 @@ impl Loader {
     fn refill_capacity(&self,state:&mut State){
         let mut account=self.shared.cache.as_ref().map(|b|b.lock().unwrap());
         let budget=account.as_ref().map_or(self.shared.budget,|b|b.ready_limit());
-        if retry_capacity(state,budget){
+        let reclaim_budget=account.as_ref().map_or(budget,|b|b.ready_reclaim_limit());
+        if retry_capacity_with_reclaim(state,budget,reclaim_budget){
             if let Some(b)=account.as_mut(){b.set_ready_parts(state.ready_parts());state.update_reservation(b);}
             self.shared.wake.notify_all();
         }
@@ -617,22 +676,28 @@ impl Loader {
     }
 }
 impl Drop for Loader { fn drop(&mut self) { self.shutdown(); } }
-// Refill only an idle worker, one known-size declined item at a time. Waiting
-// for capacity is not a pending load: wait-all must still terminate when the
-// bound chapter exceeds the budget. Consumption/unbind wakes this path; there
-// is no timer, spin, extra queue, or eviction of still-bound first-use pixels.
-fn retry_capacity(state:&mut State,budget:usize)->bool {
-    if state.stop||state.active.is_some()||state.entries.values().any(|e|e.pending){return false;}
-    if rehydrate_story(state,budget){return true;}
+// One known-size retry owns its headroom until publication or cancellation.
+// Near-story retries can reclaim IDLE; other retries only use already free
+// space and an idle worker. The reclaim wait is bounded, so wait-all terminates
+// even when render-thread reclamation is unavailable.
+#[cfg(test)]
+fn retry_capacity(state:&mut State,budget:usize)->bool {retry_capacity_with_reclaim(state,budget,budget)}
+fn retry_capacity_with_reclaim(state:&mut State,budget:usize,reclaim_budget:usize)->bool {
+    state.refresh_claim();
+    if state.stop||state.ready_claim.is_some(){return false;}
+    // Nearby work must not wait behind the entire distant chapter queue.
+    if rehydrate_story(state,reclaim_budget){return true;}
+    if state.active.is_some()||state.entries.values().any(|e|e.pending){return false;}
     let free=budget.saturating_sub(state.ready_parts().total());
     let mask_free=Kind::Mask.cap().saturating_sub(state.kind_parts(Kind::Mask).total());
     let animation_free=Kind::Animation.cap().saturating_sub(state.kind_parts(Kind::Animation).total());
-    let candidate=state.entries.iter().filter(|(_,e)|e.retry_bytes>0&&e.retry_bytes<=free&&e.payload.is_none()
+    let candidate=state.entries.iter().filter(|(p,e)|!state.story_redecoded.contains(*p)&&e.retry_bytes>0&&e.retry_bytes<=free&&e.payload.is_none()
         &&(e.refs>0||e.leased)&&e.retry_bytes<=match e.kind{Kind::Image=>usize::MAX,Kind::Mask=>mask_free,Kind::Animation=>animation_free})
         .min_by_key(|(_,e)|(e.refs==0,if e.refs>0{e.bind_order}else{e.ticket})).map(|(p,_)|p.clone());
     let Some(path)=candidate else{return false;};
     let e=state.entries.get_mut(&path).unwrap();
     crate::core_info!("[surface-prefetch] capacity-refill path={} required={} free={} ticket={}",path,e.retry_bytes,free,e.ticket);
+    state.ready_claim=Some(ReadyClaim{path:path.clone(),ticket:e.ticket,bytes:e.retry_bytes,started:std::time::Instant::now()});
     e.retry_bytes=0;e.pending=true;e.deferred=true;e.speculative=true;
     // This retry already fits free capacity. Do not reserve a new chapter's
     // 5/6 budget and evict warm provider surfaces merely for one retry.
@@ -654,12 +719,17 @@ fn rehydrate_story(state:&mut State,budget:usize)->bool{
             Some(Payload::Encoded(b,Some(proof))) if !b.is_empty()&&b.capacity()<=MAX_PAUSED_SOURCE=>{
                 let Some(bytes)=proof.rgba_bytes() else{continue;};bytes
             },
+            None if e.retry_bytes>0=>e.retry_bytes,
             _=>continue,
         };
-        if bytes>STORY_IMAGE_BYTES{continue;}
+        // The decoder still has its own 16 MiB scratch bound. A 5 MiB
+        // portrait fits; the old fixed 4 MiB filter excluded it forever.
+        let retained=e.payload.as_ref().map_or(0,Payload::bytes);
+        let target=if matches!(e.payload,Some(Payload::Encoded(..))){retained.saturating_add(bytes)}else{bytes};
+        if target.saturating_add(DECODE_READ_BUFFER)>=BUDGET{continue;}
         window_bytes=window_bytes.saturating_add(bytes);
         if window_bytes>STORY_DECODE_BYTES{break;}
-        if !matches!(e.payload,Some(Payload::Encoded(..)))||state.story_redecoded.contains(path){continue;}
+        if e.pending||matches!(e.payload,Some(Payload::Pixels(..)))||state.story_redecoded.contains(path){continue;}
         let free=budget.saturating_sub(state.ready_parts().total());
         let donors:Vec<_>=state.story_order.iter().skip(STORY_DECODE_WINDOW).rev().filter(|p|
             !state.story_current.contains(*p)&&state.entries.get(*p).is_some_and(|e|
@@ -672,6 +742,7 @@ fn rehydrate_story(state:&mut State,budget:usize)->bool{
         state.serial+=1;let ticket=state.serial;
         let e=state.entries.get_mut(&path).unwrap();
         e.ticket=ticket;e.pending=true;e.deferred=true;e.speculative=true;e.retry_bytes=0;
+        state.ready_claim=Some(ReadyClaim{path:path.clone(),ticket,bytes:target,started:std::time::Instant::now()});
         state.story_redecoded.insert(path.clone());
         state.story_priority.push_front((path.clone(),ticket));
         refill(state);
@@ -734,7 +805,8 @@ fn decoder_allowance_with_budget(width:u32,height:u32,source_capacity:usize,pixe
 }
 fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize,comments:&super::png_comments::SharedComments)->LoadStep{
     super::emote_source_cache::reclaim(budget);
-    if let Some(bytes)=resume{return decode_source(bytes,cancelled,should_yield,budget);}
+    let policy=crate::cpu_image_compression::policy_for(path);
+    if let Some(bytes)=resume{return decode_source_policy(bytes,cancelled,should_yield,budget,policy.as_ref());}
     let bytes=(||{
     for candidate in crate::native_texture::candidates(path) {
         if cancelled(){return None;}
@@ -757,9 +829,13 @@ fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,shou
     }
     None
     })();
-    match bytes{Some(b)=>decode_source(b,cancelled,should_yield,budget),None=>LoadStep::Complete(None)}
+    match bytes{Some(b)=>decode_source_policy(b,cancelled,should_yield,budget,policy.as_ref()),None=>LoadStep::Complete(None)}
 }
+#[cfg(test)]
 fn decode_source(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize)->LoadStep{
+    decode_source_policy(bytes,cancelled,should_yield,budget,None)
+}
+fn decode_source_policy(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize,policy:Option<&crate::cpu_image_compression::Policy>)->LoadStep{
         if crate::native_texture::recognized(&bytes){
             if cancelled(){return LoadStep::Complete(None);}
             if should_yield(bytes.capacity()){return LoadStep::Paused(bytes);}
@@ -777,6 +853,27 @@ fn decode_source(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&
         };
         let decoded=(||{
         if interrupted(){return None;}
+        if let Some(p)=policy.filter(|p|crate::cpu_image_compression::supported(&bytes,p)){
+            let w=u32::from_be_bytes(bytes[16..20].try_into().unwrap());let h=u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+            if let Some(allowance)=decoder_allowance_with_budget(w,h,bytes.capacity(),4,budget){
+                let source=CancelReader{cursor:std::io::Cursor::new(bytes.as_slice()),cancelled:&interrupted};
+                let source=std::io::BufReader::with_capacity(DECODE_READ_BUFFER,source);
+                if let Some((image,stats))=crate::cpu_image_compression::decode(source,budget-bytes.capacity()-DECODE_READ_BUFFER,allowance,p,&interrupted){
+                    if cancelled(){return None;}
+                    let proof=TileProof::for_prepared_upload(&image);
+                    let abort=||cancelled()||should_yield(bytes.capacity());
+                    if p.accepts(image.len(),stats)&&proof.is_some()&&!abort(){
+                        let started=std::time::Instant::now();
+                        let room=budget.saturating_sub(bytes.capacity()+image.as_raw().capacity()+proof.as_ref().map_or(0,TileProof::bytes));
+                        if let Some(packed)=crate::cpu_image_compression::compress(w,h,&image,room,&abort){
+                            crate::core_info!("[cpu-image-compression] size={}x{} raw={} packed={} ratio_check={} zero_pixels={} runs_check={} zero_bytes={} runs={} encode_us={}",w,h,image.len(),packed.len(),p.ratio_enabled,stats.zero_pixels,p.runs_enabled,stats.zero_bytes,stats.runs,started.elapsed().as_micros());
+                            return Some(DecodedSource::Sparse(packed,proof.unwrap()));
+                        }
+                    }
+                    return Some(DecodedSource::Pixels(image,proof));
+                }
+            }
+        }
         // Only gray8 PNG is a candidate. Decoder color_type also checks tRNS;
         // avoid opening a second decoder for ordinary RGB/palette resources.
         if bytes.starts_with(b"\x89PNG\r\n\x1a\n")&&bytes.get(24..26)==Some(&[8,0]) {
@@ -829,10 +926,23 @@ fn decode_source(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&
         if let Some(decoded)=decoded{return LoadStep::Complete(Some(match decoded{
             DecodedSource::Gray(w,h,p)=>Payload::Gray(w,h,p,bytes),
             DecodedSource::Pixels(p,proof)=>Payload::Pixels(p,bytes,proof),
+            DecodedSource::Sparse(b,proof)=>Payload::Sparse(b,proof),
         }));}
         if yielded.get(){LoadStep::Paused(bytes)}else{LoadStep::Complete(Some(Payload::Encoded(bytes,None)))}
 }
-enum DecodedSource { Gray(u32,u32,Tracked<Vec<u8>>), Pixels(Tracked<image::RgbaImage>,Option<TileProof>) }
+enum DecodedSource { Gray(u32,u32,Tracked<Vec<u8>>), Pixels(Tracked<image::RgbaImage>,Option<TileProof>), Sparse(Tracked<Vec<u8>>,TileProof) }
+
+#[cfg(test)] mod cpu_cache_tests {
+    use super::*;
+    #[test] fn opt_in_compression_returns_certified_packed_pixels_and_disabled_keeps_original(){
+        let image=image::RgbaImage::new(513,257);let mut file=std::io::Cursor::new(Vec::new());image.write_to(&mut file,image::ImageFormat::Png).unwrap();let bytes=file.into_inner();
+        let p=crate::cpu_image_compression::Policy{enabled:true,..Default::default()};
+        match decode_source_policy(bytes.clone().into(),&||false,&|_|false,BUDGET,Some(&p)){
+            LoadStep::Complete(Some(Payload::Sparse(b,proof)))=>{assert!(b.len()<1024);assert!(proof.certificate_for_size(513,257).is_some());let mut v=Payload::Sparse(b,proof);v.ready();assert!(v.parts().total()<2048);},_=>panic!("eligible image did not compress")
+        }
+        assert!(matches!(decode_source(bytes.into(),&||false,&|_|false,BUDGET),LoadStep::Complete(Some(Payload::Pixels(..)))));
+    }
+}
 
 static LOADER: Mutex<Option<Arc<Loader>>> = Mutex::new(None);
 fn handle()->Option<Arc<Loader>> { LOADER.lock().unwrap().clone() }
@@ -895,6 +1005,59 @@ mod tests {
         let image=image::RgbaImage::from_pixel(32,32,image::Rgba([8,12,20,139]));
         let proof=TileProof::for_prepared_upload(&image);
         if decoded{Payload::Pixels(image.into(),vec![1].into(),proof)}else{Payload::Encoded(vec![1].into(),proof)}
+    }
+    #[test] fn large_near_retry_waits_for_idle_and_keeps_headroom_during_decode(){
+        use std::sync::mpsc;
+        const M:usize=1024*1024;
+        let image=image::RgbaImage::from_pixel(813,1658,image::Rgba([1,2,3,255]));
+        let proof=TileProof::for_prepared_upload(&image);
+        let payload=Payload::Pixels(image.into(),vec![0;668443].into(),proof);
+        let required=payload.bytes();assert!(required>5*M);
+        let budget=crate::image_cache_budget::CacheBudget::new(24*M);
+        let (entered_tx,entered_rx)=mpsc::channel();let (release_tx,release_rx)=mpsc::channel();
+        // The callback is Fn; ownership of the prepared result is serialized.
+        let result=Mutex::new(Some(payload));
+        let loader=Loader::with_policy(move|_,_|{
+            entered_tx.send(()).unwrap();release_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();result.lock().unwrap().take()
+        },24*M,Some(budget.clone())).unwrap();
+        {
+            let mut state=loader.shared.state.lock().unwrap();
+            state.entries.insert("retained".into(),story_entry(Payload::encoded(vec![0;8*M])));
+            let mut e=story_entry(Payload::encoded(vec![]));e.payload=None;e.retry_bytes=required;
+            state.entries.insert("portrait".into(),e);loader.update_ready_account(&mut state);
+            budget.lock().unwrap().set_idle(14*M);
+        }
+        loader.update_story_plan(&["portrait".into()],&[]);
+        assert!(entered_rx.recv_timeout(std::time::Duration::from_millis(40)).is_err(),"must not decode before IDLE actually releases memory");
+        {
+            let mut b=budget.lock().unwrap();assert_eq!(b.ready_reserved,required);
+            let allowed=b.idle_limit(24*M);assert!(allowed<14*M);b.set_idle(allowed);
+        }
+        entered_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        {
+            let b=budget.lock().unwrap();
+            for _ in 0..2 {assert!(b.idle+3077316>b.idle_limit(24*M),"old CPU backups must not steal in-flight headroom");}
+            assert!(b.ready+b.idle+b.ready_reserved<=b.limit);
+        }
+        release_tx.send(()).unwrap();loader.wait("portrait");
+        {
+            let state=loader.shared.state.lock().unwrap();let b=budget.lock().unwrap();
+            assert!(matches!(state.entries["portrait"].payload,Some(Payload::Pixels(..))));
+            assert_eq!(b.ready_reserved,0);assert_eq!(b.ready,8*M+required);assert!(b.ready+b.idle<=b.limit);
+        }
+    }
+    #[test] fn near_claim_cancels_without_reading_and_does_not_wait_for_far_queue(){
+        let mut state=State::default();
+        let mut near=story_entry(Payload::encoded(vec![]));near.payload=None;near.retry_bytes=6*1024*1024;
+        state.entries.insert("near".into(),near);
+        let mut far=story_entry(story_payload(false));far.pending=true;far.deferred=true;
+        state.entries.insert("far".into(),far);state.story_order=vec!["near".into(),"far".into()];
+        assert!(retry_capacity_with_reclaim(&mut state,0,16*1024*1024));
+        assert_eq!(state.pop_job().unwrap().0,"near");
+        let shared=crate::image_cache_budget::CacheBudget::new(16*1024*1024);let mut b=shared.lock().unwrap();
+        state.update_reservation(&mut b);assert_eq!(b.ready_reserved,6*1024*1024);
+        state.entries.get_mut("near").unwrap().pending=false;state.update_reservation(&mut b);
+        assert_eq!(b.ready_reserved,0);assert!(state.ready_claim.is_none());
     }
     #[test] fn story_redecode_borrows_far_pixels_without_touching_current_or_repeating_failed_work(){
         let mut state=State::default();

@@ -36,6 +36,10 @@ glow = { version = "0.16", optional = true }
 libloading = { version = "0.8.9", optional = true }
 # 素材解码（PNG 等）。只随 gl-backend 启用，且只开 png 解码以保持精简。
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+flate2 = { version = "1.1.9", optional = true }
+lz4_flex = { version = "0.11.6", optional = true, default-features = false, features = ["std"] }
+weezl = { version = "0.1.12", optional = true }
+png = { version = "0.18.1", optional = true }
 # 字体光栅化（字形渲染子系统）
 ab_glyph = "0.2"
 
@@ -51,7 +55,7 @@ asb-interpreter = { path = "crates/asb-interpreter", default-features = false, f
 [features]
 default = ["gl-backend", "experimental-eluna"]
 gl-backend = ["dep:glow", "dep:image", "dep:libloading"]
-gxm-backend = ["dep:image"]
+gxm-backend = ["dep:image", "dep:flate2", "dep:lz4_flex", "dep:weezl", "dep:png"]
 gxm-native-renderer = ["gxm-backend"]
 gxm-builtin-effects = ["gxm-native-renderer"]
 gxm-text-epoch = ["gxm-native-renderer"]
@@ -60,6 +64,7 @@ experimental-eluna = ["dep:eluna"]
 game-probes = ["gl-backend"]
 
 [dev-dependencies]
+png = "0.18.1"
 # 离屏像素回读测试需要在 macOS 上创建一个 CGL headless 上下文。
 # 测试里用来在内存中编码一张 PNG 喂给解码路径。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

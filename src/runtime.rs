@@ -92,6 +92,8 @@ pub struct CoreRuntime {
     texture_provider: RuntimeTextureProvider,
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     ignore_background_alpha: bool,
+    #[cfg(all(target_os="vita",feature="gxm-backend"))]
+    pub(crate) cpu_image_compression:crate::cpu_image_compression::Policy,
     surface_timeline_cursor: asb_interpreter::SurfaceTimelineCursor,
     emote_timeline_cursor: asb_interpreter::EmoteTimelineCursor,
     png_comments: png_comments::SharedComments,
@@ -276,6 +278,8 @@ impl CoreRuntime {
             texture_provider,
             #[cfg(all(target_os="vita",feature="gxm-backend"))]
             ignore_background_alpha: false,
+            #[cfg(all(target_os="vita",feature="gxm-backend"))]
+            cpu_image_compression:Default::default(),
             surface_timeline_cursor: Default::default(),
             emote_timeline_cursor: Default::default(),
             png_comments: Default::default(),
