@@ -11,7 +11,7 @@ struct Uniform {name:String,offset:usize,count:usize}
 struct Metadata {abi:u32,source_hash:String,uniforms:Vec<Uniform>}
 #[derive(Deserialize,Serialize)]
 struct Converted {abi:u32,source_hash:String,cg_hash:String,cg:String,uniforms:Vec<Uniform>}
-struct Program {handle:u32,uniforms:Vec<Uniform>,builtin_gray:bool,builtin_mosaic:bool,builtin_blur:bool,builtin_kawase:bool}
+struct Program {handle:u32,uniforms:Vec<Uniform>,builtin_gray:bool,builtin_mosaic:bool,builtin_blur:bool,builtin_kawase:bool,translation_kind:u32}
 thread_local!{static PROGRAMS:RefCell<BTreeMap<String,Program>>=RefCell::new(BTreeMap::new());}
 thread_local!{static REVISION:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn changed(){REVISION.with(|r|r.set(r.get().saturating_add(1)));}
@@ -64,7 +64,7 @@ pub(super) fn register(id:&str,source:&[u8],package:&[u8])->Result<(),String>{
    unsafe{art3m1s_gxm_external_release(handle)};return Err(format!("GXP uniform mismatch: {}",u.name));
   }
  }
- changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms:meta.uniforms,builtin_gray:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false}){unsafe{art3m1s_gxm_external_release(old.handle)}}});
+ changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms:meta.uniforms,builtin_gray:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false,translation_kind:0}){unsafe{art3m1s_gxm_external_release(old.handle)}}});
  Ok(())
 }
 pub(super) fn register_source(id:&str,source:&[u8])->Result<(),String>{
@@ -75,7 +75,7 @@ pub(super) fn register_source_at(id:&str,file:&str,source:&[u8])->Result<(),Stri
  if let Some((name,package))=super::bundled_effects::lookup(&hash(source)){
   unsafe{art3m1s_gxm_shader_stage(3)}; // builtin
   register(id,source,package)?;
-  PROGRAMS.with(|p|{if let Some(program)=p.borrow_mut().get_mut(id){program.builtin_gray=name=="gray";program.builtin_mosaic=name=="mosaic";program.builtin_blur=matches!(name,"blur_h"|"blur_v");program.builtin_kawase=matches!(name,"blur_k"|"blur_kx"|"blur_ky");}});
+  PROGRAMS.with(|p|{if let Some(program)=p.borrow_mut().get_mut(id){program.builtin_gray=name=="gray";program.builtin_mosaic=name=="mosaic";program.builtin_blur=matches!(name,"blur_h"|"blur_v");program.builtin_kawase=matches!(name,"blur_k"|"blur_kx"|"blur_ky");program.translation_kind=match name{"blur_h"=>1,"blur_v"=>2,"blur_k"=>3,"blur_kx"=>4,"blur_ky"=>5,"gray"=>6,_=>0};}});
   crate::core_info!("[shader-builtin] id={} implementation={} bytes={} no runtime conversion/compile",id,name,package.len());
   return Ok(());
  }
@@ -100,7 +100,7 @@ pub(super) fn register_source_at(id:&str,file:&str,source:&[u8])->Result<(),Stri
    unsafe{art3m1s_gxm_external_release(handle)};return Err(format!("GXP uniform mismatch: {}",u.name));
   }
  }
- changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms,builtin_gray:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false}){unsafe{art3m1s_gxm_external_release(old.handle)}}});Ok(())
+ changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms,builtin_gray:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false,translation_kind:0}){unsafe{art3m1s_gxm_external_release(old.handle)}}});Ok(())
 }
 fn conversion_valid(c:&Converted,source:&[u8])->bool{
  if c.abi!=2||c.source_hash!=hash(source)||c.cg.len()>256*1024||c.cg_hash!=hash(c.cg.as_bytes()){return false;}
@@ -246,6 +246,23 @@ pub(super) fn cacheable_mosaic(effect:&ShaderEffect)->bool {
 // Verified mosaic only selects a bilinear sample. Verified H/V blur is a
 // nonnegative weighted sum. With alpha=1 and no mask, both preserve RGB<=A;
 // a neutral source-over wrapper can be removed while the filter still runs.
+// Source-hash-verified coordinate contracts, not script IDs. Zero means the
+// effect depends on screen coordinates or has not been audited for translation.
+// ABI: Gaussian H/V=1/2, Kawase XY/X/Y=3/4/5, pointwise gray=6.
+pub(super) fn translation_kind(effect:&ShaderEffect)->u32 {
+ if effect.mask_texture.is_some() || effect.user_texture.is_some()
+    || effect.uniforms.get("alpha").is_some_and(|v|v.as_slice()!=[1.])
+    || effect.uniforms.values().flatten().any(|v|!v.is_finite()) {return 0;}
+ let kind=PROGRAMS.with(|p|p.borrow().get(&effect.name).map_or(0,|p|p.translation_kind));
+ match kind {
+  1|2 if premultiplied_spatial_filter(effect)
+     && effect.uniforms.get(if kind==1{"width"}else{"height"})
+       .is_some_and(|v|v.len()==1&&v[0]>=0.) => kind,
+  3..=5 if verified_kawase(effect) => kind,
+  6 if premultiplied_gray(effect) => kind,
+  _=>0,
+ }
+}
 pub(super) fn verified_kawase(effect:&ShaderEffect)->bool {
  PROGRAMS.with(|p|p.borrow().get(&effect.name).is_some_and(|p|p.builtin_kawase))
     && premultiplied_spatial_filter(effect)
@@ -270,4 +287,6 @@ pub(super) fn mark_test_builtin_mosaic(id:&str){PROGRAMS.with(|p|p.borrow_mut().
 pub(super) fn mark_test_builtin_blur(id:&str){PROGRAMS.with(|p|p.borrow_mut().get_mut(id).unwrap().builtin_blur=true);changed();}
 
 #[cfg(test)]
-pub(super) fn mark_test_builtin_kawase(id:&str){PROGRAMS.with(|p|p.borrow_mut().get_mut(id).unwrap().builtin_kawase=true);changed();}
+pub(super) fn mark_test_builtin_kawase(id:&str){PROGRAMS.with(|p|{let mut p=p.borrow_mut();let p=p.get_mut(id).unwrap();p.builtin_kawase=true;p.translation_kind=3;});changed();}
+#[cfg(test)]
+pub(super) fn mark_test_translation(id:&str,kind:u32){PROGRAMS.with(|p|{let mut p=p.borrow_mut();let p=p.get_mut(id).unwrap();p.translation_kind=kind;p.builtin_blur=matches!(kind,1|2);p.builtin_gray=kind==6;});changed();}
