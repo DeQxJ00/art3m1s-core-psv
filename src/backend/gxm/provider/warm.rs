@@ -16,6 +16,8 @@ pub(super) struct WarmUpload {
     pub(super) name: String,
     info: TextureInfo,
     pixels: Tracked<Vec<u8>>,
+    sparse:bool,
+    restore:crate::cpu_image_compression::Restore,
     proof: Option<TileProof>,
     source: Option<Tracked<Vec<u8>>>,
     surface: Option<PrivateSurface>,
@@ -63,8 +65,9 @@ impl GxmTextureProvider {
     }
     pub(super) fn cancel_warm_upload(&mut self) {
         let Some(job) = self.warm.job.take() else { return; };
-        let WarmUpload {name, info, pixels, proof, source, surface, ..} = job;
+        let WarmUpload {name, info, pixels, proof, source, surface, sparse, ..} = job;
         drop(surface); // unpublished memory has no GPU readers
+        if sparse{self.encoded.insert(name,EncodedEntry{bytes:pixels,proof,last_used:self.cache_clock});self.update_warm_account();return;}
         self.decoded.insert(name.clone(), DecodedEntry {gray:false,info,rgba:pixels,last_used:self.cache_clock});
         if source.is_some() || proof.is_some() {
             self.encoded.insert(name, EncodedEntry {bytes:source.unwrap_or_else(||Tracked::bytes(Vec::new(),Owner::Provider)),proof,last_used:self.cache_clock});
@@ -90,18 +93,21 @@ impl GxmTextureProvider {
             // No cache eviction or GPU fence to make speculative space.
             if self.idle_parts().gpu + MAX_IMAGE_BYTES > IDLE_GPU_BUDGET
                 || unsafe { art3m1s_gxm_surface_warm_allowed(MAX_IMAGE_BYTES) } <= 0 { return; }
-            let Some((Ok(PreparedPixels::Rgba(p)), proof, source)) = self.warm.prefetch.as_ref().and_then(|f| f(&name)) else { return; };
-            let info = TextureInfo {width:p.width(),height:p.height()};
-            let mut pixels = p.into_raw(); pixels.transfer(Owner::Provider);
+            let Some((ready,proof,source))=self.warm.prefetch.as_ref().and_then(|f|f(&name)) else{return;};
+            let(info,mut pixels,sparse)=match ready{
+                Ok(PreparedPixels::Rgba(p))=>(TextureInfo{width:p.width(),height:p.height()},p.into_raw(),false),
+                Err(b)=>{let Some((width,height))=crate::cpu_image_compression::dimensions(&b) else{return;};(TextureInfo{width,height},b,true)},
+                _=>return,
+            };pixels.transfer(Owner::Provider);
             let mut proof=proof; if let Some(p)=proof.as_mut(){p.transfer(Owner::Provider);}
-            if self.background_alpha_ignored(&name)
+            if !sparse&&self.background_alpha_ignored(&name)
                 && proof.as_ref().and_then(|p|p.opaque_for_size(info.width,info.height))!=Some(true) {
                 background_alpha::make_opaque(&mut pixels);
             }
             // Keep the source certificate with the original encoded bytes.
             // Generate the forced-alpha upload certificate only at publication.
             let mut source=source; if let Some(p)=source.as_mut(){p.transfer(Owner::Provider);}
-            self.warm.job = Some(WarmUpload { name, info, pixels, proof, source, surface:None, row:0,steps:0,work_us:0,max_us:0 });
+            self.warm.job = Some(WarmUpload { name, info, pixels, sparse,restore:crate::cpu_image_compression::Restore::new(),proof, source, surface:None, row:0,steps:0,work_us:0,max_us:0 });
             self.update_warm_account();
             return; // acquiring READY and allocating GPU memory use separate frames
         }
@@ -124,6 +130,12 @@ impl GxmTextureProvider {
             if let Some(b)=account.as_mut(){b.set_idle(parts.total()+gpu);}
         } else if self.warm.job.as_ref().unwrap().row < self.warm.job.as_ref().unwrap().info.height as usize {
             let job = self.warm.job.as_mut().unwrap();
+            if job.sparse{
+                match super::sparse::restore_step(job.surface.as_ref().unwrap().handle,&job.pixels,&mut job.restore){
+                    Some(true)=>job.row=job.info.height as usize,
+                    Some(false)=>{},None=>{self.cancel_warm_upload();return;}
+                }
+            }else{
             let w = job.info.width as usize; let stride = (w+7)&!7;
             let end = (job.row + (COPY_BYTES/(stride*4)).max(1)).min(job.info.height as usize);
             let target = job.surface.as_mut().unwrap().bytes();
@@ -135,8 +147,9 @@ impl GxmTextureProvider {
                 job.row=y+1;
                 if y%8==7 && elapsed_us(started)>=750 {break;}
             }
+            }
         } else {
-            let force_opaque=self.background_alpha_ignored(&self.warm.job.as_ref().unwrap().name);
+            let force_opaque=!self.warm.job.as_ref().unwrap().sparse&&self.background_alpha_ignored(&self.warm.job.as_ref().unwrap().name);
             let job = self.warm.job.as_mut().unwrap();
             let forced_proof=force_opaque.then(||TileProof::for_opaque_pixels(job.info.width,job.info.height)).flatten();
             let proof=if force_opaque {forced_proof.as_ref()}else{job.proof.as_ref()};
@@ -151,11 +164,12 @@ impl GxmTextureProvider {
             let job = self.warm.job.take().unwrap();
             self.next_id += 1; self.revision = self.revision.wrapping_add(1).max(1);
             let opaque=force_opaque || job.proof.as_ref().and_then(|p|p.opaque_for_size(job.info.width,job.info.height)).unwrap_or(false);
-            self.entries.insert(job.name.clone(),Entry {id,info:job.info,rgba:job.pixels,opaque,revision:self.revision,
+            let(pixels,source)=if job.sparse{(Tracked::bytes(Vec::new(),Owner::Provider),Some(job.pixels))}else{(job.pixels,job.source)};
+            self.entries.insert(job.name.clone(),Entry {id,info:job.info,rgba:pixels,opaque,revision:self.revision,
                 last_used:self.cache_clock,cacheable:true,reclaimable:true,shared:true,gray:false,alpha_only:false,native_bytes:0,bc3:false});
             self.ids.insert(id,job.name.clone());
             // Keep the delivered source under the existing compressed cap.
-            if let Some(source)=job.source {self.keep_encoded(&job.name,source,job.proof);}
+            if let Some(source)=source {self.keep_encoded(&job.name,source,job.proof);}
             self.update_warm_account();
             crate::core_info!("GXM warm-upload name={} size={}x{} steps={} work_us={} max_step_us={} bytes_per_step={}",
                 job.name,job.info.width,job.info.height,job.steps+1,job.work_us+elapsed_us(started),job.max_us.max(elapsed_us(started)),COPY_BYTES);

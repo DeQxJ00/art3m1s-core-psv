@@ -1456,6 +1456,24 @@ pub unsafe extern "C" fn art3m1s_runtime_set_ignore_background_alpha(rt: *mut Co
     unsafe { rt.as_mut() }.map_or(0, |r| i32::from(r.set_ignore_background_alpha(enabled != 0)))
 }
 
+/// Startup-only per-game CPU image compression policy. Folders are newline separated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_cpu_image_compression(rt:*mut CoreRuntime,enabled:i32,size_check:i32,min_bytes:u32,ratio:i32,percent:u32,runs:i32,mean_bytes:u32,folders:*const c_char)->i32{
+    #[cfg(all(target_os="vita",feature="gxm-backend"))]
+    {
+        let Some(r)= (unsafe{rt.as_mut()}) else{return 0;};
+        if folders.is_null()||percent>100||mean_bytes<64||mean_bytes>65536||min_bytes<128*1024||min_bytes>16*1024*1024{return 0;}
+        let Ok(text)= (unsafe{std::ffi::CStr::from_ptr(folders)}).to_str() else{return 0;};
+        if text.len()>32768{return 0;}
+        let mut paths=Vec::new();
+        for path in text.lines(){let Some(path)=crate::cpu_image_compression::folder(path) else{return 0;};if !paths.contains(&path){paths.push(path);}if paths.len()>128{return 0;}}
+        r.cpu_image_compression=crate::cpu_image_compression::Policy{enabled:enabled!=0,size_enabled:size_check!=0,min_bytes:min_bytes as usize,ratio_enabled:ratio!=0,percent,runs_enabled:runs!=0,mean_bytes,folders:paths,ignore_bg:false};
+        1
+    }
+    #[cfg(not(all(target_os="vita",feature="gxm-backend")))]
+    {let _=(rt,enabled,size_check,min_bytes,ratio,percent,runs,mean_bytes,folders);0}
+}
+
 /// Hide the dialogue volume slider without changing mixer levels or save data.
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]

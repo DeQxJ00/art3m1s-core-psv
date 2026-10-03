@@ -16,9 +16,9 @@ impl CacheParts {
 // counter, not residency: successful payload handoff/reclamation preserves it.
 #[derive(Clone,Copy,Default,Debug,PartialEq,Eq)]
 pub(crate) struct ScriptPreloadCounts { pub planned:usize,pub completed:usize,pub pixels:usize,pub encoded:usize }
-pub(crate) struct CacheBudget { pub limit:usize,pub ready:usize,pub idle:usize,pub emote:usize,pub emote_scratch:usize,emote_request:Option<(usize,std::time::Instant)>,pub ready_goal:usize,pub ready_parts:CacheParts,pub mask_parts:CacheParts,pub animation_parts:CacheParts,pub script_preload:ScriptPreloadCounts }
+pub(crate) struct CacheBudget { pub limit:usize,pub ready:usize,pub idle:usize,pub emote:usize,pub emote_scratch:usize,emote_request:Option<(usize,std::time::Instant)>,pub ready_goal:usize,pub ready_reserved:usize,pub ready_parts:CacheParts,pub mask_parts:CacheParts,pub animation_parts:CacheParts,pub script_preload:ScriptPreloadCounts }
 impl CacheBudget {
-    pub fn new(limit:usize)->SharedCacheBudget{Arc::new(Mutex::new(Self{limit,ready:0,idle:0,emote:0,emote_scratch:0,emote_request:None,ready_goal:0,ready_parts:CacheParts::default(),mask_parts:CacheParts::default(),animation_parts:CacheParts::default(),script_preload:ScriptPreloadCounts::default()}))}
+    pub fn new(limit:usize)->SharedCacheBudget{Arc::new(Mutex::new(Self{limit,ready:0,idle:0,emote:0,emote_scratch:0,emote_request:None,ready_goal:0,ready_reserved:0,ready_parts:CacheParts::default(),mask_parts:CacheParts::default(),animation_parts:CacheParts::default(),script_preload:ScriptPreloadCounts::default()}))}
     pub fn ready_limit(&self)->usize{
         let physical=self.limit.saturating_sub(self.idle+self.emote+self.emote_scratch);
         physical.min(self.ready.max(self.limit.saturating_sub(self.idle+self.emote_goal())))
@@ -32,7 +32,10 @@ impl CacheBudget {
         self.emote_request=Some((goal.min(self.limit),std::time::Instant::now()+std::time::Duration::from_secs(1)));
     }
     pub fn clear_emote_request(&mut self){self.emote_request=None;}
-    pub fn idle_limit(&self,maximum:usize)->usize{maximum.min(self.limit.saturating_sub(self.ready.max(self.ready_goal)+self.emote_goal()))}
+    pub fn idle_limit(&self,maximum:usize)->usize{maximum.min(self.limit.saturating_sub(self.ready.saturating_add(self.ready_reserved).max(self.ready_goal)+self.emote_goal()))}
+    // Potential capacity after render-thread reclamation, never permission to
+    // publish into occupied IDLE. Model requests keep their higher priority.
+    pub fn ready_reclaim_limit(&self)->usize{self.limit.saturating_sub(self.emote_goal())}
     // Request one bounded growth window beyond actual ready allocations, not
     // the entire chapter allowance as soon as one async job is queued. The
     // former 5/6 reservation evicted warm backgrounds with >100 MiB still free.

@@ -47,6 +47,12 @@ pub mod text;
 pub mod video;
 #[cfg(feature="gxm-backend")]
 mod texture_study;
+#[cfg(feature="gxm-backend")]
+mod cache_compression_study;
+#[cfg(feature="gxm-backend")]
+mod png_zero_study;
+#[cfg(any(feature="gxm-backend",test))]
+pub(crate) mod cpu_image_compression;
 
 pub use art3m1s_emote as emote;
 pub use asb_interpreter as script;

@@ -60,6 +60,8 @@ impl CoreRuntime {
         self.clear_emote_state("project reload");
         #[cfg(all(target_os="vita",feature="gxm-backend"))]
         super::surface_loader::shutdown();
+        #[cfg(all(target_os="vita",feature="gxm-backend"))]
+        {let mut p=self.cpu_image_compression.clone();p.ignore_bg=self.ignore_background_alpha;crate::cpu_image_compression::set_policy(p);}
         super::emote_source_cache::reset();
         self.emote_timeline_cursor=Default::default();
         self.install_interpreter(project.create_interpreter());
@@ -190,6 +192,7 @@ impl CoreRuntime {
                     super::surface_loader::Payload::Pixels(image, bytes,proof) => (Ok(image.into()),proof,Some(bytes)),
                     super::surface_loader::Payload::Gray(w,h,pixels,bytes) => (Ok(crate::backend::gxm::PreparedPixels::Gray(w,h,pixels)),None,Some(bytes)),
                     super::surface_loader::Payload::Encoded(bytes,proof) => (Err(bytes),proof,None),
+                    super::surface_loader::Payload::Sparse(bytes,proof) => (Err(bytes),Some(proof),None),
                 })
             })
         };
@@ -200,6 +203,7 @@ impl CoreRuntime {
                 let resolved = magic_path::resolve_path(&paths, name);
                 match super::surface_loader::take_warm_pixels(&resolved, 4*1024*1024)? {
                     super::surface_loader::Payload::Pixels(image, bytes, proof) => Some((Ok(image.into()), proof, Some(bytes))),
+                    super::surface_loader::Payload::Sparse(bytes,proof)=>Some((Err(bytes),Some(proof),None)),
                     _ => unreachable!("warm handoff only accepts certified RGBA"),
                 }
             })

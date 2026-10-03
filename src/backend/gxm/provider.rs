@@ -47,6 +47,7 @@ impl PixelStorage<'_>{fn as_ref(&self)->&[u8]{match self{Self::Borrowed(v)=>v,Se
 
 
 mod native;
+mod sparse;
 
 struct Entry {
     id: TextureId,
@@ -482,25 +483,29 @@ impl GxmTextureProvider {
         // no separate cache allowance, reads, copies, workers or waits here.
         let deferred=self.decoded.contains_key(name);
         let native=crate::native_texture::parse(&bytes).ok();
+        let sparse=crate::cpu_image_compression::dimensions(&bytes);
+        let packed=native.is_some()||sparse.is_some();
         let Some(info)=self.entries.get(name).map(|e|e.info).or_else(||self.decoded.get(name).map(|e|e.info))
-            .or_else(||native.map(|t|TextureInfo{width:t.width,height:t.height})) else{return;};
-        if native.is_none()&&!deferred&&u64::from(info.width)*u64::from(info.height)*4<1024*1024{return;}
+            .or_else(||native.map(|t|TextureInfo{width:t.width,height:t.height}))
+            .or_else(||sparse.map(|(width,height)|TextureInfo{width,height})) else{return;};
+        if !packed&&!deferred&&u64::from(info.width)*u64::from(info.height)*4<1024*1024{return;}
         let cap=self.idle_budget/4;
         let ordinary_cap=cap.min(4*1024*1024);
         let cost=bytes.capacity()+proof.as_ref().map_or(0,TileProof::bytes);
         // Preserve a full-budget retry pixel buffer before its optional source.
         if self.decoded.get(name).is_some_and(|e|e.rgba.capacity().saturating_add(cost)>self.idle_budget){return;}
-        if (bytes.is_empty()&&proof.is_none())||cost>cap||(native.is_none()&&cost>ordinary_cap){return;}
+        if (bytes.is_empty()&&proof.is_none())||cost>cap||(!packed&&cost>ordinary_cap){return;}
         self.encoded.remove(name);
         let mut used=self.encoded.values().map(EncodedEntry::capacity).sum::<usize>();
-        let mut ordinary_used=self.encoded.values().filter(|e|!crate::native_texture::recognized(&e.bytes)).map(EncodedEntry::capacity).sum::<usize>();
-        while used+cost>cap||(native.is_none()&&ordinary_used+cost>ordinary_cap){
-            let ordinary_pressure=native.is_none()&&ordinary_used+cost>ordinary_cap;
-            let oldest=self.encoded.iter().filter(|(_,e)|!ordinary_pressure||!crate::native_texture::recognized(&e.bytes))
+        let ordinary=|e:&EncodedEntry|!crate::native_texture::recognized(&e.bytes)&&!crate::cpu_image_compression::recognized(&e.bytes);
+        let mut ordinary_used=self.encoded.values().filter(|e|ordinary(e)).map(EncodedEntry::capacity).sum::<usize>();
+        while used+cost>cap||(!packed&&ordinary_used+cost>ordinary_cap){
+            let ordinary_pressure=!packed&&ordinary_used+cost>ordinary_cap;
+            let oldest=self.encoded.iter().filter(|(_,e)|!ordinary_pressure||ordinary(e))
                 .min_by_key(|(n,e)|(!self.low_priority_idle(n),e.last_used))
                 .map(|(name,_)|name.clone()).unwrap();
             let e=self.encoded.remove(&oldest).unwrap();used-=e.capacity();
-            if !crate::native_texture::recognized(&e.bytes){ordinary_used-=e.capacity();}
+            if ordinary(&e){ordinary_used-=e.capacity();}
         }
         bytes.transfer(Owner::Provider);if let Some(p)=proof.as_mut(){p.transfer(Owner::Provider);}
         self.encoded.insert(name.into(),EncodedEntry{bytes,proof,last_used:self.cache_clock});
@@ -673,6 +678,7 @@ impl TextureProvider for GxmTextureProvider {
         };
         let mut bytes=bytes;bytes.transfer(Owner::Source);
         if crate::native_texture::recognized(&bytes){return self.upload_native(name,bytes);}
+        if crate::cpu_image_compression::recognized(&bytes){return self.upload_sparse(name,bytes,proof);}
         let started = Instant::now();
         let reader = match ImageReader::new(Cursor::new(bytes.as_slice())).with_guessed_format() {
             Ok(reader) => reader,
@@ -937,8 +943,12 @@ impl TextureProvider for GxmTextureProvider {
         // Preserve the small last-resort sources when dropping costly surfaces.
         // GPU and decoded copies retain their existing shared recency order.
         // Sources cannot occupy more than 1/4 of this same total budget.
-        reclaim.sort_unstable_by(|a,b|(!self.low_priority_idle(&a.1),a.2==2,a.0,&a.1,a.2)
-            .cmp(&(!self.low_priority_idle(&b.1),b.2==2,b.0,&b.1,b.2)));
+        let near_claim=account.as_ref().is_some_and(|b|b.ready_reserved>0);
+        // A known-size nearby decode first borrows replaceable CPU backups.
+        // Keep GPU surfaces warm when these copies alone satisfy the claim.
+        let tier_order=|tier|if near_claim{match tier{1|3=>0,0=>1,_=>2}}else{usize::from(tier==2)};
+        reclaim.sort_unstable_by(|a,b|(!self.low_priority_idle(&a.1),tier_order(a.2),a.0,&a.1,a.2)
+            .cmp(&(!self.low_priority_idle(&b.1),tier_order(b.2),b.0,&b.1,b.2)));
         let mut idle_gpu=self.warm.parts().gpu+self.entries.values().filter(|e|e.reclaimable)
             .map(|e|e.cache_bytes()-e.rgba.capacity()).sum::<usize>();
         let gpu_limit=IDLE_GPU_BUDGET.min(idle_limit);
@@ -1073,6 +1083,31 @@ mod tests {
     use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
     static LOCK: Mutex<()> = Mutex::new(());
+    #[test] fn cpu_sparse_upload_retry_eviction_and_warm_cancel_preserve_exact_pixels(){
+        let _guard=LOCK.lock().unwrap();
+        let mut image=image::RgbaImage::new(513,257);for(x,y,p)in image.enumerate_pixels_mut(){if x>493{*p=image::Rgba([x as u8,y as u8,71,if y%3==0{0}else{139}]);}}
+        for cause in 0..6{
+            let proof=TileProof::for_prepared_upload(&image).unwrap();let packed=crate::cpu_image_compression::compress(513,257,image.as_raw(),16*1024*1024,&||false).unwrap();let cost=packed.capacity()+proof.bytes();
+            let budget=crate::image_cache_budget::CacheBudget::new(32*1024*1024);budget.lock().unwrap().set_ready(cost);let b=budget.clone();
+            let ready=std::cell::RefCell::new(Some((Err(packed),Some(proof),None)));
+            let mut p=GxmTextureProvider::new().with_cache_budget(budget).with_source(|_|panic!("compressed hit should not read PNG"))
+                .with_warm_prefetch(move |_|{let v=ready.borrow_mut().take()?;let mut a=b.lock().unwrap();a.set_ready(0);let idle=a.idle+cost;a.set_idle(idle);Some(v)});
+            p.set_warm_plan(&["future".into()]);for _ in 0..6{p.warm_step();}assert!(p.warm.job.is_some());assert!(p.entries.is_empty());
+            match cause{
+                0=>{for _ in 0..64{p.warm_step();if p.warm.job.is_none(){break;}}},
+                1=>p.set_warm_plan(&["new-plan".into()]),
+                2=>{p.idle_budget=1;p.cancel_warm_under_pressure();p.idle_budget=32*1024*1024;},
+                3=>{FAIL_SURFACE.store(2,Ordering::Relaxed);for _ in 0..16{p.warm_step();}FAIL_SURFACE.store(0,Ordering::Relaxed);},
+                4=>{p.cancel_warm_upload();FAIL_SURFACE.store(1,Ordering::Relaxed);assert!(p.resolve("future").is_none());FAIL_SURFACE.store(0,Ordering::Relaxed);assert!(p.encoded.contains_key("future"));},
+                _=>{p.resolve("future").unwrap();},
+            }
+            assert!(p.warm.job.is_none());let(id,_)=p.resolve("future").unwrap();assert_eq!(p.pixels_of("future").unwrap().2,*image.as_raw());
+            assert_eq!(p.pixel_alpha(id,512,256),Some(139));assert!(p.entries["future"].rgba.is_empty());assert!(p.decoded.is_empty());assert_eq!(p.timing.decoded,0);
+            p.remove("future");assert!(p.encoded.contains_key("future"));assert_eq!(p.pixels_of("future").unwrap().2,*image.as_raw());
+            p.retain(&HashSet::new());assert_eq!(p.idle_parts().total(),p.cache_budget.as_ref().unwrap().lock().unwrap().idle);
+            p.evict_prefix("future");p.retain(&HashSet::new());assert_eq!(p.idle_parts().total(),0);
+        }
+    }
     #[test] fn native_texture_retries_compressed_source_and_accounts_physical_blocks(){
         let _guard=LOCK.lock().unwrap();
         let reads=Rc::new(Cell::new(0));let counter=reads.clone();
@@ -1541,6 +1576,16 @@ mod tests {
     static FAIL_SURFACE:AtomicUsize=AtomicUsize::new(0);
     static ABORTED:AtomicUsize=AtomicUsize::new(0);
     #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_sparse_write(p:usize,offset:usize,source:*const u8,len:usize)->i32{
+        let s=unsafe{&mut *(p as *mut MockSurface)};
+        if offset%4!=0||len%4!=0||offset+len>s.w*s.h*4{return 0;}
+        for i in (0..len).step_by(4){let logical=offset+i;let y=logical/(s.w*4);let x=logical%(s.w*4);
+            let pixel=if source.is_null(){[0;4]}else{unsafe{std::slice::from_raw_parts(source.add(i),4)}.try_into().unwrap()};
+            s.data[y*s.stride*4+x..y*s.stride*4+x+4].copy_from_slice(&pixel);
+            if x+4==s.w*4{for pad in s.w..s.stride{s.data[(y*s.stride+pad)*4..(y*s.stride+pad+1)*4].copy_from_slice(&pixel);}}
+        }1
+    }
+    #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_surface_warm_allowed(_:usize)->i32{1}
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_surface_publish_strided(p:usize,id:u64,proof:*const u8,count:usize)->i32{
@@ -1989,6 +2034,18 @@ mod tests {
         p.resolve("recent").unwrap();p.retain(&HashSet::from(["active".into()]));
         assert!(p.entries.contains_key("recent"));assert!(budget.lock().unwrap().idle>128);
         drop(p);assert_eq!(budget.lock().unwrap().idle,0);
+    }
+    #[test] fn near_decode_claim_reclaims_newer_cpu_backup_before_older_gpu(){
+        let _guard=LOCK.lock().unwrap();let budget=crate::image_cache_budget::CacheBudget::new(512);
+        let (p,_)=provider();let mut p=p.with_cache_budget(budget.clone());
+        p.resolve("warm-surface").unwrap();
+        p.decoded.insert("recent-backup".into(),DecodedEntry{gray:false,info:TextureInfo{width:8,height:8},rgba:vec![0;256].into(),last_used:999});
+        p.retain(&HashSet::new());assert!(p.entries.contains_key("warm-surface"));
+        budget.lock().unwrap().ready_reserved=256;
+        assert!(p.needs_upload_retry(),"static frames must run render-thread reclamation");
+        p.retain(&HashSet::new());
+        assert!(!p.decoded.contains_key("recent-backup"));assert!(p.entries.contains_key("warm-surface"));
+        let b=budget.lock().unwrap();assert!(b.ready+b.idle+b.ready_reserved<=b.limit);
     }
     #[test] fn async_headroom_request_reclaims_cold_textures_before_ready_publication(){
         let _guard=LOCK.lock().unwrap();let budget=crate::image_cache_budget::CacheBudget::new(480);
