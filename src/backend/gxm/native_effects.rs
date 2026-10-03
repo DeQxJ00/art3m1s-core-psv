@@ -36,6 +36,7 @@ unsafe extern "C" {
     fn art3m1s_gxm_group_filter_chain(draw:*const EffectDraw,count:u32)->i32;
     fn art3m1s_gxm_group_end_half_blur(draw:*const EffectDraw,count:u32)->i32;
     fn art3m1s_gxm_draw_cached_blur(source:*const EffectDraw,passes:*const EffectDraw,count:u32,revision:u64)->i32;
+    fn art3m1s_gxm_draw_cached_effect(sources:*const EffectDraw,n:u32,passes:*const EffectDraw,kinds:*const u32,count:u32,revision:u64,half:u32)->i32;
     fn art3m1s_gxm_node_source_draw(draw:*const EffectDraw,slot:u32)->i32;
     fn art3m1s_gxm_node_source_enabled()->i32;
     fn art3m1s_gxm_cache_slot_revision(slot:u32)->u64;
@@ -237,6 +238,26 @@ fn half_blur_chain(frame:&DrawList,chain:&[usize],inner:usize,width:u32,height:u
         g.mask_range.is_none() && full_stage_clip(g.clip_bounds,width,height)
             && super::external_effects::verified_kawase(&g.effect)
     })
+}
+// A reusable local stack may contain several transparent expression layers.
+// Effects declare their coordinate contract; masks, destination blending and
+// arbitrary shader programs are intentionally left on the ordinary path.
+fn translated_chain(frame:&DrawList,chain:&[usize],inner:usize,width:u32,height:u32)->Option<Vec<u32>> {
+    if chain.is_empty()||chain.len()>16{return None;}
+    let g=&frame.shader_groups[chain[0]];
+    if g.start>=g.end||g.end>frame.commands.len()||g.end-g.start>32
+        ||next_group(frame,g.start,g.end,inner).is_some(){return None;}
+    if frame.commands[g.start..g.end].iter().any(|c|c.shader.is_some()||c.mesh.is_some()
+        ||c.stencil.is_some()||c.native_emote.is_some()||c.color.grayscale||c.color.negative
+        ||!matches!(c.blend,BlendMode::Alpha|BlendMode::PremultipliedAlpha)
+        ||!full_stage_clip(c.clip_bounds,width,height)){return None;}
+    let kinds:Vec<_>=chain.iter().rev().map(|&i|{
+        let g=&frame.shader_groups[i];
+        if g.mask_range.is_some()||!full_stage_clip(g.clip_bounds,width,height){0}
+        else{super::external_effects::translation_kind(&g.effect)}
+    }).collect();
+    if kinds.contains(&0)||(g.end==g.start+1&&kinds.as_slice()==[6]){return None;}
+    Some(kinds)
 }
 fn opaque_cover(c: &DrawCommand, width: u32, height: u32) -> bool {
     if c.opacity != 1.0 || c.mesh.is_some() || c.stencil.is_some() || c.native_emote.is_some()
@@ -446,18 +467,29 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
                         stats[0]+=1;stats[1]+=1;inner=i;continue;
                     }
                     if !super::external_effects::registered(&g.effect.name){break;}
+                    // Keep a coordinate-dependent outer pass separate so its
+                    // stable, translation-invariant child can retain its result.
+                    // Flattening across this boundary would consume the entire
+                    // chain before the child gets a chance to use its cache.
+                    if (super::external_effects::translation_kind(&group.effect)!=0)
+                        !=(super::external_effects::translation_kind(&g.effect)!=0) {break;}
                     chain.push(i);inner=i;
                 }
             }
             let half_passes=half_blur_chain(frame,&chain,inner,width,height).then(||
                 chain.iter().rev().filter_map(|&i|
                     encode(&group_command(&frame.shader_groups[i],width,height),width,height)).collect::<Vec<_>>());
-            if let Some(passes)=half_passes.as_ref().filter(|p|p.len()==chain.len())
-                && let Some(source)=encode(&frame.commands[group.start],width,height)
-                && unsafe{art3m1s_gxm_draw_cached_blur(&source,passes.as_ptr(),passes.len() as u32,
-                    super::external_effects::revision())!=0} {
-                stats[0]+=(chain.len()-1) as u32;
-                index=group.end;continue;
+            if allow_flatten && let Some(kinds)=translated_chain(frame,&chain,inner,width,height) {
+                let passes:Vec<_>=chain.iter().rev().filter_map(|&i|
+                    encode(&group_command(&frame.shader_groups[i],width,height),width,height)).collect();
+                let sources:Vec<_>=frame.commands[group.start..group.end].iter().filter_map(|c|encode(c,width,height)).collect();
+                if passes.len()==chain.len()&&sources.len()==group.end-group.start&&unsafe{
+                    art3m1s_gxm_draw_cached_effect(sources.as_ptr(),sources.len() as u32,passes.as_ptr(),kinds.as_ptr(),passes.len() as u32,
+                        super::external_effects::revision(),u32::from(half_passes.is_some()))!=0
+                } {
+                    stats[0]+=(chain.len()-1) as u32;
+                    index=group.end;continue;
+                }
             }
             if unsafe { art3m1s_gxm_group_begin() } != 0 {
                 render_range(frame, group.start, group.end, inner, width, height, stats, allow_flatten,nodes,admit);
@@ -1200,6 +1232,8 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_draw_cached_blur(_:*const EffectDraw,_:*const EffectDraw,_:u32,_:u64)->i32 {0}
     #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_draw_cached_effect(_:*const EffectDraw,n:u32,_:*const EffectDraw,_:*const u32,count:u32,_:u64,_:u32)->i32 {event(format!("translated:{n}:{count}"));0}
+    #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_group_begin() -> i32 {
         event("begin-group".into());
         1
@@ -1652,6 +1686,68 @@ mod tests {
         // Replacing the source under the same ID revokes the proof.
         super::super::external_effects::register_source(id,src).unwrap();
         assert!(!passthrough_group_inner(&f,9,960,544,true));
+        super::super::external_effects::clear();
+    }
+    #[test]
+    fn translated_filters_require_verified_coordinates_and_independent_sources(){
+        let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
+        for (id,kind) in [("pan_h",1),("pan_v",2),("pan_gray",6)] {
+            super::super::external_effects::register_source(id,src).unwrap();
+            super::super::external_effects::mark_test_translation(id,kind);
+        }
+        let mut f=neutral_frame();f.shader_groups.clear();
+        for (id,step) in [("pan_h","width"),("pan_v","height")] {
+            let mut g=test_group(id,0,2);
+            g.effect.uniforms.insert("weights".into(),vec![0.2,0.16,0.12,0.07,0.03,0.015,0.004,0.001]);
+            g.effect.uniforms.insert(step.into(),vec![1./960.]);f.shader_groups.push(g);
+        }
+        assert_eq!(translated_chain(&f,&[1,0],0,960,544),Some(vec![1,2]));
+        f.commands[0].opacity=0.5;f.commands[0].texture=TextureId(43);
+        assert_eq!(translated_chain(&f,&[1,0],0,960,544),Some(vec![1,2]));
+        f.commands[1].clip_bounds=Some([0.,0.,100.,100.]);
+        assert!(translated_chain(&f,&[1,0],0,960,544).is_none());f.commands[1].clip_bounds=None;
+        f.commands[1].blend=BlendMode::Screen;
+        assert!(translated_chain(&f,&[1,0],0,960,544).is_none());f.commands[1].blend=BlendMode::Alpha;
+        f.shader_groups[0].effect.mask_texture=Some(TextureId(9));
+        assert!(translated_chain(&f,&[1,0],0,960,544).is_none());f.shader_groups[0].effect.mask_texture=None;
+        f.shader_groups[1].effect.uniforms.insert("height".into(),vec![f32::NAN]);
+        assert!(translated_chain(&f,&[1,0],0,960,544).is_none());
+        f.shader_groups[1].effect.uniforms.insert("height".into(),vec![1./544.]);
+        f.shader_groups[1].effect.uniforms.insert("alpha".into(),vec![0.5]);
+        assert!(translated_chain(&f,&[1,0],0,960,544).is_none());
+        // A program ID reused for an arbitrary implementation revokes metadata.
+        super::super::external_effects::register_source("pan_h",src).unwrap();
+        assert_eq!(super::super::external_effects::translation_kind(&f.shader_groups[0].effect),0);
+        f.shader_groups=vec![test_group("pan_gray",0,2)];
+        assert_eq!(translated_chain(&f,&[0],0,960,544),Some(vec![6]));
+        f.shader_groups[0].end=1;
+        assert!(translated_chain(&f,&[0],0,960,544).is_none()); // cheap single sprite
+        super::super::external_effects::clear();
+    }
+    #[test]
+    fn coordinate_dependent_outer_keeps_moving_inner_translation_cache_reachable(){
+        let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
+        for (id,kind) in [("inner_h",1),("inner_v",2),("screen_outer",0)] {
+            super::super::external_effects::register_source(id,src).unwrap();
+            super::super::external_effects::mark_test_translation(id,kind);
+        }
+        let mut f=neutral_frame();f.shader_groups.clear();
+        for (id,step) in [("inner_h","width"),("inner_v","height")] {
+            let mut g=test_group(id,0,2);
+            g.effect.uniforms.insert("weights".into(),vec![0.2,0.16,0.12,0.07,0.03,0.015,0.004,0.001]);
+            g.effect.uniforms.insert(step.into(),vec![1./960.]);f.shader_groups.push(g);
+        }
+        f.shader_groups.push(test_group("screen_outer",0,2));
+        let mut nodes=NodeCache::default();
+        for x in [0.,13.,29.] {
+            for c in &mut f.commands {c.transform.translation.x=x;}
+            EVENTS.with(|v|v.borrow_mut().clear());
+            render_range(&f,0,2,3,960,544,&mut [0,0],true,&mut nodes,false);
+            EVENTS.with(|v|{let v=v.borrow();assert!(v.contains(&"translated:2:2".into()));
+                assert_eq!(v.iter().filter(|e|*e=="filter").count(),1);
+                assert_eq!(v.iter().filter(|e|*e=="begin-group").count(),2);
+            });
+        }
         super::super::external_effects::clear();
     }
     #[test]
