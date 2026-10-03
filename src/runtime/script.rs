@@ -287,10 +287,11 @@ impl CoreRuntime {
         let advance = match reason {
             WaitReason::Timed { input, .. } => {
                 // input=0 is a pure timer: neither Skip nor an input edge may
-                // shorten it. input=1 is released by actual user input only;
+                // shorten it. input=1 accepts unhandled user input as well as
+                // the game's role-0 decide (often remapped by Lua next frame);
                 // input=2 permits only the engine's Skip state. A click that
                 // just stopped automode is already consumed for this frame.
-                if timed_wait_accepts_user_input(input, tick.user_input, stopped_automode_by_click) {
+                if timed_wait_accepts_input(input, tick, stopped_automode_by_click) {
                     self.timed_remaining_ms = 0;
                     true
                 } else if input == 2 && self.skip_active() {
@@ -660,8 +661,8 @@ fn settle_inline_event_frame(
     Ok(())
 }
 
-fn timed_wait_accepts_user_input(input: i32, user_input: bool, stopped_automode: bool) -> bool {
-    input == 1 && user_input && !stopped_automode
+fn timed_wait_accepts_input(input: i32, tick: InputTick, stopped_automode: bool) -> bool {
+    input == 1 && (tick.user_input || tick.advance) && !stopped_automode
 }
 
 fn scenario_reveal_requested(mode: i32, input: i32, advance_requested: bool, complete: bool) -> bool {
@@ -709,7 +710,7 @@ pub(crate) fn wait_reason_is_input_wait(reason: Option<&WaitReason>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        automode_stop_by_stop_wait, settle_inline_event_frame, timed_wait_accepts_user_input,
+        automode_stop_by_stop_wait, settle_inline_event_frame, timed_wait_accepts_input,
         trans_input_skip_requested, wait_advance_requested, wait_reason_is_input_wait,
     };
     use crate::runtime::InlineEventFrame;
@@ -751,11 +752,46 @@ mod tests {
 
     #[test]
     fn timed_wait_only_accepts_click_for_input_one() {
-        assert!(!timed_wait_accepts_user_input(0, true, false));
-        assert!(timed_wait_accepts_user_input(1, true, false));
-        assert!(!timed_wait_accepts_user_input(2, true, false));
-        assert!(!timed_wait_accepts_user_input(1, false, false));
-        assert!(!timed_wait_accepts_user_input(1, true, true));
+        use crate::runtime::input::InputTick;
+        let click = InputTick { user_input: true, ..InputTick::default() };
+        assert!(!timed_wait_accepts_input(0, click, false));
+        assert!(timed_wait_accepts_input(1, click, false));
+        assert!(!timed_wait_accepts_input(2, click, false));
+        assert!(!timed_wait_accepts_input(1, InputTick::default(), false));
+        assert!(!timed_wait_accepts_input(1, click, true));
+    }
+
+    #[test]
+    fn timed_dialogue_wait_accepts_remapped_confirm_without_advancing_the_next_wait() {
+        use crate::runtime::input::InputTick;
+        let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            function dialogue_delay(e)
+                e:enqueueTag { 'wait', time=4500, input=1 }
+            end
+        "#).exec().unwrap();
+        it.load_script("dialogue", "[calllua function=dialogue_delay]\n[@]\n[var name=next_line data=1]\n").unwrap();
+        it.set_callback(|event| match event {
+            Event::Wait { .. } => CallbackResult::Pause,
+            _ => CallbackResult::Continue,
+        });
+        it.boot("dialogue").unwrap();
+        let ExecutionResult::Wait(Event::Wait { reason: WaitReason::Timed { input, milliseconds } }) = it.run().unwrap() else {
+            panic!("the queued dialogue delay must suspend the scenario");
+        };
+        assert_eq!(milliseconds, 4500);
+        // The physical Enter/Circle was consumed by setonpush. On the next
+        // frame Lua injects a role-0 DECIDE; it has no raw physical edge.
+        let remapped = InputTick { advance: true, ..InputTick::default() };
+        assert!(timed_wait_accepts_input(input, remapped, false));
+        it.advance_line();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait { reason: WaitReason::Generic })));
+        assert_eq!(it.get_variable("next_line"), None);
+        // Expired overrides and UI-consumed keys cannot release another wait.
+        assert!(!timed_wait_accepts_input(1, InputTick::default(), false));
+        assert!(!timed_wait_accepts_input(0, remapped, false));
+        assert!(!timed_wait_accepts_input(2, remapped, false));
+        assert!(!timed_wait_accepts_input(1, remapped, true));
     }
 
     #[test]
