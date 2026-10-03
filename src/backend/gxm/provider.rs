@@ -107,6 +107,7 @@ unsafe extern "C" {
         length: usize,
     ) -> i32;
     fn art3m1s_gxm_delete_texture(texture: u64);
+    fn art3m1s_gxm_texture_cdram_bytes(texture:u64)->usize;
     fn art3m1s_gxm_upload_texture_proof(texture:u64,width:u32,height:u32,rgba:*const u8,length:usize,cells:*const u8,count:usize)->i32;
     fn art3m1s_gxm_upload_video_texture(texture: u64, width: u32, height: u32, rgba: *const u8, length: usize) -> i32;
 }
@@ -205,6 +206,14 @@ impl GxmTextureProvider {
         self.reclaim_idle_gpu_cache(requested,"video-cache-reclaim")
     }
     fn reclaim_idle_gpu_cache(&mut self,requested:usize,reason:&str)->usize {
+        self.reclaim_gpu_cache(requested,reason,false)
+    }
+    /// Between completed frames. Preserve active/transition textures and CPU
+    /// backups; RAM-backed GPU surfaces cannot satisfy a CDRAM request.
+    pub fn reclaim_effect_gpu_cache(&mut self,requested:usize)->usize {
+        self.reclaim_gpu_cache(requested,"effect-cache-reclaim",true)
+    }
+    fn reclaim_gpu_cache(&mut self,requested:usize,reason:&str,cdram_only:bool)->usize {
         let requested=requested.min(16*1024*1024);
         if requested==0{return 0;}
         let cache=self.cache_budget.clone();let mut account=cache.as_ref().map(|b|b.lock().unwrap());
@@ -215,11 +224,13 @@ impl GxmTextureProvider {
         let mut released=0usize;let mut count=0;
         for (_,name) in idle {
             if released>=requested{break;}
+            let cdram=if cdram_only{unsafe{art3m1s_gxm_texture_cdram_bytes(self.entries[&name].id.0)}}else{0};
+            if cdram_only&&cdram==0{continue;}
             let e=self.entries.remove(&name).unwrap();self.ids.remove(&e.id);
             self.revision=self.revision.wrapping_add(1).max(1);
             unsafe{art3m1s_gxm_delete_texture(e.id.0)};
             let gpu=e.gpu_bytes();
-            released=released.saturating_add((gpu+0x3ffff)&!0x3ffff);count+=1;
+            released=released.saturating_add(if cdram_only{cdram}else{(gpu+0x3ffff)&!0x3ffff});count+=1;
             if self.low_priority_idle(&name) {
                 self.decoded.remove(&name);self.encoded.remove(&name);self.cache_evictions+=1;
             } else if !e.rgba.is_empty(){
@@ -228,7 +239,7 @@ impl GxmTextureProvider {
         }
         let idle_bytes=self.idle_parts().total();
         if let Some(b)=account.as_mut(){b.set_idle(idle_bytes);}
-        crate::core_info!("[{}] textures={} gpu_est_bytes={} requested={} idle_after={}; active pinned, encoded retained",reason,count,released,requested,idle_bytes);
+        if count>0{crate::core_info!("[{}] textures={} gpu_est_bytes={} requested={} idle_after={}; active pinned, encoded retained",reason,count,released,requested,idle_bytes);}
         released
     }
     pub fn needs_upload_retry(&self)->bool {

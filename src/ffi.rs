@@ -1602,6 +1602,14 @@ pub unsafe extern "C" fn art3m1s_runtime_reclaim_video_gpu_cache(rt:*mut CoreRun
     unsafe{&mut *rt}.reclaim_video_gpu_cache(bytes)
 }
 
+/// Main/render thread only, outside runtime calls after the host GPU fence.
+#[cfg(all(target_os = "vita", feature = "gxm-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_reclaim_effect_gpu_cache(rt:*mut CoreRuntime,bytes:usize)->usize {
+    if rt.is_null(){return 0;}
+    unsafe{&mut *rt}.reclaim_effect_gpu_cache(bytes)
+}
+
 /// libmpv OpenGL resolver callback. `ctx` must be the runtime pointer supplied
 /// as `mpv_opengl_init_params.get_proc_address_ctx` by the host.
 #[cfg(feature = "gl-backend")]

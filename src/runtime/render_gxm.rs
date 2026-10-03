@@ -11,6 +11,9 @@ unsafe extern "C" {
 }
 
 impl CoreRuntime {
+    pub fn reclaim_effect_gpu_cache(&mut self,bytes:usize)->usize {
+        self.texture_provider.reclaim_effect_gpu_cache(bytes)
+    }
     pub fn reclaim_video_gpu_cache(&mut self,bytes:usize)->usize {
         self.texture_provider.reclaim_video_gpu_cache(bytes)
     }
