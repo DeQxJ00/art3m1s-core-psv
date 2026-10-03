@@ -22,6 +22,13 @@ pub struct TextureInfo {
 pub trait TextureProvider {
     fn resolve(&mut self, name: &str) -> Option<(TextureId, TextureInfo)>;
 
+    /// Plain alpha sprite only: optional physical crop, while `TextureInfo`
+    /// remains the original logical image size. Other uses resolve the full
+    /// texture independently (custom shaders, rule masks, pixel editing, etc.).
+    fn resolve_sprite(&mut self,name:&str)->Option<(TextureId,TextureInfo,Option<[u32;4]>)>{
+        self.resolve(name).map(|(id,size)|(id,size,None))
+    }
+
     /// Uploads raw RGBA pixels and returns a backend texture handle.
     fn upload_rgba(
         &mut self,

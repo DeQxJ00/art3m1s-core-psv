@@ -125,6 +125,17 @@ fn push_scene_command(
     else { frame.push(command); }
 }
 
+// Effects can depend on the full image's UV domain or intermediate bounds.
+// Keep that domain unchanged even when a child explicitly clears inheritance.
+fn sprite_crop_allowed(scene:&Scene,id:&str)->bool{
+    let mut current=Some(id);
+    while let Some(id)=current{
+        if scene.get(id).is_some_and(|l|l.props.shader.as_deref().is_some_and(|s|!s.is_empty())){return false;}
+        current=id.rsplit_once('.').map(|v|v.0);
+    }
+    true
+}
+
 /// 递归访问一个节点：合成本地变换，向子节点继承，产出绘制命令。
 #[allow(clippy::too_many_arguments)]
 fn visit(
@@ -149,7 +160,7 @@ fn visit(
         return;
     }
     let parent=super::build_cache::ParentState {transform:parent_transform,opacity:parent_opacity,
-        clip:parent_clip,shader:inherited_shader.clone(),keys:record_command_keys};
+        clip:parent_clip,shader:inherited_shader.clone(),keys:record_command_keys,crop_allowed:sprite_crop_allowed(scene,id)};
     if let Some(c)=cache.as_deref_mut() {
         if c.replay(scene,id,&parent,file_overrides,frame){return;}
     }
@@ -224,13 +235,20 @@ fn visit_uncached(
     let effective_file = override_name.or(layer.file.as_deref());
     if let Some(file) = effective_file
         && !file.is_empty()
-        && let Some((texture, info)) = match (&layer.mask, override_name) {
+        && let Some((texture, info, sprite_crop)) = match (&layer.mask, override_name) {
             // lyedit 结果已是最终像素，不再叠加蒙版。
-            (Some(mask), None) if !mask.is_empty() => provider.resolve_with_mask(file, mask),
-            _ => provider.resolve(file),
+            (Some(mask), None) if !mask.is_empty() => provider.resolve_with_mask(file, mask).map(|(id,size)|(id,size,None)),
+            _ if override_name.is_none()&&command_shader.is_none()&&props.clip_rect().is_none()
+                &&sprite_crop_allowed(scene,id)&&!layer.event_handlers.values().any(|h|h.enabled)
+                &&(intermediate_render||blend_mode(&props)==BlendMode::Alpha)
+                &&(intermediate_render||color_filter(&props).is_identity())=>provider.resolve_sprite(file),
+            _ => provider.resolve(file).map(|(id,size)|(id,size,None)),
         }
     {
         // 计算裁剪矩形
+        let (visual_world,visual_info)=if let Some([x,y,w,h])=sprite_crop{
+            (world*Affine2::from_translation(Vec2::new(x as f32,y as f32)),crate::render_pipeline::draw::TextureInfo{width:w,height:h})
+        }else{(world,info)};
         let clip = if let Some(clip_rect) = props.clip_rect() {
             let [x, y, w, h] = clip_rect;
             let tex_w = info.width as f32;
@@ -241,7 +259,7 @@ fn visit_uncached(
                 quad_size: [w, h],
             }
         } else {
-            ClipRect::full(info)
+            ClipRect::full(visual_info)
         };
         push_scene_command(frame, record_command_keys,
             id,
@@ -249,8 +267,8 @@ fn visit_uncached(
             0,
             DrawCommand {
                 texture,
-                size: info,
-                transform: world,
+                size: visual_info,
+                transform: visual_world,
                 opacity,
                 blend: if intermediate_render {
                     BlendMode::Alpha
@@ -628,6 +646,50 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    struct CroppedProvider { crop:bool }
+    impl TextureProvider for CroppedProvider {
+        fn resolve(&mut self,_:&str)->Option<(TextureId,TextureInfo)>{Some((TextureId(1),TextureInfo{width:1206,height:1971}))}
+        fn resolve_sprite(&mut self,n:&str)->Option<(TextureId,TextureInfo,Option<[u32;4]>)>{
+            let (id,info)=self.resolve(n)?;Some((id,info,self.crop.then_some([388,198,185,93])))
+        }
+        fn upload_rgba(&mut self,_:&str,_:u32,_:u32,_:&[u8])->Option<(TextureId,TextureInfo)>{None}
+    }
+    #[test] fn cropped_sprite_preserves_affine_coordinates_and_child_layout(){
+        for reverse in ["0","1"]{for rotate in ["0","37","180"]{
+            let mut scene=Scene::new();scene.create("1",Some("sprite".into()));scene.create("1.2",Some("child".into()));
+            scene.set_root_props(&raw(&[("left","13"),("top","7"),("zoom","80")]));
+            scene.set_props("1",&raw(&[("left","401"),("top","211"),("anchorx","603"),("anchory","985"),
+                ("xscale","73"),("yscale","121"),("reversex",reverse),("rotate",rotate)]));
+            scene.set_props("1.2",&raw(&[("left","91"),("top","127")]));
+            let full=build_frame(&scene,0,&mut CroppedProvider{crop:false},None);
+            let crop=build_frame(&scene,0,&mut CroppedProvider{crop:true},None);
+            for (original,trimmed) in full.commands.iter().zip(&crop.commands){
+                assert_eq!(trimmed.size,TextureInfo{width:185,height:93});
+                assert_eq!(trimmed.clip.uv_offset,[0.,0.]);assert_eq!(trimmed.clip.uv_scale,[1.,1.]);
+                for sample in [Vec2::ZERO,Vec2::new(92.5,46.5),Vec2::new(185.,93.)]{
+                    let a=original.transform.transform_point2(sample+Vec2::new(388.,198.));
+                    let b=trimmed.transform.transform_point2(sample);
+                    assert!((a-b).length()<0.001,"{a:?} != {b:?}");
+                }
+            }
+        }}
+    }
+    #[test] fn cropped_sprite_keeps_full_domain_for_clip_masks_effects_and_edits(){
+        for props in [vec![("clip","10,20,80,40")],vec![("shader","gray")],vec![("layermode","add")],vec![("grayscale","1")]]{
+            let mut scene=Scene::new();scene.create("1",Some("sprite".into()));scene.set_props("1",&raw(&props));
+            let full=build_frame(&scene,0,&mut CroppedProvider{crop:false},None);
+            assert_eq!(full,build_frame(&scene,0,&mut CroppedProvider{crop:true},None));
+        }
+        let mut scene=Scene::new();scene.create("1",Some("sprite".into()));scene.set_mask("1",Some("mask".into()));
+        assert_eq!(build_frame(&scene,0,&mut CroppedProvider{crop:false},None),build_frame(&scene,0,&mut CroppedProvider{crop:true},None));
+        scene.set_mask("1",None);scene.create("1.2",Some("child".into()));
+        scene.set_props("1",&raw(&[("shader","gray")]));scene.set_props("1.2",&raw(&[("shader","")]));
+        assert_eq!(build_frame(&scene,0,&mut CroppedProvider{crop:false},None),build_frame(&scene,0,&mut CroppedProvider{crop:true},None));
+        scene.set_props("1",&raw(&[("shader","")]));let overrides=HashMap::from([("1".into(),"edited".into()),("1.2".into(),"edited2".into())]);
+        assert_eq!(build_frame_with_content(&scene,0,&mut CroppedProvider{crop:false},None,None,Some(&overrides)),
+            build_frame_with_content(&scene,0,&mut CroppedProvider{crop:true},None,None,Some(&overrides)));
     }
 
     #[test]

@@ -249,7 +249,7 @@ impl CoreRuntime {
             used_files.insert(file);
         }
         self.texture_provider.set_save_image_directory(&self.savepath);
-        self.texture_provider.retain(&used_files);
+        self.texture_provider.retain_frame(&used_files,&frame,RenderPipeline::new(&self.compositor).is_transition_in_progress());
         super::surface_loader::retain_menu_images_resolving(||
             used_files.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect());
         if let Some(p) = profile.as_deref_mut() {

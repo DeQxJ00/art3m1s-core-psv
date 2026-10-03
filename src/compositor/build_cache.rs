@@ -11,6 +11,7 @@ pub(super) struct ParentState {
     pub clip: Option<[f32; 4]>,
     pub shader: Option<ShaderEffect>,
     pub keys: bool,
+    pub crop_allowed: bool,
 }
 struct Stamp {
     id: String,

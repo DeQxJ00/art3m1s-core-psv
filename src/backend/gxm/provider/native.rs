@@ -28,7 +28,7 @@ impl GxmTextureProvider {
         if id.0==self.next_id{self.next_id+=1;}
         self.revision=self.revision.wrapping_add(1).max(1);
         self.decoded.remove(name);self.encoded.remove(name);
-        self.entries.insert(name.into(),Entry{native_bytes,bc3:true,alpha_only:false,gray:false,id,info,
+        self.entries.insert(name.into(),Entry { sprite_crop:None,native_bytes,bc3:true,alpha_only:false,gray:false,id,info,
             rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque,revision:self.revision,
             last_used:self.cache_clock,cacheable:true,reclaimable:false,shared:true});
         self.ids.insert(id,name.into());
