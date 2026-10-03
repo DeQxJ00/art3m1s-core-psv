@@ -832,8 +832,13 @@ impl UserData for EngineApi {
             let hints=this.ctx.lock().unwrap().callbacks.preload_hints_enabled();
             let old=if hints{crate::preload_hints::data_table(lua,&path)}else{None};
 
+            let repaired = hints.then(|| crate::portrait_preload::repair_source(&path, &bytes)).flatten();
+            if repaired.is_some() {
+                this.ctx.lock().unwrap().callbacks.debug(1, "[surface-prefetch] enabled portrait-layer cache compatibility", true);
+            }
+
             // lua.load 接受 &[u8]，文本源码与 luac 字节码均可。
-            lua.load(&bytes[..])
+            lua.load(repaired.as_deref().unwrap_or(&bytes[..]))
                 .set_name(path.as_str())
                 .exec()
                 .map_err(|e| mlua::Error::external(format!("include 执行 {path} 失败: {e}")))?;
@@ -1389,6 +1394,11 @@ impl UserData for EngineApi {
         });
 
         // e:bindSurfaceAsync(key)
+        methods.add_method("preloadPortraitLayers", |lua, this, tag: mlua::Table| {
+            if !this.ctx.lock().unwrap().callbacks.preload_hints_enabled() { return Ok(false); }
+            crate::portrait_preload::preload(lua, &tag)
+        });
+
         methods.add_method("bindSurfaceAsync", |_lua, this, key: mlua::Value| {
             let key = lua_value_to_key(&key);
             let ctx = this.ctx.lock().unwrap();
@@ -1674,6 +1684,77 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires local portrait scripts and chapter via ARTEMIS_PORTRAIT_AUDIT"]
+    fn installed_portrait_cache_matches_rendered_layers_and_timeline() {
+        let root = std::path::PathBuf::from(std::env::var("ARTEMIS_PORTRAIT_AUDIT").unwrap());
+        let it = crate::Interpreter::new(Default::default());
+        let probe = EmoteProbe { preload_hints: true, ..Default::default() };
+        let bindings = probe.surface_binds.clone();
+        let logs = probe.logs.clone();
+        let mut ctx = EngineContext::new(Box::new(probe));
+        let files = root.clone();
+        ctx.file_reader = Some(Arc::new(move |p| Ok(std::fs::read(files.join(p))?)));
+        init_lua_engine_api(it.lua(), Arc::new(Mutex::new(ctx))).unwrap();
+        it.lua().load(r#"
+            e=__engine; conf={cachemode='large',cachemax=10000}; flg={}; csv={}; tags={};
+            game={fgext='.png'}; function checkWasm() return false end
+            function patch_checkfg() return false end
+            string.gfind=string.gmatch
+            e:include('system/table/list_windows.tbl')
+            e:include('system/adv/func.lua')
+            e:include('system/image/image.lua')
+            e:include('system/image/image_fg.lua')
+            e:include('system/image/cache.lua')
+            e:include('chapter.ast')
+        "#).exec().unwrap();
+        assert!(logs.lock().unwrap().iter().any(|s| s.contains("portrait-layer cache compatibility")));
+        let ast = it.lua().globals().raw_get::<mlua::Table>("ast").unwrap();
+        let stack = it.lua().globals().raw_get::<mlua::Function>("stackImageCache").unwrap();
+        let resolver = it.lua().globals().raw_get::<mlua::Function>("getMWFaceFile").unwrap();
+        let mut expected = std::collections::BTreeSet::new();
+        let mut commands = 0;
+        for entry in ast.clone().pairs::<String, mlua::Table>() {
+            let (block, tags) = entry.unwrap();
+            let mut sequences = vec![tags.clone()];
+            if let Ok(delay) = tags.raw_get::<mlua::Table>("delay") {
+                for entry in delay.pairs::<Value, mlua::Table>() { sequences.push(entry.unwrap().1); }
+            }
+            for tag in sequences.iter().flat_map(|t| t.sequence_values::<mlua::Table>()) {
+                let tag = tag.unwrap();
+                if tag.raw_get::<String>(1).ok().as_deref() != Some("fg") { continue; }
+                if !matches!(tag.raw_get::<i32>("mode"), Ok(1 | 3)) { continue; }
+                if tag.raw_get::<String>("file").is_err() { continue; }
+                stack.call::<()>(tag.clone()).unwrap();
+                let parts = resolver.call::<mlua::Table>((tag.clone(), true)).unwrap();
+                let prefix = parts.raw_get::<String>("path").unwrap();
+                let actual = crate::portrait_preload::paths(it.lua(), &tag);
+                for part in parts.pairs::<Value, Value>() {
+                    if let (_, Value::Table(part)) = part.unwrap() {
+                        let path = format!("{}{}.png", prefix, part.raw_get::<String>("file").unwrap());
+                        assert!(actual.contains(&path), "missing portrait binding: {path}");
+                        expected.insert(path);
+                    }
+                }
+                it.lua().globals().set("scr", it.lua().create_table_from([
+                    ("ip", it.lua().create_table_from([("file", "chapter"), ("block", block.as_str())]).unwrap())
+                ]).unwrap()).unwrap();
+                let mut cursor = crate::SurfaceTimelineCursor::default();
+                if let Some(plan) = it.query_surface_timeline(&mut cursor) {
+                    for path in actual { assert!(plan.contains(&path), "portrait absent from story plan: {path}"); }
+                }
+                commands += 1;
+            }
+        }
+        let got = bindings.lock().unwrap();
+        for path in &expected { assert!(got.contains(path)); }
+        let unique: std::collections::HashSet<_> = got.iter().collect();
+        assert_eq!(unique.len(), got.len(), "no duplicate host reference counts");
+        assert!(commands > 0 && expected.len() > 1);
+        std::fs::write(root.join("portrait-preload-paths.json"), serde_json::to_vec_pretty(&expected).unwrap()).unwrap();
+        println!("portrait commands={commands} unique_layers={} host_bindings={}", expected.len(), got.len());
+    }
+
+    #[test]
     fn include_missing_logs_and_continues_in_same_vm() {
         let lua = Lua::new();
         let probe = EmoteProbe::default();
@@ -1741,12 +1822,16 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct EmoteProbe {
+        preload_hints: bool,
+        surface_binds: Arc<Mutex<Vec<String>>>,
         logs: Arc<Mutex<Vec<String>>>,
         created: Arc<Mutex<Vec<(String, Vec<String>, u32, u32)>>>,
         commands: Arc<Mutex<Vec<(String, bool, EmoteLayerCommand)>>>,
     }
 
     impl EngineCallbacks for EmoteProbe {
+        fn preload_hints_enabled(&self) -> bool { self.preload_hints }
+        fn bind_surface_async(&self, key: &str) { self.surface_binds.lock().unwrap().push(key.into()); }
         fn debug(&self, _level: i32, data: &str, _raw: bool) {
             self.logs.lock().unwrap().push(data.to_owned());
         }

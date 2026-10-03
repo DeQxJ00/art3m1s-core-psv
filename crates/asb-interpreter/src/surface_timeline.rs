@@ -1,7 +1,7 @@
 //! Read-only hints for the standard Lua AST/cache protocol. No game functions,
 //! file reads, condition evaluation, or mutation of the game's binding table.
 use crate::Interpreter;
-use mlua::{Table, Value};
+use mlua::{Lua, Table, Value};
 use std::collections::{HashMap, HashSet};
 
 const MAX_BLOCKS: usize = 1024;
@@ -22,6 +22,7 @@ pub struct SurfaceTimelineCursor {
     // then walk these small lists when the dialogue block changes.
     blocks: HashMap<String, Option<BlockImages>>,
     tags_left: usize,
+    portrait_epoch: u64,
 }
 
 fn table(t: &Table, key: &str) -> Option<Table> { t.raw_get(key).ok() }
@@ -35,7 +36,7 @@ fn text(t: &Table, key: &str) -> Option<String> {
     }
 }
 
-fn read_block(
+fn read_block(lua: &Lua,
     tags: &Table, bound: &Table, ext: Option<&str>, fields: &[String], budget: &mut usize,
 ) -> Option<BlockImages> {
     let mut paths = Vec::new();
@@ -55,6 +56,7 @@ fn read_block(
                         if let Some(f) = text(&tag, field) { candidates.push(format!("{p}{f}{ext}")); }
                     }
                 }
+                candidates.extend(crate::portrait_preload::paths(lua, &tag));
             }
             Some("fgf") => {
                 if let Some(f) = text(&tag, "bg") { candidates.push(f); }
@@ -99,9 +101,11 @@ impl Interpreter {
         let ip = table(&table(&g, "scr")?, "ip")?;
         let bound = table(&table(&g, "cachebuff")?, "img")?;
         let position = (text(&ip, "file")?, text(&ip, "block")?);
+        let portrait_epoch = crate::portrait_preload::epoch(self.lua());
         let same_tables = cursor.ast.as_ref().is_some_and(|a| a.to_pointer() == ast.to_pointer())
             && cursor.bindings.as_ref().is_some_and(|a| a.to_pointer() == bound.to_pointer())
-            && cursor.position.as_ref().is_some_and(|p| p.0 == position.0);
+            && cursor.position.as_ref().is_some_and(|p| p.0 == position.0)
+            && cursor.portrait_epoch == portrait_epoch;
         if same_tables && cursor.position.as_ref() == Some(&position) { return None; }
         if !same_tables {
             cursor.blocks.clear();
@@ -111,6 +115,7 @@ impl Interpreter {
         cursor.ast = Some(ast.clone());
         cursor.bindings = Some(bound.clone());
         cursor.position = Some(position.clone());
+        cursor.portrait_epoch = portrait_epoch;
         let ext = table(&g, "game").and_then(|t| text(&t, "fgext"));
         let mut fields = Vec::new();
         if let Some(t) = table(&g, "init").and_then(|t| table(&t, "fgid")) {
@@ -130,7 +135,7 @@ impl Interpreter {
             if !cursor.blocks.contains_key(&block) {
                 if cursor.blocks.len() >= MAX_BLOCKS { return None; }
                 let images = ast.raw_get::<Table>(block.as_str()).ok().and_then(|tags|
-                    read_block(&tags, &bound, ext.as_deref(), &fields, &mut cursor.tags_left));
+                    read_block(self.lua(), &tags, &bound, ext.as_deref(), &fields, &mut cursor.tags_left));
                 cursor.blocks.insert(block.clone(), images);
             }
             let images = cursor.blocks.get(&block)?.as_ref()?;
@@ -148,6 +153,35 @@ impl Interpreter {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]
+    fn portrait_bindings_refresh_same_position_follow_story_and_never_run_the_helper() {
+        let it = Interpreter::new(Default::default());
+        it.lua().load(r#"
+            scr={ip={file='chapter',block='a',count=1}}; game={fgext='.png'};
+            init={fgid={file=0,file1=1}}; cachebuff={img={}};
+            ast={a={{'fg',file='one',path=':fg/',mode=1},linknext='b'},
+                 b={{'fg',file='two',path=':fg/',mode=1}}};
+            function getMWFaceFile(p, flag)
+                return {path=':fa/',file={file=p.file},file1={file=p.file..'_face'}}
+            end
+            function setImageStack(p) cachebuff.img[p]=true end
+        "#).exec().unwrap();
+        let mut cursor = SurfaceTimelineCursor::default();
+        assert!(it.query_surface_timeline(&mut cursor).unwrap().is_empty());
+        let ast = it.lua().globals().raw_get::<Table>("ast").unwrap();
+        for block in ["a", "b"] {
+            let tag = ast.raw_get::<Table>(block).unwrap().raw_get::<Table>(1).unwrap();
+            assert!(crate::portrait_preload::preload(it.lua(), &tag).unwrap());
+        }
+        it.lua().load("function getMWFaceFile() error('timeline must not evaluate helpers') end").exec().unwrap();
+        assert_eq!(it.query_surface_timeline(&mut cursor).unwrap(),
+            [":fa/one.png", ":fa/one_face.png", ":fa/two.png", ":fa/two_face.png"]);
+        assert!(it.query_surface_timeline(&mut cursor).is_none());
+        it.lua().load("scr.ip.block='b'").exec().unwrap();
+        assert_eq!(it.query_surface_timeline(&mut cursor).unwrap(), [":fa/two.png", ":fa/two_face.png"]);
+        it.lua().load("scr.ip.block='a'").exec().unwrap();
+        assert_eq!(it.query_surface_timeline(&mut cursor).unwrap().len(), 4);
+    }
     #[test] fn follows_position_preserves_future_reuse_and_does_not_call_game_code(){
         let it=Interpreter::new(Default::default());
         it.lua().load(r#"
