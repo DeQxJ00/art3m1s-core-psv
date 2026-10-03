@@ -6,6 +6,30 @@ const MAGIC:u32=0x31504641;
 
 pub(crate) struct TileProof { width:u32,height:u32,cells:Tracked<Vec<u8>> }
 impl TileProof {
+    /// Reuse the decoder's exact alpha bounds; no second image scan. Include
+    /// the bilinear footprint and require an actual aligned GPU allocation win.
+    pub fn sprite_crop(&self)->Option<[u32;4]>{
+        let c=self.certificate_for_size(self.width,self.height)?;
+        let word=|i:usize|u32::from_le_bytes(c[i*4..i*4+4].try_into().unwrap());
+        let (l,t,r,b)=(word(3),word(4),word(5),word(6));
+        if l>=r||t>=b||r>self.width||b>self.height{return None;}
+        let x=l.saturating_sub(1);let y=t.saturating_sub(1);
+        let w=r.saturating_add(1).min(self.width)-x;let h=b.saturating_add(1).min(self.height)-y;
+        let allocation=|w:u32,h:u32|((((w as u64+7)&!7)*h as u64*4+262143)/262144)*262144;
+        (allocation(w,h)<allocation(self.width,self.height)).then_some([x,y,w,h])
+    }
+    pub fn cropped_sprite_proof(&self,rect:[u32;4])->Option<Self>{
+        if self.sprite_crop()!=Some(rect){return None;}
+        let [x,y,w,h]=rect;let c=self.certificate_for_size(self.width,self.height)?;
+        let word=|i:usize|u32::from_le_bytes(c[i*4..i*4+4].try_into().unwrap());
+        let mut p=Self::allocate(w,h)?;
+        // Zero tile flags mean not certified opaque. False negatives only
+        // retain blending; shifted 64x64 tiles must never inherit false claims.
+        for (i,v) in [MAGIC,w,h,word(3)-x,word(4)-y,word(5)-x,word(6)-y,0].into_iter().enumerate(){
+            p.cells[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+        }
+        Some(p)
+    }
     fn allocate(width:u32,height:u32)->Option<Self>{
         if width==0||height==0{return None;}
         let columns=(width as usize).checked_add(63)?/64;
@@ -84,6 +108,23 @@ impl TileProof {
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn sprite_crop_reuses_alpha_bounds_with_guard_and_allocation_gate(){
+        let mut image=image::RgbaImage::from_pixel(1206,1971,image::Rgba([87,29,11,0]));
+        assert!(TileProof::for_prepared_upload(&image).unwrap().sprite_crop().is_none());
+        for y in 199..290{for x in 389..572{image.put_pixel(x,y,image::Rgba([91,13,7,1]));}}
+        let p=TileProof::for_prepared_upload(&image).unwrap();
+        let rect=[388,198,185,93];assert_eq!(p.sprite_crop(),Some(rect));
+        let cropped=p.cropped_sprite_proof(rect).unwrap();
+        let words:Vec<_>=cropped.certificate_for_size(185,93).unwrap()[..32].chunks_exact(4)
+            .map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert_eq!(words,[MAGIC,185,93,1,1,184,92,0]);
+        assert!(cropped.for_size(185,93).unwrap().iter().all(|&v|v==0));
+        assert!(p.cropped_sprite_proof([389,199,183,91]).is_none());
+        // No aligned allocation saving for tiny pictures; no trim for full alpha.
+        assert!(TileProof::for_opaque_pixels(1206,1971).unwrap().sprite_crop().is_none());
+        assert!(TileProof::for_prepared_upload(&image::RgbaImage::from_fn(64,64,|x,y|
+            image::Rgba([0,0,0,if x==31&&y==31{255}else{0}]))).unwrap().sprite_crop().is_none());
+    }
     #[test] fn rgb24_certificate_matches_full_scan_at_any_size(){
         for (w,h) in [(1,1),(65,17),(1920,1080)]{
             let image=image::RgbaImage::from_fn(w,h,|x,y|image::Rgba([x as u8,y as u8,17,255]));

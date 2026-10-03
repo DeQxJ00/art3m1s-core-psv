@@ -15,6 +15,7 @@ unsafe extern "C" {
 pub(super) struct WarmUpload {
     pub(super) name: String,
     info: TextureInfo,
+    sprite_crop: Option<(TextureInfo,[u32;4])>,
     pixels: Tracked<Vec<u8>>,
     sparse:bool,
     restore:crate::cpu_image_compression::Restore,
@@ -27,7 +28,9 @@ pub(super) struct WarmUpload {
     max_us: u64,
 }
 impl WarmUpload {
-    fn gpu_bytes(&self) -> usize { ((self.info.width as usize + 7) & !7) * self.info.height as usize * 4 }
+    fn gpu_bytes(&self) -> usize {
+        if self.sprite_crop.is_some(){super::sparse::allocation_bytes(self.info)}else{((self.info.width as usize + 7) & !7) * self.info.height as usize * 4}
+    }
     fn parts(&self) -> CacheParts {
         CacheParts { decoded: self.pixels.capacity(), encoded: self.source.as_ref().map_or(0, |p|p.capacity()),
             proof: self.proof.as_ref().map_or(0, TileProof::bytes),
@@ -89,7 +92,7 @@ impl GxmTextureProvider {
             if self.warm.tick % 4 != 0 || self.warm.plan.is_empty() || self.warm.admitted >= PLAN_BYTES { return; }
             let i = self.warm.cursor % self.warm.plan.len(); self.warm.cursor += 1;
             let name = self.warm.plan[i].clone();
-            if self.entries.contains_key(&name) || self.decoded.contains_key(&name) { return; }
+            if self.entries.contains_key(&name) || self.entries.contains_key(&super::sparse::sprite_key(&name)) || self.decoded.contains_key(&name) { return; }
             // No cache eviction or GPU fence to make speculative space.
             if self.idle_parts().gpu + MAX_IMAGE_BYTES > IDLE_GPU_BUDGET
                 || unsafe { art3m1s_gxm_surface_warm_allowed(MAX_IMAGE_BYTES) } <= 0 { return; }
@@ -107,7 +110,10 @@ impl GxmTextureProvider {
             // Keep the source certificate with the original encoded bytes.
             // Generate the forced-alpha upload certificate only at publication.
             let mut source=source; if let Some(p)=source.as_mut(){p.transfer(Owner::Provider);}
-            self.warm.job = Some(WarmUpload { name, info, pixels, sparse,restore:crate::cpu_image_compression::Restore::new(),proof, source, surface:None, row:0,steps:0,work_us:0,max_us:0 });
+            let sprite_crop=if sparse{proof.as_ref().filter(|p|p.certificate_for_size(info.width,info.height).is_some())
+                .and_then(TileProof::sprite_crop).map(|r|(info,r))}else{None};
+            let info=sprite_crop.map_or(info,|(_, [_,_,width,height])|TextureInfo{width,height});
+            self.warm.job = Some(WarmUpload { name, info, sprite_crop, pixels, sparse,restore:crate::cpu_image_compression::Restore::new(),proof, source, surface:None, row:0,steps:0,work_us:0,max_us:0 });
             self.update_warm_account();
             return; // acquiring READY and allocating GPU memory use separate frames
         }
@@ -131,7 +137,10 @@ impl GxmTextureProvider {
         } else if self.warm.job.as_ref().unwrap().row < self.warm.job.as_ref().unwrap().info.height as usize {
             let job = self.warm.job.as_mut().unwrap();
             if job.sparse{
-                match super::sparse::restore_step(job.surface.as_ref().unwrap().handle,&job.pixels,&mut job.restore){
+                let restored=if let Some((_,rect))=job.sprite_crop{
+                    super::sparse::restore_crop_step(job.surface.as_ref().unwrap().handle,&job.pixels,&mut job.restore,rect)
+                }else{super::sparse::restore_step(job.surface.as_ref().unwrap().handle,&job.pixels,&mut job.restore)};
+                match restored{
                     Some(true)=>job.row=job.info.height as usize,
                     Some(false)=>{},None=>{self.cancel_warm_upload();return;}
                 }
@@ -152,7 +161,8 @@ impl GxmTextureProvider {
             let force_opaque=!self.warm.job.as_ref().unwrap().sparse&&self.background_alpha_ignored(&self.warm.job.as_ref().unwrap().name);
             let job = self.warm.job.as_mut().unwrap();
             let forced_proof=force_opaque.then(||TileProof::for_opaque_pixels(job.info.width,job.info.height)).flatten();
-            let proof=if force_opaque {forced_proof.as_ref()}else{job.proof.as_ref()};
+            let cropped_proof=job.sprite_crop.and_then(|(_,r)|job.proof.as_ref()?.cropped_sprite_proof(r));
+            let proof=if force_opaque {forced_proof.as_ref()}else{cropped_proof.as_ref().or(job.proof.as_ref())};
             let Some(cells)=proof.and_then(|p|p.certificate_for_size(job.info.width,job.info.height)) else {
                 self.cancel_warm_upload(); return;
             };
@@ -165,14 +175,15 @@ impl GxmTextureProvider {
             self.next_id += 1; self.revision = self.revision.wrapping_add(1).max(1);
             let opaque=force_opaque || job.proof.as_ref().and_then(|p|p.opaque_for_size(job.info.width,job.info.height)).unwrap_or(false);
             let(pixels,source)=if job.sparse{(Tracked::bytes(Vec::new(),Owner::Provider),Some(job.pixels))}else{(job.pixels,job.source)};
-            self.entries.insert(job.name.clone(),Entry {id,info:job.info,rgba:pixels,opaque,revision:self.revision,
+            let key=if job.sprite_crop.is_some(){super::sparse::sprite_key(&job.name)}else{job.name.clone()};
+            self.entries.insert(key.clone(),Entry { sprite_crop:job.sprite_crop,id,info:job.info,rgba:pixels,opaque,revision:self.revision,
                 last_used:self.cache_clock,cacheable:true,reclaimable:true,shared:true,gray:false,alpha_only:false,native_bytes:0,bc3:false});
-            self.ids.insert(id,job.name.clone());
+            self.ids.insert(id,key);
             // Keep the delivered source under the existing compressed cap.
             if let Some(source)=source {self.keep_encoded(&job.name,source,job.proof);}
             self.update_warm_account();
-            crate::core_info!("GXM warm-upload name={} size={}x{} steps={} work_us={} max_step_us={} bytes_per_step={}",
-                job.name,job.info.width,job.info.height,job.steps+1,job.work_us+elapsed_us(started),job.max_us.max(elapsed_us(started)),COPY_BYTES);
+            crate::core_info!("GXM warm-upload name={} size={}x{} crop={:?} steps={} work_us={} max_step_us={} bytes_per_step={}",
+                job.name,job.info.width,job.info.height,job.sprite_crop.map(|v|v.1),job.steps+1,job.work_us+elapsed_us(started),job.max_us.max(elapsed_us(started)),COPY_BYTES);
             return;
         }
         let us=elapsed_us(started);
