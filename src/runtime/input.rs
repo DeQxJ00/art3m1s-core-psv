@@ -4,6 +4,8 @@ use super::callbacks::{
 };
 use super::{CoreRuntime, InlineEventFrame};
 use crate::compositor::Compositor;
+use crate::compositor::reduce::InputHandler;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 impl CoreRuntime {
@@ -277,16 +279,16 @@ impl CoreRuntime {
                 continue;
             }
             let key_string = key.to_string();
+            let binding = resolve_input_binding(&self.interpreter, &self.compositor, "push", &key_string);
             if should_dispatch_push(
                 bits,
-                handler_keyrepeat(&self.compositor, "push", &key_string),
+                binding.as_ref().is_some_and(|h| h.params.get("keyrepeat").is_some_and(|v| v == "1")),
             ) {
                 let event_type = if is_mouse_button(key) { "click" } else { "key" };
-                let dispatch = enqueue_input_handler(
+                let dispatch = dispatch_input_binding(
                     &self.interpreter,
-                    &self.compositor,
                     "push",
-                    &key_string,
+                    binding.as_deref(),
                     &[("key", &key_string), ("type", event_type)],
                 );
                 needs_inline_event_frame |= dispatch.needs_return_frame;
@@ -671,13 +673,6 @@ fn key_blocks_default_role(key: u32, pointer_claimed: bool) -> bool {
     key == 1 && pointer_claimed
 }
 
-fn handler_keyrepeat(compositor: &Compositor, event_name: &str, key: &str) -> bool {
-    compositor
-        .get_input_handler(event_name, key)
-        .and_then(|handler| handler.params.get("keyrepeat"))
-        .is_some_and(|value| value == "1")
-}
-
 /// 计算拖动起始状态：只要求图层存在（能取到 offset），不做 draggable /
 /// 处理器 / 鼠标悬停检查——这是 `[lydrag]` 强制拖动语义的核心。
 fn forced_drag_state(
@@ -754,7 +749,7 @@ fn event_dispatch_layers(
 mod tests {
     use super::super::callbacks::{InputSnapshot, OVERRIDE_IS_DECIDE, OVERRIDE_IS_DOWN, OVERRIDE_IS_DOWN_EDGE, OVERRIDE_IS_PUSH};
     #[cfg(feature = "gxm-menu-key-alias")]
-    use super::{has_native_menu_definition, resolve_host_action_key};
+    use super::{has_native_menu_definition, resolve_host_action_key, resolve_input_binding};
     use super::{
         InlineEventFrame, dispatch_handler, enqueue_handler_tags, enqueue_input_handler,
         enqueue_layer_handler, event_dispatch_layers, forced_drag_state,
@@ -864,7 +859,7 @@ mod tests {
         };
         compositor.apply_event(&bind("113", "AUTO"));
         assert_eq!(resolve_host_action_key(&compositor, "AUTO"), 113);
-        // PCSG01297 uses the same key for MENU and moves AUTO to 114.
+        // Another key table uses the same key for MENU and moves AUTO to 114.
         compositor.apply_event(&bind("113", "MENU"));
         compositor.apply_event(&bind("114", "AUTO"));
         assert_eq!(resolve_host_action_key(&compositor, "AUTO"), 114);
@@ -873,6 +868,8 @@ mod tests {
         // Never return pointer buttons or a high code rejected by Lua's cap.
         compositor.apply_event(&bind("1", "SAVE"));
         compositor.apply_event(&bind("262", "SAVE"));
+        assert_eq!(resolve_host_action_key(&compositor, "SAVE"), 220);
+        compositor.apply_event(&bind("220", "OTHER"));
         assert_eq!(resolve_host_action_key(&compositor, "SAVE"), 0);
         let mut alias = Compositor::new();
         alias.apply_event(&bind("256", "MENU"));
@@ -929,6 +926,117 @@ mod tests {
         assert!(enqueue_input_handler(&interpreter,&compositor,"push","225",&[("key","225")]).queued);
         interpreter.flush_pending_tags().unwrap();
         assert_eq!(interpreter.lua().globals().get::<String>("action").unwrap(),"EXISTING");
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
+    fn console_save_load_aliases_keep_original_filter_and_low_dispatch_key() {
+        let mut interpreter = Interpreter::new(InterpreterConfig::default());
+        interpreter.lua().load(r#"
+            action = ''; blocked = false
+            function dispatch_action(e,p)
+                assert(tonumber(p.key) <= 226)
+                action = p.adv
+            end
+            __engine:setEventFilter(function(e, name, p)
+                assert(name == 'setonpush')
+                filtered_key = tonumber(p.key)
+                if blocked then return 1 end
+                return 0
+            end)
+        "#).exec().unwrap();
+        let mut compositor = Compositor::new();
+        for (source, alias, action) in [("262", "220", "SAVE"), ("263", "219", "LOAD")] {
+            compositor.apply_event(&Event::SetEventHandler {
+                event_name: "push".into(), file: None, label: None, call: false,
+                handler: Some("calllua".into()), extra_params: HashMap::from([
+                    ("key".into(), source.into()), ("adv".into(), action.into()),
+                    ("function".into(), "dispatch_action".into()),
+                ]),
+            });
+            assert_eq!(resolve_host_action_key(&compositor, action), alias.parse::<u32>().unwrap());
+            let dispatch = enqueue_input_handler(&interpreter, &compositor, "push", alias, &[("key", alias)]);
+            assert!(dispatch.queued && dispatch.needs_return_frame);
+            interpreter.flush_pending_tags().unwrap();
+            assert_eq!(interpreter.lua().globals().get::<String>("action").unwrap(), action);
+            assert_eq!(interpreter.lua().globals().get::<u32>("filtered_key").unwrap(), source.parse::<u32>().unwrap());
+        }
+        interpreter.lua().load("blocked = true; action = ''").exec().unwrap();
+        let dispatch = enqueue_input_handler(&interpreter, &compositor, "push", "220", &[("key", "220")]);
+        assert_eq!(dispatch.outcome, DispatchOutcome::SuppressedSuccess);
+        assert!(!dispatch.queued && !dispatch.needs_return_frame);
+        interpreter.flush_pending_tags().unwrap();
+        assert_eq!(interpreter.lua().globals().get::<String>("action").unwrap(), "");
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
+    fn missing_directions_follow_current_ui_and_preserve_registered_keys() {
+        let mut interpreter = Interpreter::new(InterpreterConfig::default());
+        interpreter.lua().load(r#"
+            mode = 'adv'; action = ''; cursor = 0; blocked = false
+            function getGameMode() return mode end
+            btn = {name='history', history={key={
+                UP={rep=true, delta=-1}, DW={rep=true, delta=1}
+            }}}
+            function setonpush_calllua(e,p)
+                if mode == 'adv' then action = p.adv
+                else
+                    local entry = btn[btn.name].key[p.ui]
+                    if entry then cursor = cursor + entry.delta end
+                end
+            end
+            __engine:setEventFilter(function(e, name, p)
+                if blocked then return 1 end
+                return 0
+            end)
+        "#).exec().unwrap();
+        let mut compositor = Compositor::new();
+        let bind = |key: &str, action: &str| Event::SetEventHandler {
+            event_name: "push".into(), file: None, label: None, call: false,
+            handler: Some("calllua".into()), extra_params: HashMap::from([
+                ("key".into(), key.into()), ("adv".into(), action.into()),
+                ("ui".into(), action.into()), ("function".into(), "setonpush_calllua".into()),
+            ]),
+        };
+        compositor.apply_event(&bind("13", "CLICK"));
+        compositor.apply_event(&bind("82", "BACKLOG"));
+        compositor.apply_event(&bind("112", "QSAVE"));
+        compositor.apply_event(&bind("113", "QLOAD"));
+        for (key, action) in [("38", "BACKLOG"), ("40", "CLICK"), ("37", "QSAVE"), ("39", "QLOAD")] {
+            assert!(enqueue_input_handler(&interpreter, &compositor, "push", key, &[("key", key)]).queued);
+            interpreter.flush_pending_tags().unwrap();
+            assert_eq!(interpreter.lua().globals().get::<String>("action").unwrap(), action);
+        }
+        interpreter.lua().load("scr = {select={}}").exec().unwrap();
+        assert_eq!(resolve_input_binding(&interpreter, &compositor, "push", "38").unwrap().params["adv"], "UP");
+        assert!(resolve_input_binding(&interpreter, &compositor, "push", "37").is_none());
+        interpreter.lua().load("scr.select.yesno = true").exec().unwrap();
+        assert_eq!(resolve_input_binding(&interpreter, &compositor, "push", "37").unwrap().params["adv"], "LT");
+        interpreter.lua().load("scr.select = nil").exec().unwrap();
+        interpreter.lua().load("mode = 'ui'").exec().unwrap();
+        for (key, cursor) in [("38", -1), ("40", 0)] {
+            let binding = resolve_input_binding(&interpreter, &compositor, "push", key).unwrap();
+            assert_eq!(binding.params.get("keyrepeat").map(String::as_str), Some("1"));
+            assert!(enqueue_input_handler(&interpreter, &compositor, "push", key, &[("key", key)]).queued);
+            interpreter.flush_pending_tags().unwrap();
+            assert_eq!(interpreter.lua().globals().get::<i32>("cursor").unwrap(), cursor);
+        }
+        // An undeclared UI direction must never leak through to quick-save.
+        assert!(resolve_input_binding(&interpreter, &compositor, "push", "37").is_none());
+        interpreter.lua().load("blocked = true").exec().unwrap();
+        assert!(!enqueue_input_handler(&interpreter, &compositor, "push", "38", &[("key", "38")]).queued);
+        interpreter.lua().load("blocked = false; btn.name = 'other'").exec().unwrap();
+        assert!(resolve_input_binding(&interpreter, &compositor, "push", "38").is_none());
+        // No optional metadata probe may execute a metatable callback.
+        interpreter.lua().load("btn = setmetatable({}, {__index=function() error('side effect') end})").exec().unwrap();
+        assert!(resolve_input_binding(&interpreter, &compositor, "push", "38").is_none());
+        compositor.apply_event(&bind("38", "EXISTING"));
+        assert_eq!(resolve_input_binding(&interpreter, &compositor, "push", "38").unwrap().params["adv"], "EXISTING");
+        // Other event types and other dispatch frameworks remain untouched.
+        assert!(resolve_input_binding(&interpreter, &compositor, "release", "40").is_none());
+        let empty = Compositor::new();
+        assert!(resolve_input_binding(&interpreter, &empty, "push", "40").is_none());
     }
 
     #[test]
@@ -1729,6 +1837,19 @@ fn enqueue_layer_handler(
 }
 
 #[cfg(feature = "gxm-menu-key-alias")]
+const HOST_ACTION_ALIASES: &[(&str, &str)] = &[
+    ("225", "MENU"), ("224", "AUTO"), ("223", "BACKLOG"),
+    ("222", "QSAVE"), ("221", "QLOAD"), ("220", "SAVE"),
+    ("219", "LOAD"), ("218", "CONFIG"), ("217", "CLICK"),
+];
+
+#[cfg(feature = "gxm-menu-key-alias")]
+fn native_action_handler<'a>(compositor: &'a Compositor, action: &str) -> Option<&'a InputHandler> {
+    (256..=271).find_map(|key| compositor.get_input_handler("push", &key.to_string())
+        .filter(|h| h.params.get("adv").is_some_and(|v| v == action)))
+}
+
+#[cfg(feature = "gxm-menu-key-alias")]
 fn resolve_host_action_key(compositor: &Compositor, action: &str) -> u32 {
     // Prefer ordinary keyboard keys over pointer events and console-only
     // codes; both input filters and the game's normal key dispatcher still run.
@@ -1738,13 +1859,94 @@ fn resolve_host_action_key(compositor: &Compositor, action: &str) -> u32 {
             return key;
         }
     }
-    if action == "MENU"
-        && compositor.get_input_handler("push", "225").is_none()
-        && compositor.get_input_handler("push", "256")
-            .is_some_and(|h| h.params.get("adv").is_some_and(|v| v == "MENU")) {
-        return 225;
+    if let Some((key, _)) = HOST_ACTION_ALIASES.iter().find(|(_, name)| *name == action) {
+        if compositor.get_input_handler("push", key).is_none()
+            && native_action_handler(compositor, action).is_some() {
+            return key.parse().unwrap_or(0);
+        }
     }
     0
+}
+
+fn resolve_input_binding<'a>(
+    interpreter: &asb_interpreter::Interpreter,
+    compositor: &'a Compositor,
+    event_name: &str,
+    key: &str,
+) -> Option<Cow<'a, InputHandler>> {
+    if let Some(binding) = compositor.get_input_handler(event_name, key) {
+        return Some(Cow::Borrowed(binding));
+    }
+    #[cfg(feature = "gxm-menu-key-alias")]
+    if event_name == "push" {
+        // Deliver a low key accepted by PC Lua dispatchers, but preserve the
+        // registered console action and its original event-filter parameters.
+        if let Some((_, action)) = HOST_ACTION_ALIASES.iter().find(|(alias, _)| *alias == key) {
+            return native_action_handler(compositor, action).map(Cow::Borrowed);
+        }
+        return missing_direction_binding(interpreter, compositor, key);
+    }
+    let _ = interpreter;
+    None
+}
+
+#[cfg(feature = "gxm-menu-key-alias")]
+fn missing_direction_binding<'a>(
+    interpreter: &asb_interpreter::Interpreter,
+    compositor: &'a Compositor,
+    key: &str,
+) -> Option<Cow<'a, InputHandler>> {
+    let (direction, adv_action) = match key {
+        "37" => ("LT", "QSAVE"), "38" => ("UP", "BACKLOG"),
+        "39" => ("RT", "QLOAD"), "40" => ("DW", "CLICK"),
+        _ => return None,
+    };
+    // Only supplement the standard script dispatcher, and only from the
+    // current UI's declared actions. Never call save/backlog functions directly
+    // or bypass transition, disabled-button and event-filter checks.
+    let template = compositor.get_input_handler("push", "13").filter(|h|
+        h.handler.as_deref() == Some("calllua")
+        && h.params.get("function").is_some_and(|v| v == "setonpush_calllua"))?;
+    let (mode, available, repeat) = interpreter.lua().load(r#"
+        local direction = ...
+        local function field(t, k)
+            if type(t) == 'table' then return rawget(t, k) end
+        end
+        local f = rawget(_G, 'getGameMode')
+        if type(f) ~= 'function' then return '', false, false end
+        local mode = f()
+        if mode == 'adv' then
+            local selection = field(rawget(_G, 'scr'), 'select')
+            if type(selection) == 'table' then
+                local vertical = direction == 'UP' or direction == 'DW'
+                return 'select', vertical or not not field(selection, 'yesno'), vertical
+            end
+            return mode, false, false
+        end
+        if mode ~= 'ui' and mode ~= 'dlg' and mode ~= 'system' then
+            return '', false, false
+        end
+        local b = rawget(_G, 'btn')
+        local name = field(b, 'name')
+        local group = name and field(b, name)
+        local p = field(field(group, 'key'), direction)
+        return mode, type(p) == 'table', not not field(p, 'rep')
+    "#).call::<(String, bool, bool)>(direction).ok()?;
+    if mode == "adv" {
+        let action_key = resolve_host_action_key(compositor, adv_action);
+        if action_key == 0 { return None; }
+        return compositor.get_input_handler("push", &action_key.to_string())
+            .or_else(|| native_action_handler(compositor, adv_action)).map(Cow::Borrowed);
+    }
+    if !available { return None; }
+    let mut binding = template.clone();
+    for params in [&mut binding.params, &mut binding.filter_params] {
+        for (name, value) in [("key", key), ("adv", direction), ("ui", direction),
+                              ("btn", direction), ("keyrepeat", if repeat { "1" } else { "0" })] {
+            params.insert(name.into(), value.into());
+        }
+    }
+    Some(Cow::Owned(binding))
 }
 
 #[cfg(feature = "gxm-menu-key-alias")]
@@ -1752,7 +1954,7 @@ fn has_native_menu_definition(interpreter: &asb_interpreter::Interpreter) -> boo
     // Called only on an explicit menu request, never on the render path.
     // Use raw access so probing optional script metadata cannot invoke game
     // metatable callbacks. A leftover menu.lua or a background-only table is
-    // not a usable menu (SHUF00002 ships precisely such an empty definition).
+    // not a usable menu.
     interpreter.lua().load(r#"
         local c = rawget(_G, 'csv')
         if type(c) ~= 'table' then return false end
@@ -1776,17 +1978,16 @@ fn enqueue_input_handler(
     key: &str,
     runtime_params: &[(&str, &str)],
 ) -> HandlerDispatch {
-    let binding = compositor.get_input_handler(event_name, key);
-    #[cfg(feature = "gxm-menu-key-alias")]
-    let binding = binding.or_else(|| {
-        // Some PC-derived scripts register the native MENU key (256), yet
-        // reject key numbers above 226 in their Lua dispatcher. Keep the
-        // registered action and event filters, but deliver the low host alias.
-        // Never override an existing binding, and never alias an unrelated key.
-        if event_name != "push" || key != "225" { return None; }
-        compositor.get_input_handler("push", "256")
-            .filter(|h| h.params.get("adv").is_some_and(|action| action == "MENU"))
-    });
+    let binding = resolve_input_binding(interpreter, compositor, event_name, key);
+    dispatch_input_binding(interpreter, event_name, binding.as_deref(), runtime_params)
+}
+
+fn dispatch_input_binding(
+    interpreter: &asb_interpreter::Interpreter,
+    event_name: &str,
+    binding: Option<&InputHandler>,
+    runtime_params: &[(&str, &str)],
+) -> HandlerDispatch {
     let Some(h) = binding else {
         return HandlerDispatch::default();
     };
