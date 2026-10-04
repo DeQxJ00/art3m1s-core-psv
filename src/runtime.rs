@@ -32,6 +32,7 @@ mod control;
 mod dialog;
 pub(crate) mod emote;
 mod emote_source_cache;
+mod ogv_cache;
 mod events;
 mod input;
 mod layer_info;
@@ -96,6 +97,7 @@ pub struct CoreRuntime {
     pub(crate) cpu_image_compression:crate::cpu_image_compression::Policy,
     surface_timeline_cursor: asb_interpreter::SurfaceTimelineCursor,
     emote_timeline_cursor: asb_interpreter::EmoteTimelineCursor,
+    ogv_timeline_cursor: asb_interpreter::OgvTimelineCursor,
     png_comments: png_comments::SharedComments,
     compositor: Compositor,
     /// 上一帧已经提交的逻辑场景。转场源帧需保留旧图像层，同时按当前状态
@@ -282,6 +284,7 @@ impl CoreRuntime {
             cpu_image_compression:Default::default(),
             surface_timeline_cursor: Default::default(),
             emote_timeline_cursor: Default::default(),
+            ogv_timeline_cursor: Default::default(),
             png_comments: Default::default(),
             compositor,
             last_rendered_scene: None,
@@ -903,6 +906,7 @@ impl Drop for CoreRuntime {
         surface_loader::shutdown();
         callbacks::clear_surface_cache();
         emote_source_cache::reset();
+        ogv_cache::reset();
     }
 }
 

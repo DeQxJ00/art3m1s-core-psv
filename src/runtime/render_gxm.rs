@@ -18,6 +18,13 @@ impl CoreRuntime {
         self.texture_provider.reclaim_video_gpu_cache(bytes)
     }
     pub fn prepare_gxm_textures(&mut self) {
+        if let Some(paths)=self.interpreter.query_ogv_timeline(&mut self.ogv_timeline_cursor){
+            let paths:Vec<_>=paths.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect();
+            super::ogv_cache::plan(&paths,self.png_comments.clone());
+        }
+        // Menus/title Lua can start videos without any story AST or image
+        // preload. Ensure their demand hints also obtain a background worker.
+        if super::ogv_cache::pending(){super::surface_loader::wake_models(self.png_comments.clone());}
         if let Some(paths)=self.interpreter.query_emote_timeline(&mut self.emote_timeline_cursor){
             let paths:Vec<_>=paths.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect();
             super::emote_source_cache::plan(&paths,self.png_comments.clone());

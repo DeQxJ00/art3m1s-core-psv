@@ -63,6 +63,8 @@ impl CoreRuntime {
         #[cfg(all(target_os="vita",feature="gxm-backend"))]
         {let mut p=self.cpu_image_compression.clone();p.ignore_bg=self.ignore_background_alpha;crate::cpu_image_compression::set_policy(p);}
         super::emote_source_cache::reset();
+        super::ogv_cache::reset();
+        self.ogv_timeline_cursor=Default::default();
         self.emote_timeline_cursor=Default::default();
         self.install_interpreter(project.create_interpreter());
 

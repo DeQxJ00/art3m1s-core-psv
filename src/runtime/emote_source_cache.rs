@@ -121,7 +121,7 @@ impl Cache {
             // IDLE is lower priority: its occupied bytes may delay admission,
             // but must not cause eviction of a higher-priority PSB.
             if !source_growth && b.idle>0 {break;}
-            let available=b.limit.saturating_sub(b.ready.max(b.ready_goal)+b.emote+b.emote_scratch.saturating_sub(credit));
+            let available=b.limit.saturating_sub(b.ready.max(b.ready_goal)+b.video+b.emote+b.emote_scratch.saturating_sub(credit));
             let fits=needed<=available && (!source_growth || needed<=self.limit.saturating_sub(b.emote));
             drop(b);
             if fits { break; }
@@ -134,9 +134,10 @@ impl Cache {
         }
     }
     fn reserve_scratch(&self,size:usize)->Option<ParseScratch>{
+        super::ogv_cache::reclaim(size);
         let mut s=self.state.lock().unwrap();self.evict_locked(&mut s,size,false);
         let mut b=self.budget.lock().unwrap();
-        if size>b.limit.saturating_sub(b.ready.max(b.ready_goal)+b.idle+b.emote+b.emote_scratch){
+        if size>b.limit.saturating_sub(b.ready.max(b.ready_goal)+b.idle+b.video+b.emote+b.emote_scratch){
             let goal=b.emote+b.emote_scratch+size;b.request_emote(goal);return None;
         }
         b.emote_scratch+=size;b.clear_emote_request();
@@ -144,12 +145,13 @@ impl Cache {
     }
     fn reserve(&self,size:usize)->Option<Reservation> {self.reserve_with_credit(size,&mut None)}
     fn reserve_with_credit(&self,size:usize,scratch:&mut Option<ParseScratch>)->Option<Reservation> {
+        super::ogv_cache::reclaim(size);
         if size>self.limit {return None;}
         let credit=scratch.as_ref().map_or(0,|s|s.bytes);
         let mut s=self.state.lock().unwrap();self.evict_with_credit(&mut s,size,true,credit);
         let mut b=self.budget.lock().unwrap();
         if size>self.limit.saturating_sub(b.emote) {return None;}
-        if size>b.limit.saturating_sub(b.ready.max(b.ready_goal)+b.idle+b.emote+b.emote_scratch.saturating_sub(credit)) {
+        if size>b.limit.saturating_sub(b.ready.max(b.ready_goal)+b.idle+b.video+b.emote+b.emote_scratch.saturating_sub(credit)) {
             let goal=b.emote.saturating_add(b.emote_scratch).saturating_add(size);b.request_emote(goal);
             return None;
         }
