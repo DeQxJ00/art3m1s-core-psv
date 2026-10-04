@@ -216,6 +216,7 @@ impl Loader {
           }
           crate::ffi::worker_started(c"surface-loader");
           let mut paused:Option<(String,u64,Tracked<Vec<u8>>)>=None;
+          let mut video_turn=false;
           loop {
             let mut state = s.state.lock().unwrap();
             if paused.as_ref().is_some_and(|(p,t,_)|!state.entries.get(p).is_some_and(|e|e.pending&&e.ticket==*t)){
@@ -228,9 +229,11 @@ impl Loader {
             if state.model_pending && state.urgent.is_none() && state.scene_priority.is_empty()
                 && (!state.model_last || state.queue_len()==0) {
                 state.model_pending=false;state.model_last=true;drop(state);
-                let deferred=super::emote_source_cache::process_one();
+                let deferred=if super::ogv_cache::pending()&&(video_turn||!super::emote_source_cache::pending()){
+                    video_turn=false;super::ogv_cache::process_one()
+                }else{video_turn=true;super::emote_source_cache::process_one()};
                 let mut state=s.state.lock().unwrap();
-                state.model_pending|=super::emote_source_cache::pending();
+                state.model_pending|=super::emote_source_cache::pending()||super::ogv_cache::pending();
                 if deferred && state.queue_len()==0 && !state.stop {
                     // Let the render thread reclaim IDLE; demand/cancellation
                     // can wake us early. Never spin or block the render thread.
@@ -804,6 +807,7 @@ fn decoder_allowance_with_budget(width:u32,height:u32,source_capacity:usize,pixe
         .filter(|remaining|*remaining>0)
 }
 fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize,comments:&super::png_comments::SharedComments)->LoadStep{
+    super::ogv_cache::reclaim(budget);
     super::emote_source_cache::reclaim(budget);
     let policy=crate::cpu_image_compression::policy_for(path);
     if let Some(bytes)=resume{return decode_source_policy(bytes,cancelled,should_yield,budget,policy.as_ref());}
@@ -961,6 +965,7 @@ pub(super) fn bind(path:&str,asynchronous:bool,comments:super::png_comments::Sha
 pub(super) fn wake_models(comments:super::png_comments::SharedComments){if let Some(w)=worker(comments){
     let mut s=w.shared.state.lock().unwrap();s.model_pending=true;w.shared.wake.notify_one();
 }}
+pub(super) fn wake_media(){if let Some(w)=handle(){let mut s=w.shared.state.lock().unwrap();s.model_pending=true;w.shared.wake.notify_one();}}
 pub(super) fn model_should_yield()->bool{handle().is_some_and(|w|{
     let s=w.shared.state.lock().unwrap();s.stop||s.urgent.is_some()||!s.scene_priority.is_empty()
 })}
@@ -983,8 +988,8 @@ pub(super) fn prioritize_scene(paths:&[String]){
 }
 pub(super) fn loading(path:Option<&str>)->bool{handle().is_some_and(|l|l.loading(path))}
 pub(super) fn unbind(path:&str){if let Some(l)=handle(){l.unbind(path);}}
-pub(super) fn cancel(){super::emote_source_cache::cancel_plan();if let Some(l)=handle(){l.cancel();}}
-pub(super) fn shutdown(){let loader=LOADER.lock().unwrap().take();if let Some(l)=loader{l.shutdown();}}
+pub(super) fn cancel(){super::ogv_cache::cancel_plan();super::emote_source_cache::cancel_plan();if let Some(l)=handle(){l.cancel();}}
+pub(super) fn shutdown(){super::ogv_cache::cancel_plan();let loader=LOADER.lock().unwrap().take();if let Some(l)=loader{l.shutdown();}}
 
 #[cfg(test)]
 mod tests {

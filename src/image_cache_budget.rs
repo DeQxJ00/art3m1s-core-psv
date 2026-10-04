@@ -16,12 +16,12 @@ impl CacheParts {
 // counter, not residency: successful payload handoff/reclamation preserves it.
 #[derive(Clone,Copy,Default,Debug,PartialEq,Eq)]
 pub(crate) struct ScriptPreloadCounts { pub planned:usize,pub completed:usize,pub pixels:usize,pub encoded:usize }
-pub(crate) struct CacheBudget { pub limit:usize,pub ready:usize,pub idle:usize,pub emote:usize,pub emote_scratch:usize,emote_request:Option<(usize,std::time::Instant)>,pub ready_goal:usize,pub ready_reserved:usize,pub ready_parts:CacheParts,pub mask_parts:CacheParts,pub animation_parts:CacheParts,pub script_preload:ScriptPreloadCounts }
+pub(crate) struct CacheBudget { pub limit:usize,pub ready:usize,pub idle:usize,pub emote:usize,pub emote_scratch:usize,pub video:usize,video_request:Option<(usize,std::time::Instant)>,emote_request:Option<(usize,std::time::Instant)>,pub ready_goal:usize,pub ready_reserved:usize,pub ready_parts:CacheParts,pub mask_parts:CacheParts,pub animation_parts:CacheParts,pub script_preload:ScriptPreloadCounts }
 impl CacheBudget {
-    pub fn new(limit:usize)->SharedCacheBudget{Arc::new(Mutex::new(Self{limit,ready:0,idle:0,emote:0,emote_scratch:0,emote_request:None,ready_goal:0,ready_reserved:0,ready_parts:CacheParts::default(),mask_parts:CacheParts::default(),animation_parts:CacheParts::default(),script_preload:ScriptPreloadCounts::default()}))}
+    pub fn new(limit:usize)->SharedCacheBudget{Arc::new(Mutex::new(Self{limit,ready:0,idle:0,emote:0,emote_scratch:0,video:0,video_request:None,emote_request:None,ready_goal:0,ready_reserved:0,ready_parts:CacheParts::default(),mask_parts:CacheParts::default(),animation_parts:CacheParts::default(),script_preload:ScriptPreloadCounts::default()}))}
     pub fn ready_limit(&self)->usize{
-        let physical=self.limit.saturating_sub(self.idle+self.emote+self.emote_scratch);
-        physical.min(self.ready.max(self.limit.saturating_sub(self.idle+self.emote_goal())))
+        let physical=self.limit.saturating_sub(self.idle+self.emote+self.emote_scratch+self.video);
+        physical.min(self.ready.max(self.limit.saturating_sub(self.idle+self.emote_goal()+self.video)))
     }
     fn emote_goal(&self)->usize{
         (self.emote+self.emote_scratch).max(self.emote_request.filter(|(_,until)|*until>std::time::Instant::now()).map_or(0,|(n,_)|n))
@@ -32,10 +32,13 @@ impl CacheBudget {
         self.emote_request=Some((goal.min(self.limit),std::time::Instant::now()+std::time::Duration::from_secs(1)));
     }
     pub fn clear_emote_request(&mut self){self.emote_request=None;}
-    pub fn idle_limit(&self,maximum:usize)->usize{maximum.min(self.limit.saturating_sub(self.ready.saturating_add(self.ready_reserved).max(self.ready_goal)+self.emote_goal()))}
+    pub fn request_video(&mut self,goal:usize){self.video_request=Some((goal.min(self.limit),std::time::Instant::now()+std::time::Duration::from_secs(1)));}
+    pub fn clear_video_request(&mut self){self.video_request=None;}
+    fn video_goal(&self)->usize{self.video.max(self.video_request.filter(|(_,until)|*until>std::time::Instant::now()).map_or(0,|(n,_)|n))}
+    pub fn idle_limit(&self,maximum:usize)->usize{maximum.min(self.limit.saturating_sub(self.ready.saturating_add(self.ready_reserved).max(self.ready_goal)+self.emote_goal()+self.video_goal()))}
     // Potential capacity after render-thread reclamation, never permission to
     // publish into occupied IDLE. Model requests keep their higher priority.
-    pub fn ready_reclaim_limit(&self)->usize{self.limit.saturating_sub(self.emote_goal())}
+    pub fn ready_reclaim_limit(&self)->usize{self.limit.saturating_sub(self.emote_goal()+self.video)}
     // Request one bounded growth window beyond actual ready allocations, not
     // the entire chapter allowance as soon as one async job is queued. The
     // former 5/6 reservation evicted warm backgrounds with >100 MiB still free.
@@ -49,7 +52,7 @@ impl CacheBudget {
     pub fn set_ready_parts(&mut self,parts:CacheParts){let bytes=parts.total();debug_assert!(bytes<=self.ready_limit());self.ready=bytes;self.ready_parts=parts;}
     #[cfg(test)]
     pub fn set_ready(&mut self,bytes:usize){self.set_ready_parts(CacheParts{decoded:bytes,..Default::default()});}
-    pub fn set_idle(&mut self,bytes:usize){debug_assert!(bytes<=self.limit.saturating_sub(self.ready+self.emote+self.emote_scratch));self.idle=bytes;}
+    pub fn set_idle(&mut self,bytes:usize){debug_assert!(bytes<=self.limit.saturating_sub(self.ready+self.emote+self.emote_scratch+self.video));self.idle=bytes;}
 }
 // Like the existing loader, one game session owns these accounts. Shutdown and
 // provider Drop release their respective counters, including a project reload.
