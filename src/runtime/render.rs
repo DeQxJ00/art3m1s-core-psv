@@ -1315,6 +1315,7 @@ mod tests {
     fn mesh_damage_uses_deformed_vertex_bounds() {
         let mut command = quad(10.0, 20.0);
         command.mesh = Some(DrawMesh {
+            grid_side: 0,
             vertices: vec![
                 [5.0, 5.0, 0.0, 0.0],
                 [15.0, 5.0, 1.0, 0.0],
