@@ -593,12 +593,29 @@ impl GlyphTextRenderer {
             glyph.character = c.to_string();
             return Some(glyph);
         }
-        let q = sf.outline_glyph(glyph_id.with_scale(sz))?;
+        let advance_x = sf.h_advance(glyph_id);
+        let q = match sf.outline_glyph(glyph_id.with_scale(sz)) {
+            Some(outline) => outline,
+            None if c.is_whitespace() && !c.is_control() && glyph_id.0 != 0 => {
+                // Spaces have font metrics but no pixels. Keep them in layout
+                // and host font-size reflow without allocating an atlas cell.
+                let mut glyph = GlyphInfo {
+                    logical_size: sz, font_generation: self.font_generation,
+                    character: String::new(), texture_id: TextureId(0),
+                    atlas_x: 0.0, atlas_y: 0.0, atlas_w: 0.0, atlas_h: 0.0,
+                    offset_x: 0.0, offset_y: 0.0, width: 0.0, height: 0.0,
+                    advance_x,
+                };
+                self.cache.insert(k, glyph.clone());
+                glyph.character = c.to_string();
+                return Some(glyph);
+            }
+            None => return None,
+        };
         let b = q.px_bounds();
         let w = b.width().ceil() as u32;
         let h = b.height().ceil() as u32;
         let offset_y = sf.ascent() + b.min.y;
-        let advance_x = sf.h_advance(glyph_id.with_scale(sz).id);
         let (page, ax, ay, aw, ah) = if w > 0 && h > 0 && w < ATLAS_SZ && h < ATLAS_SZ {
             // Preserve the existing largest supported glyph dimensions.
             let pad = u32::from(w + 2 <= ATLAS_SZ && h + 2 <= ATLAS_SZ);

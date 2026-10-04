@@ -12,6 +12,38 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
+    fn outline_free_spaces_keep_advance_and_follow_message_resize() {
+        let mut r = GlyphTextRenderer::new();
+        r.set_named_font_bytes("fixture", std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap()).unwrap();
+        let atlas_count = r.atlases.len();
+        for c in [' ', '\u{00a0}', '\u{3000}'] {
+            let cold = r.rasterize_glyph(c, 24.0).unwrap();
+            assert!(cold.advance_x > 0.0);
+            assert_eq!((cold.atlas_w, cold.atlas_h), (0.0, 0.0));
+            assert_eq!(r.rasterize_glyph(c, 24.0).unwrap(), cold);
+        }
+        assert_eq!(r.atlases.len(), atlas_count);
+        r.set_message_font_roles(Some(asb_interpreter::MessageLayerIds {
+            name: Some("speaker".into()), dialogue: Some("dialogue".into()), subtitle: None }));
+        for id in ["dialogue", "speaker", "chapter"] {
+            r.state.active_layer = Some(id.into());
+            r.state.active_layer_mut().font.size = Some(24.0);
+            r.push_text("A B", false);
+        }
+        let before = r.state.layers.clone();
+        assert_eq!(before["dialogue"].text_buffer.len(), 3);
+        assert!(r.set_message_font_sizes(true, 125, 150));
+        assert!((r.state.layers["dialogue"].text_buffer[1].advance_x / before["dialogue"].text_buffer[1].advance_x - 1.5).abs() < 0.001);
+        assert!((r.state.layers["speaker"].text_buffer[1].advance_x / before["speaker"].text_buffer[1].advance_x - 1.25).abs() < 0.001);
+        assert_eq!(r.state.layers["chapter"].text_buffer, before["chapter"].text_buffer);
+        assert!(r.set_message_font_sizes(false, 125, 150));
+        for (id, old) in before {
+            assert_eq!(r.state.layers[&id].text_buffer, old.text_buffer);
+            assert_eq!(r.state.layers[&id].page_tags, old.page_tags);
+        }
+    }
+    #[test]
+    #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
     fn subtitle_size_is_independent_and_restores_existing_pages() {
         let mut r = GlyphTextRenderer::new();
         r.set_named_font_bytes("fixture", std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap()).unwrap();
