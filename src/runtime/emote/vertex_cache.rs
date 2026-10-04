@@ -1,6 +1,4 @@
-use super::{draw_mesh_with_indexing, DrawMesh};
-#[cfg(test)]
-use super::draw_mesh;
+use super::{draw_mesh, DrawMesh};
 
 const MAX_SLOTS: usize = 256;
 const MAX_BYTES: usize = 512 * 1024;
@@ -12,29 +10,17 @@ struct Entry {
     bytes: usize,
 }
 
-/// One CPU mesh per draw position. Exact geometry comparison makes
+/// One expanded CPU mesh per draw position. Exact geometry comparison makes
 /// reordering safe; texture/material/transform state is never cached here.
+#[derive(Default)]
 pub(super) struct VertexCache {
     slots: Vec<Option<Entry>>,
     pub hits: u64,
     pub builds: u64,
     pub bytes: usize,
-    indexed: bool,
-}
-
-impl Default for VertexCache {
-    fn default() -> Self {
-        Self { slots: Vec::new(), hits: 0, builds: 0, bytes: 0, indexed: true }
-    }
 }
 
 impl VertexCache {
-    pub fn set_indexed(&mut self, enabled: bool) -> bool {
-        if self.indexed == enabled { return false; }
-        self.begin(0);
-        self.indexed = enabled;
-        true
-    }
     pub fn begin(&mut self, count: usize) {
         let count = count.min(MAX_SLOTS);
         for index in count..self.slots.len() { self.discard(index); }
@@ -57,7 +43,7 @@ impl VertexCache {
         }
         self.discard(index);
         self.builds += 1;
-        let mesh = draw_mesh_with_indexing(points, width, height, self.indexed)?;
+        let mesh = draw_mesh(points, width, height)?;
         let bytes = std::mem::size_of::<Entry>() + 32
             + std::mem::size_of_val(points?) + std::mem::size_of_val(mesh.vertices.as_ref());
         if index < self.slots.len() && bytes <= MAX_BYTES.saturating_sub(self.bytes) {
@@ -93,27 +79,6 @@ mod tests {
         cache.begin(0); assert_eq!(cache.bytes, 0);
         // A frame in flight may still own the old Arc after cache eviction.
         assert_eq!(first, draw_mesh(Some(&a), 100., 200.).unwrap());
-    }
-
-    #[test]
-    fn changing_index_mode_discards_cached_topology_but_preserves_triangles() {
-        let mut cache = VertexCache::default();
-        cache.begin(1);
-        let input = points(8);
-        let compact = cache.get(0, Some(&input), 100., 200.).unwrap();
-        assert_eq!(compact.vertices.len(), 64);
-        assert_eq!(compact.grid_side, 8);
-        assert!(cache.set_indexed(false));
-        assert_eq!(cache.bytes, 0);
-        cache.begin(1);
-        let legacy = cache.get(0, Some(&input), 100., 200.).unwrap();
-        assert_eq!(legacy.vertices.len(), 294);
-        assert_eq!(legacy.grid_side, 0);
-        let mut expanded = Vec::new();
-        compact.append_triangles(&mut expanded);
-        assert_eq!(expanded.as_slice(), legacy.vertices.as_ref());
-        assert!(!cache.set_indexed(false));
-        assert!(cache.set_indexed(true));
     }
 
     #[test]
