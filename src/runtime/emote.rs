@@ -759,15 +759,6 @@ impl EmoteInstance {
 
         let state = self.render_state();
         let transform = self.player.transform();
-        #[cfg(all(target_os = "vita", feature = "gxm-builtin-effects"))]
-        {
-            unsafe extern "C" {
-                fn art3m1s_gxm_indexed_mesh_enabled() -> i32;
-            }
-            if self.vertex_cache.set_indexed(unsafe { art3m1s_gxm_indexed_mesh_enabled() != 0 }) {
-                self.pose_cache.invalidate();
-            }
-        }
         // Keep texture uploads/retries and retention above the cache lookup.
         // Missing textures must never freeze a partially rendered character.
         let complete = self.textures.values().all(|texture| texture.gpu.is_some());
@@ -1108,14 +1099,7 @@ fn packed_color(value: u32, opacity: f32) -> [f32; 4] {
     ]
 }
 
-#[cfg(test)]
 fn draw_mesh(points: Option<&[f32]>, width: f32, height: f32) -> Option<DrawMesh> {
-    draw_mesh_with_indexing(points, width, height, true)
-}
-
-fn draw_mesh_with_indexing(
-    points: Option<&[f32]>, width: f32, height: f32, indexed: bool,
-) -> Option<DrawMesh> {
     let points = points?;
     if points.is_empty() || !points.len().is_multiple_of(2) {
         return None;
@@ -1135,18 +1119,6 @@ fn draw_mesh_with_indexing(
             y as f32 / (side - 1) as f32,
         ]
     };
-    if indexed && side <= 32 {
-        let mut vertices = Vec::with_capacity(point_count);
-        for y in 0..side {
-            for x in 0..side {
-                vertices.push(vertex(x, y));
-            }
-        }
-        return Some(DrawMesh {
-            vertices: vertices.into(),
-            grid_side: side as u32,
-        });
-    }
     let mut vertices = Vec::with_capacity((side - 1) * (side - 1) * 6);
     for y in 0..side - 1 {
         for x in 0..side - 1 {
@@ -1166,7 +1138,6 @@ fn draw_mesh_with_indexing(
     }
     Some(DrawMesh {
         vertices: vertices.into(),
-        grid_side: 0,
     })
 }
 
@@ -1391,29 +1362,9 @@ mod tests {
             }
         }
         let mesh = draw_mesh(Some(&points), 300.0, 600.0).unwrap();
-        assert_eq!(mesh.vertices.len(), 16);
-        let mut expanded = Vec::new();
-        mesh.append_triangles(&mut expanded);
-        assert_eq!(expanded.len(), 54);
-        assert_eq!(expanded[0], [0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(expanded[2], [100.0, 200.0, 1.0 / 3.0, 1.0 / 3.0]);
-    }
-
-    #[test]
-    fn indexed_mesh_expands_to_identical_authored_triangles() {
-        use super::draw_mesh_with_indexing;
-        for side in 2..=33 {
-            let points: Vec<f32> = (0..side * side).flat_map(|i| [
-                ((i * 17) % 31) as f32 / 19.0 - 0.3,
-                ((i * 13) % 29) as f32 / 17.0 - 0.4,
-            ]).collect();
-            let compact = draw_mesh_with_indexing(Some(&points), 312.25, 617.75, true).unwrap();
-            let reference = draw_mesh_with_indexing(Some(&points), 312.25, 617.75, false).unwrap();
-            let mut expanded = Vec::new();
-            compact.append_triangles(&mut expanded);
-            assert_eq!(expanded.as_slice(), reference.vertices.as_ref(), "side={side}");
-            assert_eq!(compact.grid_side, if side <= 32 { side as u32 } else { 0 });
-        }
+        assert_eq!(mesh.vertices.len(), 54);
+        assert_eq!(mesh.vertices[0], [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(mesh.vertices[2], [100.0, 200.0, 1.0 / 3.0, 1.0 / 3.0]);
     }
 
     #[test]

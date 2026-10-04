@@ -394,7 +394,6 @@ impl ElunaEmoteInstance {
                 },
                 Some(DrawMesh {
                     vertices: vertices.into(),
-                    grid_side: 0,
                 }),
             )
         } else {
