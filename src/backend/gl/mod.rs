@@ -998,8 +998,8 @@ impl GlRenderer {
                         .filter(|mesh| !mesh.vertices.is_empty())
                         .map(|mesh| {
                             let first = mesh_vertices.len() as i32;
-                            mesh_vertices.extend_from_slice(&mesh.vertices);
-                            (first, mesh.vertices.len() as i32)
+                            mesh.append_triangles(&mut mesh_vertices);
+                            (first, mesh_vertices.len() as i32 - first)
                         })
                 })
                 .collect::<Vec<_>>();
@@ -1013,8 +1013,8 @@ impl GlRenderer {
                         .filter(|mesh| !mesh.vertices.is_empty())
                         .map(|mesh| {
                             let first = mesh_vertices.len() as i32;
-                            mesh_vertices.extend_from_slice(&mesh.vertices);
-                            (first, mesh.vertices.len() as i32)
+                            mesh.append_triangles(&mut mesh_vertices);
+                            (first, mesh_vertices.len() as i32 - first)
                         })
                 })
                 .collect::<Vec<_>>();

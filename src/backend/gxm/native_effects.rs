@@ -30,6 +30,7 @@ struct EffectDraw {
     mesh: *const [f32; 4],
     mesh_count: usize,
     custom: super::external_effects::CustomDraw,
+    grid_side: u32,
 }
 unsafe extern "C" {
     fn art3m1s_gxm_draw_effect(draw: *const EffectDraw);
@@ -123,6 +124,7 @@ fn encode(cmd: &DrawCommand, width: u32, height: u32) -> Option<EffectDraw> {
         blend: blend_code(cmd.blend),
         mesh: std::ptr::null(),
         mesh_count: 0,
+        grid_side: 0,
         custom: super::external_effects::encode(cmd.shader.as_ref(),cmd.opacity,cmd.color.multiply),
         effects: Effects {
             flags: [
@@ -143,6 +145,7 @@ fn encode(cmd: &DrawCommand, width: u32, height: u32) -> Option<EffectDraw> {
     if let Some(mesh) = &cmd.mesh {
         draw.mesh = mesh.vertices.as_ptr();
         draw.mesh_count = mesh.vertices.len();
+        draw.grid_side = mesh.grid_side;
     }
     if let Some(e) = &cmd.shader {
         if kind(Some(e)) != 0 {
@@ -1541,6 +1544,7 @@ mod tests {
     fn mesh_and_native_emote_parameters_cross_the_ffi_intact() {
         let mut cmd = group_command(&test_group(SPRITE_SHADER, 0, 1), 960, 544);
         cmd.mesh = Some(DrawMesh {
+            grid_side: 0,
             vertices: std::sync::Arc::from([[0., 0., 0., 0.], [1., 0., 1., 0.], [0., 1., 0., 1.]]),
         });
         cmd.native_emote = Some(NativeEmoteMaterial {
@@ -1557,6 +1561,12 @@ mod tests {
         assert_eq!(draw.effects.wipe, [2., -0.2, 1., 3.]);
         assert_eq!(draw.effects.model_x[3], 1.);
         assert_eq!(&draw.effects.corners[..4], &[0.2, 0.3, 0.4, 0.5]);
+        let mesh = cmd.mesh.as_mut().unwrap();
+        mesh.grid_side = 8;
+        mesh.vertices = vec![[0.; 4]; 64].into();
+        let indexed = encode(&cmd, 960, 544).unwrap();
+        assert_eq!(indexed.grid_side, 8);
+        assert_eq!(indexed.mesh_count, 64);
     }
 
     #[test]

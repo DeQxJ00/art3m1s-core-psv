@@ -303,12 +303,35 @@ pub struct DrawCommandKey {
 /// once, so callers can move command batches into the final draw list.
 pub type LayerDrawSource<'a> = dyn FnMut(&str) -> Vec<DrawCommand> + 'a;
 
-/// Expanded triangle-list geometry for deformed sprites.
+/// Triangle-list or row-major regular-grid geometry for deformed sprites.
 ///
 /// Positions are local pixels and UVs are normalized within `DrawCommand::clip`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DrawMesh {
     pub vertices: Arc<[[f32; 4]]>,
+    /// Zero denotes an expanded triangle list; supported grids have 2..=32
+    /// vertices per side. Grids preserve the same
+    /// TL/TR/BR, TL/BR/BL triangles without duplicating shared vertices.
+    pub grid_side: u32,
+}
+
+impl DrawMesh {
+    pub fn append_triangles(&self, output: &mut Vec<[f32; 4]>) {
+        let side = self.grid_side as usize;
+        if side == 0 {
+            output.extend_from_slice(&self.vertices);
+        } else if (2..=32).contains(&side) && self.vertices.len() == side * side {
+            output.reserve((side - 1) * (side - 1) * 6);
+            for y in 0..side - 1 {
+                for x in 0..side - 1 {
+                    let i = y * side + x;
+                    for j in [i, i + 1, i + side + 1, i, i + side + 1, i + side] {
+                        output.push(self.vertices[j]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
