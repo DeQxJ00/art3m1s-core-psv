@@ -12,7 +12,7 @@ impl GxmTextureProvider {
         let pixel_bytes=t.format.storage_bytes(t.width,t.height);
         let id=self.entries.get(name).map_or(TextureId(self.next_id),|e|e.id);
         let started=Instant::now();
-        let ok=unsafe{art3m1s_gxm_upload_compressed(id.0,t.width,t.height,t.format as u32,opaque as u32,t.data.as_ptr(),t.data.len())};
+        let ok=unsafe{art3m1s_gxm_upload_compressed(id.0,t.width,t.height,t.format as u32,(opaque as u32)|if t.swizzled {2}else{0},t.data.as_ptr(),t.data.len())};
         let us=elapsed_us(started);self.timing.uploads+=1;self.timing.upload_us+=us;
         self.timing.upload_max_us=self.timing.upload_max_us.max(us);
         if ok<=0{

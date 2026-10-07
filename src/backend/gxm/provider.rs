@@ -1020,6 +1020,34 @@ impl TextureProvider for GxmTextureProvider {
         Some((id,info))
     }
 
+    fn upload_s3tc_render_only(&mut self,name:&str,width:u32,height:u32,data:&[u8],bc1:bool,swizzled:bool)->Option<(TextureId,TextureInfo)>{
+        if !bc1&&!swizzled {return self.upload_dxt5_render_only(name,width,height,data);}
+        self.dxt5_upload_deferred=false;
+        if data.len()!=art3m1s_emote::bc_layout::payload_len(width,height,bc1,swizzled)? {return None;}
+        let id=self.entries.get(name).map_or(TextureId(self.next_id),|e|e.id);
+        let started=Instant::now();
+        let ok=unsafe{art3m1s_gxm_upload_compressed(id.0,width,height,if bc1 {1}else{3},if swizzled {2}else{0},data.as_ptr(),data.len())};
+        if ok<0{return None;}
+        let us=elapsed_us(started);self.timing.uploads+=1;self.timing.upload_us+=us;
+        self.timing.upload_max_us=self.timing.upload_max_us.max(us);
+        if ok==0 {
+            self.timing.upload_errors+=1;self.dxt5_upload_deferred=true;
+            self.defer_upload(art3m1s_emote::bc_layout::payload_len(width,height,bc1,true)?);
+            return None;
+        }
+        self.timing.upload_bytes+=data.len() as u64;
+        if id.0==self.next_id {self.next_id+=1;}
+        self.revision=self.revision.wrapping_add(1).max(1);
+        self.decoded.remove(name);self.encoded.remove(name);
+        let info=TextureInfo{width,height};
+        self.entries.insert(name.into(),Entry {sprite_crop:None,native_bytes:ok as usize,bc3:true,alpha_only:false,gray:false,
+            id,info,rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque:false,revision:self.revision,last_used:self.cache_clock,
+            cacheable:false,reclaimable:false,shared:false});
+        self.ids.insert(id,name.into());
+        crate::core_info!("GXM s3tc-atlas name={} bc1={} swizzled={} size={}x{} source_bytes={} gpu_alloc_bytes={}",name,bc1,swizzled,width,height,data.len(),ok);
+        Some((id,info))
+    }
+
     fn dxt5_upload_is_deferred(&self)->bool {self.dxt5_upload_deferred}
     fn upload_rgba_render_only_region(&mut self, name: &str, width: u32, height: u32, data: &[u8], region: [u32; 4]) -> Option<(TextureId, TextureInfo)> {
         let [x, y, w, h] = region;
@@ -1325,6 +1353,26 @@ mod tests {
         assert!(p.upload_dxt5_render_only("emote-atlas",12,8,&data).is_some());
         assert!(!p.needs_upload_retry());p.retain(&live);
         assert_eq!(p.entries.len(),2);
+    }
+    #[test] fn s3tc_explicit_layout_flags_and_pressure_do_not_expand_pixels(){
+        let _guard=LOCK.lock().unwrap();
+        let mut p=GxmTextureProvider::new();
+        for bc1 in [true,false] {for sw in [false,true] {
+            if !bc1&&!sw {continue;} // Legacy BC3 entry point is covered separately.
+            let bytes=art3m1s_emote::bc_layout::payload_len(17,9,bc1,sw).unwrap();
+            let data=vec![0;bytes];
+            assert!(p.upload_s3tc_render_only("model",17,9,&data[..bytes-1],bc1,sw).is_none());
+            FAIL_UPLOAD.store(1,Ordering::Relaxed);
+            assert!(p.upload_s3tc_render_only("model",17,9,&data,bc1,sw).is_none());
+            assert!(p.dxt5_upload_is_deferred());
+            FAIL_UPLOAD.store(0,Ordering::Relaxed);
+            assert!(p.upload_s3tc_render_only("model",17,9,&data,bc1,sw).is_some());
+            assert!(!p.dxt5_upload_is_deferred());
+            assert_eq!(NATIVE_ARGS.load(Ordering::Relaxed),(if bc1 {1}else{3})<<8|if sw {2}else{0});
+            assert_eq!(NATIVE_SOURCE_BYTES.load(Ordering::Relaxed),bytes);
+            assert!(p.entries["model"].rgba.is_empty());
+            assert!(p.entries["model"].native_bytes>0);
+        }}
     }
     #[test] fn bc3_pressure_defers_without_requesting_rgba_fallback(){
         let _guard=LOCK.lock().unwrap();let mut p=GxmTextureProvider::new();
@@ -1830,12 +1878,16 @@ mod tests {
     }
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_upload_compressed(id:u64,w:u32,h:u32,format:u32,flags:u32,_:*const u8,n:usize)->i32{
+        NATIVE_ARGS.store((format as usize)<<8|flags as usize,Ordering::Relaxed);
+        NATIVE_SOURCE_BYTES.store(n,Ordering::Relaxed);
         assert!((1..=14).contains(&format));assert!(n>0);
         if FAIL_UPLOAD.load(Ordering::Relaxed)!=0{return 0;}
         let mut data=vec![0;w as usize*h as usize*4];
-        for p in data.chunks_exact_mut(4){p.copy_from_slice(&[64,96,128,if flags!=0{255}else{127}]);}
+        for p in data.chunks_exact_mut(4){p.copy_from_slice(&[64,96,128,if flags&1!=0{255}else{127}]);}
         NATIVE.lock().unwrap().get_or_insert_with(HashMap::new).insert(id,MockSurface{w:w as usize,h:h as usize,stride:w as usize,data});256*1024
     }
+    static NATIVE_ARGS:AtomicUsize=AtomicUsize::new(0);
+    static NATIVE_SOURCE_BYTES:AtomicUsize=AtomicUsize::new(0);
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_read_texture_region(id:u64,x:u32,y:u32,w:u32,h:u32,out:*mut u8,n:usize)->i32{
         assert_eq!(n,w as usize*h as usize*4);

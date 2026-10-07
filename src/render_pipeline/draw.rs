@@ -91,6 +91,13 @@ pub trait TextureProvider {
         None
     }
 
+    /// BC1/BC3 source blocks with explicit layout. Non-GXM backends may fall
+    /// back to the model decoder; never feed swizzled bytes to linear upload.
+    fn upload_s3tc_render_only(&mut self,name:&str,width:u32,height:u32,data:&[u8],bc1:bool,swizzled:bool)
+        -> Option<(TextureId,TextureInfo)> {
+        if !bc1 && !swizzled {self.upload_dxt5_render_only(name,width,height,data)} else {None}
+    }
+
     fn supports_astc_4x4(&self) -> bool {
         false
     }
