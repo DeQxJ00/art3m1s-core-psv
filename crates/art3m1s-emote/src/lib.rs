@@ -4,6 +4,7 @@
 //! `art3m1s-core` owns script bindings, GPU resources and scene composition.
 
 mod atlas;
+pub mod bc_layout;
 mod error;
 mod model;
 mod memory;

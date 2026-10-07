@@ -5,9 +5,20 @@ use crate::{EmoteError, PsbDocument, PsbResourceData, PsbValue, ResourceRef, Res
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextureFormat {
     Dxt5,
+    Dxt5Swizzled,
+    Dxt1,
+    Dxt1Swizzled,
     /// PSB RGBA8 uses little-endian ARGB words (B, G, R, A bytes).
     Rgba8,
     Other(String),
+}
+
+impl TextureFormat {
+    /// (BC1 rather than BC3, GXM-swizzled rather than row-major blocks).
+    pub fn s3tc_layout(&self) -> Option<(bool, bool)> {
+        match self { Self::Dxt5=>Some((false,false)), Self::Dxt5Swizzled=>Some((false,true)),
+            Self::Dxt1=>Some((true,false)), Self::Dxt1Swizzled=>Some((true,true)), _=>None }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -115,6 +126,13 @@ impl EmoteAtlas {
         let bytes = document.resource(texture.resource)?;
         match texture.format {
             TextureFormat::Dxt5 => decode_dxt5(bytes, texture.width, texture.height),
+            TextureFormat::Dxt1 => decode_dxt1(bytes, texture.width, texture.height),
+            TextureFormat::Dxt5Swizzled | TextureFormat::Dxt1Swizzled => {
+                let bc1=texture.format==TextureFormat::Dxt1Swizzled;
+                let linear=crate::bc_layout::linearize(bytes,texture.width,texture.height,bc1)
+                    .ok_or_else(||EmoteError::InvalidFormat("invalid GXM swizzled texture payload".into()))?;
+                if bc1 {decode_dxt1(&linear,texture.width,texture.height)} else {decode_dxt5(&linear,texture.width,texture.height)}
+            },
             TextureFormat::Rgba8 => decode_rgba8(bytes, texture.width, texture.height),
             TextureFormat::Other(ref format) => {
                 Err(EmoteError::Unsupported(format!("texture format {format}")))
@@ -128,6 +146,13 @@ impl EmoteAtlas {
             .ok_or_else(|| EmoteError::InvalidFormat(format!("unknown texture {id}")))?;
         match texture.format {
             TextureFormat::Dxt5 => decode_dxt5(bytes, texture.width, texture.height),
+            TextureFormat::Dxt1 => decode_dxt1(bytes, texture.width, texture.height),
+            TextureFormat::Dxt5Swizzled | TextureFormat::Dxt1Swizzled => {
+                let bc1=texture.format==TextureFormat::Dxt1Swizzled;
+                let linear=crate::bc_layout::linearize(bytes,texture.width,texture.height,bc1)
+                    .ok_or_else(||EmoteError::InvalidFormat("invalid GXM swizzled texture payload".into()))?;
+                if bc1 {decode_dxt1(&linear,texture.width,texture.height)} else {decode_dxt5(&linear,texture.width,texture.height)}
+            },
             TextureFormat::Rgba8 => decode_rgba8(bytes, texture.width, texture.height),
             TextureFormat::Other(ref format) => {
                 Err(EmoteError::Unsupported(format!("texture format {format}")))
@@ -144,8 +169,11 @@ fn parse_texture(id: &str, value: &PsbValue) -> Result<EmoteTexture> {
         height: required_u32(value, "height")?,
         truncated_width: required_u32(value, "truncated_width")?,
         truncated_height: required_u32(value, "truncated_height")?,
-        format: if format.eq_ignore_ascii_case("DXT5") {
+        format: if format.eq_ignore_ascii_case("DXT5") || format.eq_ignore_ascii_case("DXT5_LINEAR") {
             TextureFormat::Dxt5
+        } else if format.eq_ignore_ascii_case("DXT5_SWIZZLED") { TextureFormat::Dxt5Swizzled
+        } else if format.eq_ignore_ascii_case("DXT1") || format.eq_ignore_ascii_case("DXT1_LINEAR") { TextureFormat::Dxt1
+        } else if format.eq_ignore_ascii_case("DXT1_SWIZZLED") { TextureFormat::Dxt1Swizzled
         } else if format.eq_ignore_ascii_case("RGBA8") {
             TextureFormat::Rgba8
         } else {
@@ -185,20 +213,11 @@ fn validate_texture_resource(document: &PsbDocument, texture: &EmoteTexture) -> 
     if texture.format == TextureFormat::Rgba8 {
         validate_rgba8(bytes, texture.width, texture.height)?;
     }
-    if texture.format == TextureFormat::Dxt5 {
-        let blocks_x = texture.width.div_ceil(4) as usize;
-        let blocks_y = texture.height.div_ceil(4) as usize;
-        let expected = blocks_x
-            .checked_mul(blocks_y)
-            .and_then(|blocks| blocks.checked_mul(16))
-            .ok_or_else(|| EmoteError::InvalidFormat("DXT5 texture size overflow".into()))?;
-        if bytes.len() != expected {
-            return Err(EmoteError::InvalidFormat(format!(
-                "{} DXT5 resource has {} bytes, expected {expected}",
-                texture.id,
-                bytes.len()
-            )));
-        }
+    if let Some((bc1,swizzled))=texture.format.s3tc_layout() {
+        let expected=crate::bc_layout::payload_len(texture.width,texture.height,bc1,swizzled)
+            .ok_or_else(||EmoteError::InvalidFormat("S3TC dimensions outside GXM limits".into()))?;
+        if bytes.len()!=expected {return Err(EmoteError::InvalidFormat(format!(
+            "{} {:?} resource has {} bytes, expected {expected}",texture.id,texture.format,bytes.len())));}
     }
     Ok(())
 }
@@ -275,6 +294,25 @@ fn required_f32(value: &PsbValue, key: &str) -> Result<f32> {
             "missing numeric field {key}"
         ))),
     }
+}
+
+fn decode_dxt1(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let expected=crate::bc_layout::payload_len(width,height,true,false)
+        .ok_or_else(||EmoteError::InvalidFormat("invalid DXT1 dimensions".into()))?;
+    if data.len()!=expected { return Err(EmoteError::InvalidFormat("invalid DXT1 payload length".into())); }
+    let mut out=vec![0;width as usize*height as usize*4];let bw=width.div_ceil(4) as usize;
+    for (i,b) in data.chunks_exact(8).enumerate() {
+        let c0=u16::from_le_bytes([b[0],b[1]]);let c1=u16::from_le_bytes([b[2],b[3]]);
+        let mut colors=color_palette(c0,c1);
+        if c0<=c1 { for c in 0..3 {colors[2][c]=((colors[0][c] as u16+colors[1][c] as u16)/2) as u8;} colors[3]=[0;3]; }
+        let indices=u32::from_le_bytes(b[4..8].try_into().unwrap());
+        for p in 0..16 {let x=(i%bw)*4+p%4;let y=(i/bw)*4+p/4;
+            if x>=width as usize||y>=height as usize {continue;}
+            let c=((indices>>(p*2))&3) as usize;let alpha=if c0<=c1&&c==3 {0}else{255};
+            let at=(y*width as usize+x)*4;out[at..at+4].copy_from_slice(&[colors[c][0],colors[c][1],colors[c][2],alpha]);
+        }
+    }
+    Ok(out)
 }
 
 fn decode_dxt5(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
@@ -399,5 +437,40 @@ mod tests {
         let block = [255, 0, 0, 0, 0, 0, 0, 0, 0x00, 0xf8, 0x00, 0xf8, 0, 0, 0, 0];
         let rgba = decode_dxt5(&block, 4, 4).unwrap();
         assert!(rgba.chunks_exact(4).all(|pixel| pixel == [255, 0, 0, 255]));
+    }
+    fn descriptor(kind:&str,w:u32,h:u32) -> EmoteTexture {
+        let mut v=BTreeMap::new();
+        v.insert("type".into(),PsbValue::String(kind.into()));
+        for (k,n) in [("width",w),("height",h),("truncated_width",w),("truncated_height",h)] {
+            v.insert(k.into(),PsbValue::Integer(n as i64));
+        }
+        v.insert("pixel".into(),PsbValue::Resource(ResourceRef{index:0,extra:false}));
+        parse_texture("atlas",&PsbValue::Object(v)).unwrap()
+    }
+    #[test] fn format_aliases_and_swizzled_cpu_fallback_preserve_pixels() {
+        for (name,bc1) in [("DXT1",true),("DXT5",false)] {
+            assert_eq!(descriptor(name,12,8).format,descriptor(&format!("{name}_LINEAR"),12,8).format);
+            let texture=descriptor(&format!("{name}_swizzled"),12,8);
+            assert_eq!(texture.format.s3tc_layout(),Some((bc1,true)));
+            let stride=if bc1 {8}else{16};
+            let mut linear=vec![0;6*stride];
+            // Distinct red/green/blue blocks, nonuniform alpha and indices.
+            for (i,b) in linear.chunks_exact_mut(stride).enumerate() {
+                let color=if bc1 {0}else{8};
+                if !bc1 {b[0]=255;b[1]=0;for v in &mut b[2..8] {*v=(i*31) as u8;}}
+                let c=[0xf800u16,0x07e0,0x001f][i%3];
+                b[color..color+2].copy_from_slice(&c.to_le_bytes());
+                b[color+4..color+8].copy_from_slice(&(0x01020304u32*i as u32).to_le_bytes());
+            }
+            let mut sw=vec![0;8*stride];
+            for (i,j) in [0,2,4,1,3,5].into_iter().enumerate() {sw[j*stride..(j+1)*stride].copy_from_slice(&linear[i*stride..(i+1)*stride]);}
+            let mut atlas=EmoteAtlas::default();atlas.textures.insert("atlas".into(),texture);
+            let actual=atlas.decode_texture_data_rgba8("atlas",&sw).unwrap();
+            let expected=if bc1 {decode_dxt1(&linear,12,8)}else{decode_dxt5(&linear,12,8)}.unwrap();
+            assert_eq!(actual,expected);
+            assert!(atlas.decode_texture_data_rgba8("atlas",&linear).is_err());
+        }
+        let rgba=decode_dxt1(&[0,0,0xff,0xff,0xff,0xff,0xff,0xff],4,4).unwrap();
+        assert!(rgba.chunks_exact(4).all(|p|p==[0,0,0,0]));
     }
 }

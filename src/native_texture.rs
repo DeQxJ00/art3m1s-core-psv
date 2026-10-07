@@ -23,23 +23,29 @@ impl Format {
     pub fn storage_bytes(self,w:u32,h:u32)->usize{self.bytes(w.next_power_of_two(),h.next_power_of_two())}
 }
 #[derive(Clone,Copy,Debug)]
-pub(crate) struct Texture<'a>{pub format:Format,pub width:u32,pub height:u32,pub opaque:bool,pub data:&'a[u8]}
+pub(crate) struct Texture<'a>{pub format:Format,pub width:u32,pub height:u32,pub opaque:bool,pub swizzled:bool,pub data:&'a[u8]}
 pub(crate) fn recognized(b:&[u8])->bool{b.starts_with(b"DDS ")||b.starts_with(b"PVR\x03")}
 fn u32_at(b:&[u8],p:usize)->Result<u32,&'static str>{
     Ok(u32::from_le_bytes(b.get(p..p+4).ok_or("truncated header")?.try_into().unwrap()))
 }
-fn finish(b:&[u8],format:Format,w:u32,h:u32,mips:u32,start:usize,opaque:bool)->Result<Texture<'_>,&'static str>{
+fn finish(b:&[u8],format:Format,w:u32,h:u32,mips:u32,start:usize,opaque:bool,swizzled:bool)->Result<Texture<'_>,&'static str>{
     if w==0||h==0||w>4096||h>4096{return Err("dimensions outside GXM limits");}
     if mips==0||mips>32-w.max(h).leading_zeros(){return Err("invalid mip count");}
     if format.pvrtc1(){
         let (bw,bh,_)=format.block();
         if !w.is_power_of_two()||!h.is_power_of_two()||w<bw*2||h<bh*2{return Err("PVRTC1 requires power-of-two dimensions and at least 2x2 blocks");}
     }
+    if swizzled {
+        if !matches!(format,Format::Bc1|Format::Bc3)||mips!=1 {return Err("GXMSW supports single-level BC1/BC3 only");}
+        let bytes=format.storage_bytes(w,h);
+        if start.checked_add(bytes)!=Some(b.len()) {return Err("invalid GXMSW payload length");}
+        return Ok(Texture{format,width:w,height:h,opaque:opaque||format.opaque(),swizzled:true,data:&b[start..]});
+    }
     let mut total=0usize;
     for level in 0..mips {total=total.checked_add(format.bytes((w>>level).max(1),(h>>level).max(1))).ok_or("payload overflow")?;}
     let end=start.checked_add(total).ok_or("payload overflow")?;
     if end>b.len(){return Err("truncated mip payload");}
-    Ok(Texture{format,width:w,height:h,opaque:opaque||format.opaque(),data:&b[start..start+format.bytes(w,h)]})
+    Ok(Texture{format,width:w,height:h,opaque:opaque||format.opaque(),swizzled:false,data:&b[start..start+format.bytes(w,h)]})
 }
 pub(crate) fn parse(b:&[u8])->Result<Texture<'_>,&'static str>{
     use Format::*;
@@ -70,7 +76,7 @@ pub(crate) fn parse(b:&[u8])->Result<Texture<'_>,&'static str>{
             if creator==0x03525650&&key==3&&(n!=3||b[pos..end]!=[0,0,0]){return Err("unsupported PVR orientation");}
             pos=end;
         }
-        finish(b,format,w,h,mips,start,false)
+        finish(b,format,w,h,mips,start,false,false)
     }else if b.starts_with(b"DDS "){
         if u32_at(b,4)?!=124||u32_at(b,76)?!=32{return Err("invalid DDS header size");}
         if u32_at(b,80)?&4==0{return Err("DDS must use a compressed FOURCC");}
@@ -89,7 +95,7 @@ pub(crate) fn parse(b:&[u8])->Result<Texture<'_>,&'static str>{
             },
             _=>return Err("unsupported DDS compression"),
         };
-        finish(b,format,w,h,mips,start,opaque)
+        finish(b,format,w,h,mips,start,opaque,b.get(32..37)==Some(b"GXMSW"))
     }else{Err("not a native texture container")}
 }
 
@@ -149,6 +155,23 @@ pub(crate) fn header_dimensions(b:&[u8])->Option<(u32,u32)>{
             let mut b=vec![0;148+64];b[..4].copy_from_slice(b"DDS ");b[84..88].copy_from_slice(b"DX10");
             for (at,v) in [(4,124u32),(12,4),(16,4),(76,32),(80,4),(128,code),(132,3),(140,1)]{b[at..at+4].copy_from_slice(&v.to_le_bytes());}
             assert!(parse(&b).is_ok());b[144]=2;assert!(parse(&b).is_err());
+        }
+    }
+    #[test] fn gxmsw_bc1_bc3_exact_lengths_and_legacy_compatibility() {
+        for (cc,f) in [(b"DXT1",Format::Bc1),(b"DXT5",Format::Bc3)] {
+            for (w,h) in [(1,1),(12,8),(8,20),(17,9),(1024,512)] {
+                let mut b=vec![0;128+f.storage_bytes(w,h)];b[..4].copy_from_slice(b"DDS ");
+                for (at,v) in [(4,124u32),(12,h),(16,w),(76,32),(80,4)] {b[at..at+4].copy_from_slice(&v.to_le_bytes());}
+                b[84..88].copy_from_slice(cc);b[32..37].copy_from_slice(b"GXMSW");
+                let t=parse(&b).unwrap();assert!(t.swizzled);assert_eq!(t.data.len(),f.storage_bytes(w,h));
+                assert_eq!((t.width,t.height),(w,h));assert_eq!(t.format,f);
+                assert!(parse(&b[..b.len()-1]).is_err());
+                b.push(0);assert!(parse(&b).is_err());b.pop();
+                b[28..32].copy_from_slice(&2u32.to_le_bytes());assert!(parse(&b).is_err());b[28..32].fill(0);
+                b[84..88].copy_from_slice(b"DXT3");assert!(parse(&b).is_err());b[84..88].copy_from_slice(cc);
+                b[32..37].fill(0);b.truncate(128+f.bytes(w,h));
+                let t=parse(&b).unwrap();assert!(!t.swizzled);assert_eq!(t.data.len(),f.bytes(w,h));
+            }
         }
     }
 }

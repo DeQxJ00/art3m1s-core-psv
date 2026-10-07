@@ -613,12 +613,12 @@ impl EmoteInstance {
                     format!("E-Mote texture {texture_id} was evicted after source release")
                 })?;
                 let compressed = compressed.as_bytes();
-                if texture.format == art3m1s_emote::TextureFormat::Dxt5 {
-                    texture.gpu = provider.upload_dxt5_render_only(
+                if let Some((bc1,swizzled)) = texture.format.s3tc_layout() {
+                    texture.gpu = provider.upload_s3tc_render_only(
                         &texture.name,
                         texture.width,
                         texture.height,
-                        compressed,
+                        compressed, bc1, swizzled,
                     );
                     if texture.gpu.is_none() && provider.dxt5_upload_is_deferred(){
                         // Expanding to RGBA needs more GPU memory and repeated
