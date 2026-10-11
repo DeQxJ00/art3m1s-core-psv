@@ -1489,7 +1489,7 @@ impl TextRenderer for GlyphTextRenderer {
                         shader: None,
                         mesh: None,
                         stencil: None,
-                        native_emote: None,
+                        recovered_packet: None, native_emote: None,
                     };
                     if has_shadow {
                         let mut sc = base.clone();
@@ -1581,7 +1581,7 @@ impl TextRenderer for GlyphTextRenderer {
                         shader: None,
                         mesh: None,
                         stencil: None,
-                        native_emote: None,
+                        recovered_packet: None, native_emote: None,
                     });
                 }
             }
@@ -1633,7 +1633,7 @@ impl TextRenderer for GlyphTextRenderer {
                             shader: None,
                             mesh: None,
                             stencil: None,
-                            native_emote: None,
+                            recovered_packet: None, native_emote: None,
                         });
                     }
                 }

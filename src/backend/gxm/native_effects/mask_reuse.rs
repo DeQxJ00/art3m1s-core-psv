@@ -32,9 +32,7 @@ impl MaskReuse {
             return false;
         }
         for command in commands {
-            if let Some(draw) = encode(command, width, height) {
-                unsafe { art3m1s_gxm_draw_effect(&draw) };
-            }
+            draw_command(command,width,height);
         }
         if eligible {
             self.token = unsafe { art3m1s_gxm_group_mask_revision() };

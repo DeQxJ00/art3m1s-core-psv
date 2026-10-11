@@ -929,6 +929,7 @@ pub unsafe extern "C" fn art3m1s_runtime_set_emote_backend(
         return 0;
     }
     let backend = crate::runtime::emote::EmoteBackend::from_int(backend);
+    if backend == crate::runtime::emote::EmoteBackend::Recovered && !cfg!(feature="emote-recovery") {return 0;}
     if backend == crate::runtime::emote::EmoteBackend::ElunaExperimental
         && !cfg!(feature = "experimental-eluna")
     {

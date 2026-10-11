@@ -428,7 +428,7 @@ impl ElunaEmoteInstance {
                 source_label: sprite.draw_frame_info.path.clone(),
                 mask_labels: mask_labels.cloned().unwrap_or_default(),
             }),
-            native_emote: Some(native_emote_material(sprite)),
+            recovered_packet: None, native_emote: Some(native_emote_material(sprite)),
         })
     }
 }

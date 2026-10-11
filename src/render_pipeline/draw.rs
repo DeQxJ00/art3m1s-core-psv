@@ -288,6 +288,8 @@ pub struct DrawCommand {
     pub mesh: Option<DrawMesh>,
     pub stencil: Option<StencilMetadata>,
     pub native_emote: Option<NativeEmoteMaterial>,
+    /// An owned recovered renderer snapshot, replayed in this command position.
+    pub recovered_packet: Option<Arc<super::recovered::RecoveredPacket>>,
 }
 
 /// Stable compositor identity for matching draw commands across frames.

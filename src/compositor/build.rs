@@ -285,7 +285,7 @@ fn visit_uncached(
                 shader: command_shader.clone(),
                 mesh: None,
                 stencil: None,
-                native_emote: None,
+                recovered_packet: None, native_emote: None,
             },
         );
     } else if effective_file.is_none_or(str::is_empty)
@@ -325,7 +325,7 @@ fn visit_uncached(
                 shader: command_shader.clone(),
                 mesh: None,
                 stencil: None,
-                native_emote: None,
+                recovered_packet: None, native_emote: None,
             },
         );
     }
@@ -427,7 +427,7 @@ fn visit_uncached(
                     texture, size, transform: world, opacity: 1.0,
                     blend: BlendMode::Alpha, color: ColorFilter::default(),
                     clip: ClipRect::full(size), clip_bounds,
-                    shader: None, mesh: None, stencil: None, native_emote: None,
+                    shader: None, mesh: None, stencil: None, recovered_packet: None, native_emote: None,
                 });
                 Some([start, start + 1])
             });
@@ -878,7 +878,7 @@ mod tests {
             shader: None,
             mesh: None,
             stencil: None,
-            native_emote: None,
+            recovered_packet: None, native_emote: None,
         };
         let mut content_for = |id: &str| {
             if id == "1" {

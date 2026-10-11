@@ -94,6 +94,7 @@ fn kind(effect: Option<&ShaderEffect>) -> u32 {
     }
 }
 fn encode(cmd: &DrawCommand, width: u32, height: u32) -> Option<EffectDraw> {
+    if cmd.recovered_packet.is_some(){return None;}
     let clip = super::stage_clip(cmd.clip_bounds, width, height).ok()?;
     let m = cmd.transform.matrix2;
     let t = cmd.transform.translation;
@@ -213,7 +214,7 @@ fn group_command(group: &ShaderGroup, width: u32, height: u32) -> DrawCommand {
         shader: Some(group.effect.clone()),
         mesh: None,
         stencil: None,
-        native_emote: None,
+        recovered_packet: None, native_emote: None,
     }
 }
 fn full_stage_clip(clip: Option<[f32; 4]>, width: u32, height: u32) -> bool {
@@ -402,6 +403,35 @@ fn local_opaque_group(frame:&DrawList,index:usize,width:u32,height:u32)->Option<
     correction.clip.uv_scale=[w/iw*image.clip.uv_scale[0],h/ih*image.clip.uv_scale[1]];
     Some([fused,base_draw,encode(&correction,width,height)?])
 }
+fn draw_command(cmd:&DrawCommand,width:u32,height:u32) {
+    if let Some(packet)=&cmd.recovered_packet {
+        #[cfg(feature="emote-recovery")]
+        {
+            unsafe extern "C" {
+                fn art3m1s_recovery_packet_draw(id:u64,affine:*const f32,opacity:f32,clip:*const f32)->i32;
+                fn art3m1s_gxm_recovered_frame_error();
+            }
+            if !packet.on_owner_thread() || width!=960 || height!=544 || cmd.shader.is_some()
+                ||cmd.color!=ColorFilter::default() ||cmd.blend!=BlendMode::Alpha ||cmd.stencil.is_some() {
+                unsafe{art3m1s_gxm_recovered_frame_error()};
+                crate::core_warn!("recovered packet rejected unsupported host effect/size/thread");return;
+            }
+            let Ok(bounds)=super::stage_clip(cmd.clip_bounds,width,height) else{return;};
+            let Ok(clip)=crate::render_pipeline::recovered::clip_edges(bounds) else {
+                unsafe{art3m1s_gxm_recovered_frame_error()};return;
+            };
+            let m=cmd.transform.matrix2;let t=cmd.transform.translation;
+            let affine=[m.x_axis.x,m.x_axis.y,m.y_axis.x,m.y_axis.y,t.x,t.y];
+            let result=unsafe{art3m1s_recovery_packet_draw(packet.handle(),affine.as_ptr(),cmd.opacity,
+                clip.as_ref().map_or(std::ptr::null(),|c|c.as_ptr()))};
+            if result!=1 {unsafe{art3m1s_gxm_recovered_frame_error()};crate::core_warn!("recovered packet replay failed/deferred: {result}");}
+        }
+        #[cfg(not(feature="emote-recovery"))]
+        {let _=packet;}
+        return;
+    }
+    if let Some(draw)=encode(cmd,width,height){unsafe{art3m1s_gxm_draw_effect(&draw)}}
+}
 fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width: u32, height: u32, stats: &mut [u32;2], allow_flatten: bool, nodes:&mut NodeCache, admit:bool) {
     let mut index = start;
     while index < end {
@@ -521,9 +551,7 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
             }
             index = group.end;
         } else {
-            if let Some(draw) = encode(&frame.commands[index], width, height) {
-                unsafe { art3m1s_gxm_draw_effect(&draw) };
-            }
+            draw_command(&frame.commands[index],width,height);
             index += 1;
         }
     }
@@ -685,6 +713,18 @@ fn overlay_span(frame:&DrawList,width:u32,height:u32,previous:Option<&RetainedGr
     Some(ShaderGroup{key:None,start,end,effect:ShaderEffect{name:GROUP_COMPOSITE_SHADER.into(),uniforms:Default::default(),mask_texture:None,user_texture:None},clip_bounds:Some(bounds),mask_range:None})
 }
 pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&mut RetainedGroups) {
+    // Foreign packets bypass quad caches; ordered state commands are indivisible.
+    if frame.commands.iter().chain(&frame.mask_commands).any(|c|c.recovered_packet.is_some()) {
+        for cmd in frame.commands.iter().chain(&frame.mask_commands) {
+            if let Some(packet)=&cmd.recovered_packet {packet.prepare();}
+        }
+        *caches=RetainedGroups::default();
+        unsafe {super::art3m1s_gxm_frame_begin(width,height)};
+        let mut stats=[0,0];
+        render_range(frame,0,frame.commands.len(),frame.shader_groups.len(),width,height,&mut stats,false,&mut caches.nodes,false);
+        unsafe {art3m1s_gxm_report_groups(stats[0],stats[1]);super::art3m1s_gxm_frame_end()};
+        return;
+    }
     unsafe { super::art3m1s_gxm_frame_begin(width, height) };
     let mut stats=[0,0];
     if !caches.identity_blur_reported && frame.shader_groups.iter().any(|g|identity_blur_fallback(g,width,height)) {
@@ -1331,7 +1371,7 @@ mod tests {
     #[test]
     fn static_overlay_reuses_then_invalidates_on_content_texture_and_hide(){
         let mut f=DrawList::default();
-        let c=DrawCommand{texture:TextureId(41),size:TextureInfo{width:4,height:4},transform:glam::Affine2::from_translation(glam::vec2(20.,400.)),opacity:1.,blend:BlendMode::Alpha,color:ColorFilter::default(),clip:ClipRect{uv_offset:[0.,0.],uv_scale:[1.,1.],quad_size:[4.,4.]},clip_bounds:None,shader:None,mesh:None,stencil:None,native_emote:None};
+        let c=DrawCommand{texture:TextureId(41),size:TextureInfo{width:4,height:4},transform:glam::Affine2::from_translation(glam::vec2(20.,400.)),opacity:1.,blend:BlendMode::Alpha,color:ColorFilter::default(),clip:ClipRect{uv_offset:[0.,0.],uv_scale:[1.,1.],quad_size:[4.,4.]},clip_bounds:None,shader:None,mesh:None,stencil:None,recovered_packet:None,native_emote:None};
         f.commands=vec![c;40];let mut cache=RetainedGroups::default();
         EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
         assert!(!cache.overlay.baked);

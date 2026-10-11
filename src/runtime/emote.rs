@@ -16,6 +16,9 @@ use crate::render_pipeline::draw::{
 #[cfg(feature = "experimental-eluna")]
 mod eluna;
 
+#[cfg(feature = "emote-recovery")]
+mod recovery;
+
 mod pose_cache;
 mod scene_activity;
 mod vertex_cache;
@@ -68,12 +71,14 @@ pub(crate) enum EmoteBackend {
     #[default]
     Builtin,
     ElunaExperimental,
+    Recovered,
 }
 
 impl EmoteBackend {
     pub(crate) fn from_int(value: i32) -> Self {
         match value {
             1 => Self::ElunaExperimental,
+            2 => Self::Recovered,
             _ => Self::Builtin,
         }
     }
@@ -99,6 +104,8 @@ struct LayerSlots {
 }
 
 enum EmoteInstanceSlot {
+    #[cfg(feature = "emote-recovery")]
+    Recovered(recovery::RecoveryInstance),
     Builtin(EmoteInstance),
     #[cfg(feature = "experimental-eluna")]
     Eluna(eluna::ElunaEmoteInstance),
@@ -155,7 +162,7 @@ struct EmoteTextureState {
 
 impl EmoteState {
     fn set_mesh_ratio(&mut self, ratio: f32) -> bool {
-        if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 || self.backend != EmoteBackend::Builtin {
+        if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 || (self.backend != EmoteBackend::Builtin && !(self.backend == EmoteBackend::Recovered && ratio == 1.0)) {
             return false;
         }
         self.default_mesh_ratio = ratio;
@@ -165,6 +172,8 @@ impl EmoteState {
                     EmoteInstanceSlot::Builtin(instance) => instance.command(EmoteLayerCommand::SetMeshDivisionRatio { ratio }),
                     #[cfg(feature = "experimental-eluna")]
                     EmoteInstanceSlot::Eluna(_) => {}
+                    #[cfg(feature = "emote-recovery")]
+                    EmoteInstanceSlot::Recovered(_) => {}
                 }
             }
         }
@@ -239,6 +248,12 @@ impl EmoteState {
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
         let instance = match self.backend {
+            EmoteBackend::Recovered => {
+                #[cfg(feature = "emote-recovery")]
+                { EmoteInstanceSlot::Recovered(recovery::RecoveryInstance::new(&path,&bytes.bytes,width,height)?) }
+                #[cfg(not(feature = "emote-recovery"))]
+                { return Err("recovered E-Mote backend requires emote-recovery feature".into()); }
+            }
             EmoteBackend::Builtin => {
                 let mut instance = EmoteInstance::new_shared(generation, &path, bytes, width, height)?;
                 instance.command(EmoteLayerCommand::SetMeshDivisionRatio { ratio: self.default_mesh_ratio });
@@ -315,6 +330,12 @@ impl EmoteState {
         instance.command(command)
     }
 
+    #[cfg(feature = "emote-recovery")]
+    fn recovered(&self,id:&str,next:bool)->Option<&recovery::RecoveryInstance>{
+        let slots=self.layers.get(id)?;
+        match if next{slots.pending.as_ref()}else{slots.active.as_ref()}{Some(EmoteInstanceSlot::Recovered(i))=>Some(i),_=>None}
+    }
+
     fn builtin(&self, id: &str, next: bool) -> Result<&EmoteInstance, String> {
         let slots = self
             .layers
@@ -333,10 +354,14 @@ impl EmoteState {
     }
 
     pub fn mesh_ratio(&self, id: &str, next: bool) -> Result<f32, String> {
+        #[cfg(feature = "emote-recovery")]
+        if let Some(instance)=self.recovered(id,next){return instance.query(3, "");}
         Ok(self.builtin(id, next)?.mesh_division_ratio)
     }
 
     pub fn variable(&self, id: &str, next: bool, label: &str) -> Result<f32, String> {
+        #[cfg(feature = "emote-recovery")]
+        if let Some(instance)=self.recovered(id,next){return instance.query(1,label);}
         let instance = self.builtin(id, next)?;
         Ok(instance
             .player
@@ -346,6 +371,8 @@ impl EmoteState {
     }
 
     pub fn timeline_playing(&self, id: &str, next: bool, label: &str) -> Result<bool, String> {
+        #[cfg(feature = "emote-recovery")]
+        if let Some(instance)=self.recovered(id,next){return instance.query(2,label).map(|v|v!=0.);}
         let timelines = self.builtin(id, next)?.player.timelines();
         Ok(if label.is_empty() {
             !timelines.is_empty()
@@ -415,6 +442,8 @@ impl EmoteInstanceSlot {
     fn set_profile_enabled(&mut self, enabled: bool) {
         match self {
             Self::Builtin(_) => {}
+            #[cfg(feature = "emote-recovery")]
+            Self::Recovered(_) => {}
             #[cfg(feature = "experimental-eluna")]
             Self::Eluna(instance) => instance.set_profile_enabled(enabled),
         }
@@ -423,6 +452,8 @@ impl EmoteInstanceSlot {
     fn take_profile_stats(&self) -> EmoteProfileStats {
         match self {
             Self::Builtin(_) => EmoteProfileStats::default(),
+            #[cfg(feature = "emote-recovery")]
+            Self::Recovered(_) => EmoteProfileStats::default(),
             #[cfg(feature = "experimental-eluna")]
             Self::Eluna(instance) => instance.take_profile_stats(),
         }
@@ -432,6 +463,8 @@ impl EmoteInstanceSlot {
     fn as_builtin(&self) -> &EmoteInstance {
         match self {
             Self::Builtin(instance) => instance,
+            #[cfg(feature = "emote-recovery")]
+            Self::Recovered(_) => panic!("expected built-in E-Mote instance"),
             #[cfg(feature = "experimental-eluna")]
             Self::Eluna(_) => panic!("expected built-in E-Mote instance"),
         }
@@ -440,6 +473,8 @@ impl EmoteInstanceSlot {
     fn source_bytes(&self) -> u64 {
         match self {
             Self::Builtin(instance) => instance.source_bytes(),
+            #[cfg(feature = "emote-recovery")]
+            Self::Recovered(instance) => instance.source_bytes(),
             #[cfg(feature = "experimental-eluna")]
             Self::Eluna(instance) => instance.source_bytes(),
         }
@@ -453,12 +488,16 @@ impl EmoteInstanceSlot {
             }
             #[cfg(feature = "experimental-eluna")]
             Self::Eluna(instance) => instance.command(command),
+            #[cfg(feature = "emote-recovery")]
+            Self::Recovered(instance) => instance.command(command),
         }
     }
 
     fn advance(&mut self, _delta_ms: u64, builtin_frames: f32) -> bool {
         match self {
             Self::Builtin(instance) => instance.advance(builtin_frames),
+            #[cfg(feature = "emote-recovery")]
+            Self::Recovered(instance) => instance.advance(builtin_frames),
             #[cfg(feature = "experimental-eluna")]
             Self::Eluna(instance) => instance.advance(_delta_ms),
         }
@@ -471,6 +510,8 @@ impl EmoteInstanceSlot {
     ) -> Result<Vec<DrawCommand>, String> {
         match self {
             Self::Builtin(instance) => instance.build_commands(provider, retained),
+            #[cfg(feature = "emote-recovery")]
+            Self::Recovered(instance) => instance.build_commands(),
             #[cfg(feature = "experimental-eluna")]
             Self::Eluna(instance) => instance.build_commands(provider, retained),
         }
@@ -879,7 +920,7 @@ impl EmoteInstance {
                 source_label: item.layer_label,
                 mask_labels: item.stencil_mask_layers,
             }),
-            native_emote: Some(native_material),
+            recovered_packet: None, native_emote: Some(native_material),
         })
     }
 }
