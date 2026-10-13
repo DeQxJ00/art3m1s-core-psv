@@ -432,10 +432,10 @@ fn draw_command(cmd:&DrawCommand,width:u32,height:u32) {
                 fn art3m1s_recovery_packet_draw(id:u64,affine:*const f32,opacity:f32,clip:*const f32)->i32;
                 fn art3m1s_gxm_recovered_frame_error();
             }
-            if !packet.on_owner_thread() || width!=960 || height!=544 || cmd.stencil.is_some()
+            if !packet.on_owner_thread() || width==0 || height==0 || cmd.stencil.is_some()
                 || !cmd.opacity.is_finite() || !(0.0..=1.0).contains(&cmd.opacity) {
                 unsafe{art3m1s_gxm_recovered_frame_error()};
-                crate::core_warn!("recovered packet rejected unsupported host effect/size/thread");return;
+                crate::core_warn!("recovered packet rejected stage={}x{} owner={} stencil={} opacity={}",width,height,packet.on_owner_thread(),cmd.stencil.is_some(),cmd.opacity);return;
             }
             let Ok(bounds)=super::stage_clip(cmd.clip_bounds,width,height) else{return;};
             let Ok(clip)=crate::render_pipeline::recovered::clip_edges(bounds) else {
@@ -443,6 +443,9 @@ fn draw_command(cmd:&DrawCommand,width:u32,height:u32) {
             };
             let m=cmd.transform.matrix2;let t=cmd.transform.translation;
             let affine=[m.x_axis.x,m.x_axis.y,m.y_axis.x,m.y_axis.y,t.x,t.y];
+            let Ok((affine,clip))=crate::render_pipeline::recovered::stage_to_vita(affine,clip,width,height) else {
+                unsafe{art3m1s_gxm_recovered_frame_error()};return;
+            };
             // Effects act on the completed character, not each overlapping mesh.
             // Use the same host isolation/composite path as ordinary scene groups.
             let isolate=cmd.opacity!=1. || cmd.color!=ColorFilter::default()

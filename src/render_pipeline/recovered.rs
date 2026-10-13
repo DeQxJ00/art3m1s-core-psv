@@ -52,8 +52,28 @@ pub(crate) fn clip_edges(bounds: Option<[f32;4]>) -> Result<Option<[f32;4]>,()> 
     if ![x,y,w,h].iter().chain(edges.iter()).all(|v|v.is_finite()) || w<=0. || h<=0. {return Err(())}
     Ok(Some(edges))
 }
+/// Packet vertices encode logical pixels using a fixed 960x544 NDC basis.
+/// Match the ordinary host bridge when the game's stage has another size.
+pub(crate) fn stage_to_vita(mut affine:[f32;6],mut clip:Option<[f32;4]>,width:u32,height:u32)
+    -> Result<([f32;6],Option<[f32;4]>),()> {
+    if width==0||height==0{return Err(())}
+    let sx=960./width as f32;let sy=544./height as f32;
+    for i in [0,2,4]{affine[i]*=sx;}
+    for i in [1,3,5]{affine[i]*=sy;}
+    if let Some(c)=clip.as_mut(){c[0]*=sx;c[2]*=sx;c[1]*=sy;c[3]*=sy;}
+    if !affine.iter().chain(clip.iter().flatten()).all(|v|v.is_finite()){return Err(())}
+    Ok((affine,clip))
+}
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn logical_stage_maps_geometry_and_clip_together(){
+        let a=[1.,0.,0.,1.,120.,90.];let c=Some([120.,90.,420.,290.]);
+        assert_eq!(stage_to_vita(a,c,960,544),Ok((a,c)));
+        assert_eq!(stage_to_vita(a,c,1920,1088),Ok(([0.5,0.,0.,0.5,60.,45.],Some([60.,45.,210.,145.]))));
+        let (mapped,bounds)=stage_to_vita([0.,1.,-1.,0.,1440.,810.],Some([0.,0.,1440.,810.]),1440,810).unwrap();
+        assert_eq!(mapped[4],960.);assert_eq!(mapped[5],544.);assert_eq!(bounds,Some([0.,0.,960.,544.]));
+        assert!(stage_to_vita(a,c,0,544).is_err());
+    }
     #[test] fn non_origin_clip_converts_extent_to_edges(){
         assert_eq!(clip_edges(Some([120.,90.,300.,200.])),Ok(Some([120.,90.,420.,290.])));
         assert_eq!(clip_edges(None),Ok(None));
