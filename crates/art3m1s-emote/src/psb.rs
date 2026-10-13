@@ -289,6 +289,25 @@ impl PsbDocument {
     }
 }
 
+/// Validate and expose the same plain PSB header to foreign model evaluators.
+/// Texture/body bytes stay untouched; plaintext input is borrowed.
+pub fn normalize_psb_header(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let header = parse_header(data)?;
+    if header.encryption_flags & !1 != 0 {
+        return Err(EmoteError::Unsupported("encrypted PSB bodies are not implemented yet".into()));
+    }
+    validate_body_start(data, &header)?;
+    if let Some(key) = header.header_key {
+        let mut plain = data.to_vec();
+        let end = PsbHeader::encoded_length(header.version)?;
+        crypt_header(&mut plain[8..end], key);
+        plain[6..8].fill(0);
+        Ok(std::borrow::Cow::Owned(plain))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(data))
+    }
+}
+
 fn parse_header(data: &[u8]) -> Result<PsbHeader> {
     if data.len() < 8 || data.get(0..4) != Some(PSB_MAGIC) {
         return Err(EmoteError::InvalidFormat("missing PSB signature".into()));
@@ -726,6 +745,28 @@ mod tests {
         crypt_header(&mut header[8..], key);
 
         assert_eq!(infer_header_key(&header, 4).unwrap(), key);
+    }
+
+    #[test]
+    fn normalizes_header_without_changing_body_and_rejects_corruption() {
+        let mut plain = vec![0u8; 80];
+        plain[..4].copy_from_slice(PSB_MAGIC);
+        plain[4..6].copy_from_slice(&4u16.to_le_bytes());
+        plain[8..12].copy_from_slice(&56u32.to_le_bytes());
+        for off in (12..40).step_by(4) { plain[off..off+4].copy_from_slice(&56u32.to_le_bytes()); }
+        plain[56] = 0x0d;
+        let checksum = adler32(&[&plain[8..40], &plain[44..56]].concat());
+        plain[40..44].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(normalize_psb_header(&plain).unwrap(), std::borrow::Cow::Borrowed(_)));
+        let mut encrypted = plain.clone();
+        encrypted[6..8].copy_from_slice(&1u16.to_le_bytes());
+        crypt_header(&mut encrypted[8..56], 439_510_497);
+        assert_eq!(normalize_psb_header(&encrypted).unwrap().as_ref(), plain.as_slice());
+        encrypted[20] ^= 1;
+        assert!(normalize_psb_header(&encrypted).is_err());
+        plain[6] = 2;
+        assert!(normalize_psb_header(&plain).is_err());
+        assert!(normalize_psb_header(&plain[..7]).is_err());
     }
 
     #[test]

@@ -10,13 +10,16 @@ unsafe extern "C" {
  fn art3m1s_recovery_advance(id:u64,frames:f32)->i32;
  fn art3m1s_recovery_capture(id:u64)->u64;
 }
-pub(super) struct RecoveryInstance {id:u64,owner:std::thread::ThreadId,bytes:u64}
+pub(super) struct RecoveryInstance {id:u64,owner:std::thread::ThreadId,bytes:u64,width:u32,height:u32}
 impl RecoveryInstance {
  pub(super) fn new(path:&str,bytes:&[u8],width:u32,height:u32)->Result<Self,String>{
+  crate::core_info!("[recovered-emote] create model={path} surface={width}x{height} bytes={}",bytes.len());
+  let normalized=art3m1s_emote::normalize_psb_header(bytes).map_err(|e|format!("recovered E-Mote PSB {path}: {e}"))?;
+  let bytes=normalized.as_ref();
   let path=CString::new(path).map_err(|_|"recovery path contains NUL")?;
   let id=unsafe{art3m1s_recovery_create(path.as_ptr(),bytes.as_ptr(),bytes.len(),width,height)};
-  if id==0{return Err("recovered E-Mote create failed (owner thread, PSB v2/v3/v4 and 960x544 required)".into());}
-  Ok(Self{id,owner:std::thread::current().id(),bytes:bytes.len() as u64})
+  if id==0{return Err("recovered E-Mote create failed (owner thread, PSB v2/v3/v4 and valid logical canvas required)".into());}
+  Ok(Self{id,owner:std::thread::current().id(),bytes:bytes.len() as u64,width,height})
  }
  fn owner(&self)->Result<(),String>{if self.owner==std::thread::current().id(){Ok(())}else{Err("recovered E-Mote operation requires its render owner thread".into())}}
  pub(super) fn source_bytes(&self)->u64{self.bytes}
@@ -46,8 +49,8 @@ impl RecoveryInstance {
   // Keep failures in the ordered list: frame_begin would erase an error set here.
   let packet=if self.owner().is_ok(){RecoveredPacket::from_handle(unsafe{art3m1s_recovery_capture(self.id)})}else{None}
    .unwrap_or_else(||{crate::core_warn!("recovered packet capture failed; submitting explicit failed snapshot");RecoveredPacket::failed()});
-  let size=TextureInfo{width:960,height:544};
-  Ok(vec![DrawCommand{texture:TextureId(0),size,transform:Affine2::IDENTITY,opacity:1.,blend:BlendMode::Alpha,color:ColorFilter::default(),clip:ClipRect::full(size),clip_bounds:None,shader:None,mesh:None,stencil:None,native_emote:None,recovered_packet:Some(packet)}])
+  let size=TextureInfo{width:self.width,height:self.height};
+  Ok(vec![DrawCommand{texture:TextureId(0),size,transform:Affine2::IDENTITY,opacity:1.,blend:BlendMode::Alpha,color:ColorFilter::default(),clip:ClipRect::full(size),clip_bounds:Some([0.,0.,self.width as f32,self.height as f32]),shader:None,mesh:None,stencil:None,native_emote:None,recovered_packet:Some(packet)}])
  }
 }
 impl Drop for RecoveryInstance {fn drop(&mut self){unsafe{art3m1s_recovery_destroy(self.id)}}}
