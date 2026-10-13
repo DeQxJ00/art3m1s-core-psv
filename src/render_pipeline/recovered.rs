@@ -13,7 +13,7 @@ impl RecoveredPacket {
     pub(crate) fn from_handle(handle: u64) -> Option<std::sync::Arc<Self>> {
         (handle != 0).then(|| std::sync::Arc::new(Self {handle, owner: std::thread::current().id()}))
     }
-    #[cfg(feature="emote-recovery")]
+    #[cfg(any(test,feature="emote-recovery"))]
     pub(crate) fn failed() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {handle:0,owner:std::thread::current().id()})
     }

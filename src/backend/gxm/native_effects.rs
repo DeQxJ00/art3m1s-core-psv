@@ -470,6 +470,17 @@ fn draw_command(cmd:&DrawCommand,width:u32,height:u32) {
     }
     if let Some(draw)=encode(cmd,width,height){unsafe{art3m1s_gxm_draw_effect(&draw)}}
 }
+// Adjacent packets share this scene; each packet still executes its own mask
+// reset and state restoration. Reject anything that would isolate again.
+#[cfg(any(test,feature="emote-recovery"))]
+fn recovered_group_parent(frame:&DrawList,start:usize,end:usize,inner:usize)->bool {
+    let Some(commands)=frame.commands.get(start..end) else{return false;};
+    !commands.is_empty() && commands.iter().all(|c|
+        c.recovered_packet.is_some() && c.opacity==1.
+        && c.color==ColorFilter::default() && c.shader.is_none()
+        && c.blend==BlendMode::Alpha)
+        && !frame.shader_groups.iter().take(inner).any(|g|g.start>=start && g.start<end && g.end>g.start)
+}
 fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width: u32, height: u32, stats: &mut [u32;2], allow_flatten: bool, nodes:&mut NodeCache, admit:bool) {
     let mut index = start;
     while index < end {
@@ -560,16 +571,10 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
                     index=group.end;continue;
                 }
             }
-            // The innermost single-packet shader group is also a recovered
-            // parent. No intervening target or nested isolation can consume DS.
+            // The innermost group may contain several adjacent characters.
+            // Their group effect still composites the combined source once.
             #[cfg(feature="emote-recovery")]
-            let recovered_parent=group.end==group.start+1
-                && frame.commands[group.start].recovered_packet.is_some()
-                && frame.commands[group.start].opacity==1.
-                && frame.commands[group.start].color==ColorFilter::default()
-                && frame.commands[group.start].shader.is_none()
-                && frame.commands[group.start].blend==BlendMode::Alpha
-                && next_group(frame,group.start,group.end,inner).is_none();
+            let recovered_parent=recovered_group_parent(frame,group.start,group.end,inner);
             let opened=unsafe {
                 #[cfg(feature="emote-recovery")]
                 {if recovered_parent {art3m1s_gxm_recovered_group_begin()} else {art3m1s_gxm_group_begin()}}
@@ -1696,6 +1701,24 @@ mod tests {
         for id in [42,43] {let mut c=group_command(&g,960,544);c.texture=TextureId(id);
             c.shader=None;c.blend=BlendMode::Alpha;f.push(c);}
         f.shader_groups.push(g);f
+    }
+    #[test]
+    fn recovered_parent_accepts_adjacent_packets_without_nested_isolation(){
+        let mut f=neutral_frame();f.shader_groups.clear();
+        f.commands.push(f.commands[0].clone());
+        for c in &mut f.commands {c.recovered_packet=Some(crate::render_pipeline::recovered::RecoveredPacket::failed());}
+        assert!(recovered_group_parent(&f,0,3,0));
+        assert!(recovered_group_parent(&f,0,1,0));
+        assert!(!recovered_group_parent(&f,0,0,0));
+        assert!(!recovered_group_parent(&f,0,4,0));
+        let good=f.commands[1].clone();
+        f.commands[1].opacity=0.5;assert!(!recovered_group_parent(&f,0,3,0));f.commands[1]=good.clone();
+        f.commands[1].color.grayscale=true;assert!(!recovered_group_parent(&f,0,3,0));f.commands[1]=good.clone();
+        f.commands[1].blend=BlendMode::Add;assert!(!recovered_group_parent(&f,0,3,0));f.commands[1]=good.clone();
+        f.commands[1].recovered_packet=None;assert!(!recovered_group_parent(&f,0,3,0));f.commands[1]=good;
+        f.shader_groups.push(test_group(GROUP_COMPOSITE_SHADER,0,3));
+        assert!(!recovered_group_parent(&f,0,3,1));
+        f.shader_groups[0].start=1;assert!(!recovered_group_parent(&f,0,3,1));
     }
     #[test]
     fn recovered_effects_composite_whole_source_once(){
