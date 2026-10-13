@@ -19,6 +19,12 @@ impl RecoveredPacket {
     }
     pub(crate) fn on_owner_thread(&self) -> bool { self.owner == std::thread::current().id() }
     pub(crate) fn handle(&self) -> u64 { self.handle }
+    pub(crate) fn source_over(&self)->bool {
+        #[cfg(feature="emote-recovery")]
+        { self.handle!=0 && self.on_owner_thread() && unsafe{art3m1s_recovery_packet_source_over(self.handle)}==1 }
+        #[cfg(not(feature="emote-recovery"))]
+        { false }
+    }
     /// Must be called before BeginScene. Deferred packets stay owned for retry.
     pub(crate) fn prepare(&self) -> bool {
         #[cfg(feature="emote-recovery")]
@@ -30,6 +36,7 @@ impl RecoveredPacket {
 #[cfg(feature="emote-recovery")]
 unsafe extern "C" {
     fn art3m1s_recovery_packet_prepare(handle: u64) -> i32;
+    fn art3m1s_recovery_packet_source_over(handle: u64) -> i32;
     // Thread-safe queue-only operation; native destruction happens on render owner.
     fn art3m1s_recovery_packet_release(handle: u64);
 }

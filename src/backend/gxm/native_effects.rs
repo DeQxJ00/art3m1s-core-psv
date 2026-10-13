@@ -299,7 +299,8 @@ fn passthrough_group_inner(frame: &DrawList, index: usize, width: u32, height: u
         || scalar(e,"negative",0.0)!=0.0 || scalar(e,"blendMode",0.0)!=0.0
         || e.uniforms.get("colorMultiply").is_some_and(|v|v.as_slice()!=[1.0,1.0,1.0])) { return false; }
     if frame.commands[g.start..g.end].iter().any(|c| c.blend!=BlendMode::Alpha
-        || c.stencil.is_some() || c.native_emote.is_some()) { return false; }
+        || c.stencil.is_some() || c.native_emote.is_some()
+        || c.recovered_packet.as_ref().is_some_and(|p|!p.source_over())) { return false; }
     let nested=|i:usize,n:&ShaderGroup| i<index && n.start>=g.start && n.end<=g.end;
     // Screen depends on the destination. A certified, ungrouped opaque prefix
     // replaces that destination before the light is drawn, making it identical
@@ -403,6 +404,26 @@ fn local_opaque_group(frame:&DrawList,index:usize,width:u32,height:u32)->Option<
     correction.clip.uv_scale=[w/iw*image.clip.uv_scale[0],h/ih*image.clip.uv_scale[1]];
     Some([fused,base_draw,encode(&correction,width,height)?])
 }
+// Coordinates are already baked into the recovered packet on replay; the
+// completed source is a full-stage premultiplied image. Shader uniforms and
+// mask/user texture bindings remain those of the inherited host command.
+fn recovered_composite(cmd:&DrawCommand,width:u32,height:u32)->Option<EffectDraw>{
+    let mut source=cmd.clone();source.recovered_packet=None;
+    source.transform=glam::Affine2::IDENTITY;
+    source.size=TextureInfo{width,height};source.clip=ClipRect::full(source.size);
+    source.mesh=None;source.native_emote=None;
+    source.blend=match source.blend {
+        BlendMode::Alpha=>BlendMode::PremultipliedAlpha,
+        BlendMode::Add=>BlendMode::PremultipliedAdd,
+        other=>other,
+    };
+    let mut draw=encode(&source,width,height)?;
+    if cmd.shader.is_none(){draw.effects.flags[0]=3.;}
+    else if kind(cmd.shader.as_ref())==1 {draw.effects.flags[0]=6.;} // rule on premultiplied character
+    // Unknown custom programs must never quietly become a plain composite.
+    if cmd.shader.is_some() && kind(cmd.shader.as_ref())==0 && draw.custom.program==0{return None;}
+    Some(draw)
+}
 fn draw_command(cmd:&DrawCommand,width:u32,height:u32) {
     if let Some(packet)=&cmd.recovered_packet {
         #[cfg(feature="emote-recovery")]
@@ -411,8 +432,8 @@ fn draw_command(cmd:&DrawCommand,width:u32,height:u32) {
                 fn art3m1s_recovery_packet_draw(id:u64,affine:*const f32,opacity:f32,clip:*const f32)->i32;
                 fn art3m1s_gxm_recovered_frame_error();
             }
-            if !packet.on_owner_thread() || width!=960 || height!=544 || cmd.shader.is_some()
-                ||cmd.color!=ColorFilter::default() ||cmd.blend!=BlendMode::Alpha ||cmd.stencil.is_some() {
+            if !packet.on_owner_thread() || width!=960 || height!=544 || cmd.stencil.is_some()
+                || !cmd.opacity.is_finite() || !(0.0..=1.0).contains(&cmd.opacity) {
                 unsafe{art3m1s_gxm_recovered_frame_error()};
                 crate::core_warn!("recovered packet rejected unsupported host effect/size/thread");return;
             }
@@ -422,8 +443,17 @@ fn draw_command(cmd:&DrawCommand,width:u32,height:u32) {
             };
             let m=cmd.transform.matrix2;let t=cmd.transform.translation;
             let affine=[m.x_axis.x,m.x_axis.y,m.y_axis.x,m.y_axis.y,t.x,t.y];
-            let result=unsafe{art3m1s_recovery_packet_draw(packet.handle(),affine.as_ptr(),cmd.opacity,
+            // Effects act on the completed character, not each overlapping mesh.
+            // Use the same host isolation/composite path as ordinary scene groups.
+            let isolate=cmd.opacity!=1. || cmd.color!=ColorFilter::default()
+                || cmd.shader.is_some() || cmd.blend!=BlendMode::Alpha;
+            let composite=if isolate { recovered_composite(cmd,width,height) } else {None};
+            if isolate && (composite.is_none() || unsafe{art3m1s_gxm_group_begin()}==0) {
+                unsafe{art3m1s_gxm_recovered_frame_error()};return;
+            }
+            let result=unsafe{art3m1s_recovery_packet_draw(packet.handle(),affine.as_ptr(),1.,
                 clip.as_ref().map_or(std::ptr::null(),|c|c.as_ptr()))};
+            if let Some(draw)=&composite {unsafe{art3m1s_gxm_group_end(draw)}}
             if result!=1 {unsafe{art3m1s_gxm_recovered_frame_error()};crate::core_warn!("recovered packet replay failed/deferred: {result}");}
         }
         #[cfg(not(feature="emote-recovery"))]
@@ -439,7 +469,8 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
             stats[0]+=1;
             // A proven neutral boundary needs no composite shader at all.
             // This must precede fusion, matching the retained-cache exclusion.
-            if allow_flatten && passthrough_group_inner(frame,group_index,width,height,true) {
+            if (allow_flatten || frame.commands[group.start..group.end].iter().any(|c|c.recovered_packet.is_some()))
+                && passthrough_group_inner(frame,group_index,width,height,true) {
                 stats[1]+=1;
                 render_range(frame,group.start,group.end,group_index,width,height,stats,allow_flatten,nodes,admit);
                 index=group.end;continue;
@@ -1621,6 +1652,29 @@ mod tests {
         for id in [42,43] {let mut c=group_command(&g,960,544);c.texture=TextureId(id);
             c.shader=None;c.blend=BlendMode::Alpha;f.push(c);}
         f.shader_groups.push(g);f
+    }
+    #[test]
+    fn recovered_effects_composite_whole_source_once(){
+        let mut c=neutral_frame().commands[0].clone();
+        c.opacity=0.5;c.color.multiply=[0.8,0.6,0.4];c.color.grayscale=true;c.color.negative=true;
+        c.transform=glam::Affine2::from_translation(glam::vec2(50.,70.));
+        c.clip_bounds=Some([10.,20.,300.,200.]);
+        let d=recovered_composite(&c,960,544).unwrap();
+        assert_eq!(d.transform,[1.,0.,0.,1.,0.,0.]);assert_eq!(d.blend,5);
+        assert_eq!(d.tint,[0.8,0.6,0.4,0.5]);assert_eq!(d.effects.flags,[3.,1.,1.,0.]);
+        assert_eq!(d.clip,[10.,20.,300.,200.]);assert_eq!(d.has_clip,1);
+        c.blend=BlendMode::Add;assert_eq!(recovered_composite(&c,960,544).unwrap().blend,6);
+        c.shader=Some(ShaderEffect{name:"unregistered-recovery-effect".into(),uniforms:Default::default(),mask_texture:None,user_texture:None});
+        assert!(recovered_composite(&c,960,544).is_none());
+    }
+    #[test]
+    fn nonneutral_wrappers_retain_isolation(){
+        let mut f=neutral_frame();assert!(passthrough_group_inner(&f,0,960,544,true));
+        for (name,value) in [("alpha",0.5),("negative",1.),("grayscale",1.),("blendMode",2.)] {
+            f.shader_groups[0].effect.uniforms.insert(name.into(),vec![value]);
+            assert!(!passthrough_group_inner(&f,0,960,544,true),"{name}");
+            f.shader_groups[0].effect.uniforms.remove(name);
+        }
     }
     #[test]
     fn rebuilding_neutral_external_wrapper_keeps_filter_and_retained_boundary(){
