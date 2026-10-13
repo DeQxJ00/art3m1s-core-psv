@@ -10,6 +10,14 @@ unsafe extern "C" {
     fn art3m1s_gxm_read_completed_frame(width: u32, height: u32, output: *mut u8, length: usize) -> i32;
 }
 
+#[cfg(feature="emote-recovery")]
+pub(super) struct PreparedFrame {
+    frame: DrawList,
+    texture_revision: u64,
+    clock: u64,
+    size: (u32,u32),
+}
+
 impl CoreRuntime {
     pub fn reclaim_effect_gpu_cache(&mut self,bytes:usize)->usize {
         self.texture_provider.reclaim_effect_gpu_cache(bytes)
@@ -67,6 +75,28 @@ impl CoreRuntime {
         if let Some(renderer) = self.text_renderer.as_mut() {
             renderer.prepare_textures(&mut self.texture_provider);
         }
+        #[cfg(feature="emote-recovery")]
+        self.prepare_recovered_scene();
+    }
+    #[cfg(feature="emote-recovery")]
+    fn prepare_recovered_scene(&mut self) {
+        // Build CPU snapshots while the previous GPU frame is still executing.
+        // Never replace the last *submitted* scene before actual presentation;
+        // transitions and first-frame loading keep the existing conservative path.
+        if self.prepared_gxm_frame.is_some() || self.last_submitted_frame.is_none()
+            || !self.emote.lock().unwrap().uses_recovered()
+            || RenderPipeline::new(&self.compositor).needs_trans_capture()
+            || RenderPipeline::new(&self.compositor).is_transition_in_progress()
+            || self.texture_provider.needs_upload_retry() { return; }
+        self.frame_visual_dirty |= self.drive_click_wait_icon();
+        if !self.frame_visual_dirty && self.last_submitted_texture_revision == self.texture_provider.content_revision() { return; }
+        self.texture_provider.begin_scene_build();
+        self.sync_backlog_snapshot();
+        let (frame,_,_) = self.build_bound_scene(true,None,None,DrawList::default());
+        self.prepared_gxm_frame=Some(PreparedFrame{frame,
+            texture_revision:self.texture_provider.content_revision(),
+            clock:self.compositor.clock_ms(),size:(self.stage_w,self.stage_h)});
+        self.frame_visual_dirty=false;
     }
     /// Draw only; the Vita host advances scripts before opening its GXM scene.
     pub fn present_gxm(&mut self) -> bool {
@@ -126,13 +156,26 @@ impl CoreRuntime {
             unsafe { art3m1s_gxm_cancel_capture() };
         }
         let build_started = profile.mark();
-        self.frame_visual_dirty |= self.drive_click_wait_icon();
+        let mut used_prepared = false;
+        #[cfg(feature="emote-recovery")]
+        if let Some(prepared)=self.prepared_gxm_frame.take() {
+            if !self.frame_visual_dirty && prepared.clock==self.compositor.clock_ms()
+                && prepared.size==(self.stage_w,self.stage_h)
+                && prepared.texture_revision==self.texture_provider.content_revision()
+                && !RenderPipeline::new(&self.compositor).is_transition_in_progress() {
+                self.last_submitted_frame=Some(prepared.frame);
+                self.last_submitted_texture_revision=prepared.texture_revision;
+                self.last_rendered_clock_ms=prepared.clock;
+                used_prepared=true;
+            } else { self.frame_visual_dirty=true; }
+        }
+        if !used_prepared { self.frame_visual_dirty |= self.drive_click_wait_icon(); }
         let texture_revision = self.texture_provider.content_revision();
-        let rebuild = self.frame_visual_dirty
+        let rebuild = !used_prepared && (self.frame_visual_dirty
             || self.texture_provider.needs_upload_retry()
             || self.last_submitted_frame.is_none()
             || self.last_submitted_texture_revision != texture_revision
-            || RenderPipeline::new(&self.compositor).is_transition_in_progress();
+            || RenderPipeline::new(&self.compositor).is_transition_in_progress());
 
         if rebuild {
             // An incomplete draw list must not freeze missing images on an

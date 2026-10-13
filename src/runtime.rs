@@ -108,6 +108,8 @@ pub struct CoreRuntime {
     /// advances every tick, but identical visual frames skip GPU work/readback.
     last_submitted_frame: Option<crate::render_pipeline::draw::DrawList>,
     last_submitted_texture_revision: u64,
+    #[cfg(all(target_os="vita",feature="gxm-backend",feature="emote-recovery"))]
+    prepared_gxm_frame: Option<render::PreparedFrame>,
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     scene_build_cache: crate::compositor::build_cache::SceneBuildCache,
     text_renderer: Option<Box<dyn TextRenderer>>,
@@ -291,6 +293,8 @@ impl CoreRuntime {
             last_rendered_clock_ms: 0,
             last_submitted_frame: None,
             last_submitted_texture_revision: 0,
+            #[cfg(all(target_os="vita",feature="gxm-backend",feature="emote-recovery"))]
+            prepared_gxm_frame: None,
             #[cfg(all(target_os="vita",feature="gxm-backend"))]
             scene_build_cache: Default::default(),
             text_renderer: None,
@@ -566,6 +570,8 @@ impl CoreRuntime {
     }
 
     fn advance_logic(&mut self, delta_ms: u64, profile: &mut crate::profiler::FrameProfile) {
+        #[cfg(all(target_os="vita",feature="gxm-backend",feature="emote-recovery"))]
+        { self.prepared_gxm_frame = None; }
         let logic_started = profile.mark();
         self.interpreter.begin_frame();
         let input_started = profile.mark();

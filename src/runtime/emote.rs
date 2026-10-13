@@ -161,6 +161,8 @@ struct EmoteTextureState {
 }
 
 impl EmoteState {
+    #[cfg(feature="emote-recovery")]
+    pub(super) fn uses_recovered(&self)->bool { self.backend == EmoteBackend::Recovered && !self.layers.is_empty() }
     fn set_mesh_ratio(&mut self, ratio: f32) -> bool {
         if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 || (self.backend != EmoteBackend::Builtin && !(self.backend == EmoteBackend::Recovered && ratio == 1.0)) {
             return false;
