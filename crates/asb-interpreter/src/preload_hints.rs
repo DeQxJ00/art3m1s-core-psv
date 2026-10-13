@@ -27,13 +27,9 @@ pub(crate) fn masks(lua:&Lua,ast:&Table)->Vec<String>{
             match t.raw_get::<Value>(i){Ok(Value::Table(child))=>walk(&child,depth+1,budget,visited,f),Ok(Value::Nil)|Err(_)=>break,_=>{}}
         }
     }
-    walk(ast,0,&mut budget,&mut visited,&mut |tag|{
+    let mut add_rule=|value:Option<Value>|{
         if result.len()>=128{return;}
-        let command=tag.raw_get::<Value>(1).ok().and_then(string);
-        // Image commands can carry their transition inline; the game's image
-        // helper forwards p.rule to the same getRule/trans path.
-        if !matches!(command.as_deref(),Some("extrans"|"trans"|"bg"|"fg"|"cg"|"cgdel")){return;}
-        let mut rule=match tag.raw_get::<Value>("rule").ok(){Some(Value::Integer(n)) if (0..=999).contains(&n)=>format!("{n:03}"),Some(Value::Number(n)) if n>=0.&&n<=999.&&n.fract()==0.=>format!("{:03}",n as u32),Some(v)=>match string(v){Some(s)=>s,None=>return},None=>return};
+        let mut rule=match value{Some(Value::Integer(n)) if (0..=999).contains(&n)=>format!("{n:03}"),Some(Value::Number(n)) if n>=0.&&n<=999.&&n.fract()==0.=>format!("{:03}",n as u32),Some(v)=>match string(v){Some(s)=>s,None=>return},None=>return};
         let mut language=false;
         if let Some(init)=&init{
             if let Ok(v)=init.raw_get::<Value>(rule.as_str()){
@@ -49,6 +45,27 @@ pub(crate) fn masks(lua:&Lua,ast:&Table)->Vec<String>{
         if language{return;}
         let path=format!("{}/{rule}{ext}",prefix.trim_end_matches(['/', '\\']));
         if seen.insert(path.clone()){result.push(path);}
+    };
+    // msg_getrule selects these init aliases inside Lua, so no literal rule
+    // appears on the story tag. Read only configured aliases (including the
+    // numbered message windows), without invoking the helper or guessing files.
+    // They use the existing bounded mask lane and chapter lifetime.
+    if let Some(init)=&init {
+        for mode in ["msgon","msgoff"] {
+            for suffix in std::iter::once(String::new()).chain((1..=99).map(|n|format!("{n:02}"))) {
+                let key=format!("rule_{mode}{suffix}");
+                if init.raw_get::<Value>(key.as_str()).is_ok_and(|v|!matches!(v,Value::Nil|Value::Boolean(false))) {
+                    if let Ok(value)=lua.create_string(&key){add_rule(Some(Value::String(value)));}
+                }
+            }
+        }
+    }
+    walk(ast,0,&mut budget,&mut visited,&mut |tag|{
+        let command=tag.raw_get::<Value>(1).ok().and_then(string);
+        // Image helpers forward p.rule to the same getRule/trans path.
+        if matches!(command.as_deref(),Some("extrans"|"trans"|"bg"|"fg"|"cg"|"cgdel")) {
+            add_rule(tag.raw_get::<Value>("rule").ok());
+        }
     });result
 }
 
@@ -130,6 +147,23 @@ pub(crate) fn probe_frames(_bytes:&[u8])->Vec<String>{vec![]}
         assert_eq!(rules,["image/rule/wipe_17.png","image/rule/cinema.png","image/rule/wipe_02.png","image/rule/wipe_13.png","image/rule/wipe_14.png"]);
         let patterns=animation_patterns(&ast);assert!(patterns.iter().any(|p|p==":ani/line2.ipt"));
         println!("installed chapter rules={rules:?} animation_patterns={patterns:?}");
+    }
+    #[test] fn implicit_message_rules_use_configured_aliases_without_executing_helpers(){
+        let lua=Lua::new();lua.load(r#"
+            game={path={rule='custom/rules/'},ruleext='.png'};
+            init={rule_msgon={'show',200},rule_msgoff={'hide',200},
+                  rule_msgoff01={'hide',300},rule_msgon02='window2',
+                  rule_msgoff03={'localized',200,true},rule_msgon04=false};
+            setmetatable(init,{__index=function() error('must use raw data') end});
+            function msg_getrule() error('must not run helper') end
+            ast={{{'msg',hide=1},{'extrans',rule='rule_msgoff'}}}
+        "#).exec().unwrap();
+        assert_eq!(masks(&lua,&data_table(&lua,"chapter.ast").unwrap()),
+            ["custom/rules/show.png","custom/rules/window2.png","custom/rules/hide.png"]);
+    }
+    #[test] fn missing_message_configuration_does_not_guess_asset_names(){
+        let lua=Lua::new();lua.load("game={path={rule='r'},ruleext='.png'};init={};ast={{{'msgoff'}}}").exec().unwrap();
+        assert!(masks(&lua,&data_table(&lua,"chapter.ast").unwrap()).is_empty());
     }
     #[test] fn animation_validates_mode_max_and_frame_table(){
         let lua=Lua::new();lua.load("ipt={mode='anime_full',base={max=3},{'one'},{'two'},{'one'}}").exec().unwrap();
