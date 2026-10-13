@@ -91,8 +91,25 @@ impl CoreRuntime {
         self.frame_visual_dirty |= self.drive_click_wait_icon();
         if !self.frame_visual_dirty && self.last_submitted_texture_revision == self.texture_provider.content_revision() { return; }
         self.texture_provider.begin_scene_build();
+        let started=std::time::Instant::now();
         self.sync_backlog_snapshot();
-        let (frame,_,_) = self.build_bound_scene(true,None,None,DrawList::default());
+        let backlog_us=started.elapsed().as_micros() as u64;
+        let mut timing=crate::profiler::FrameProfile::default();timing.enabled=true;
+        let (frame,_,_) = self.build_bound_scene(true,None,Some(&mut timing),DrawList::default());
+        thread_local! {static SAMPLE:std::cell::RefCell<(Option<std::time::Instant>,[u64;7])>=const{std::cell::RefCell::new((None,[0;7]))};}
+        SAMPLE.with(|sample|{
+            let mut sample=sample.borrow_mut();
+            let values=[1,started.elapsed().as_micros() as u64,backlog_us,timing.frame_text_ns/1000,
+                timing.frame_emote_ns/1000,timing.frame_scene_ns/1000,timing.frame_retain_ns/1000];
+            for (sum,value) in sample.1.iter_mut().zip(values){*sum+=value;}
+            let now=std::time::Instant::now();
+            if sample.0.is_some_and(|t|now.duration_since(t).as_secs()>=5){
+                let n=sample.1[0];
+                crate::core_info!("[recovered-build] frames={} total_us={} backlog_us={} text_us={} emote_us={} scene_us={} retain_us={}; averages",
+                    n,sample.1[1]/n,sample.1[2]/n,sample.1[3]/n,sample.1[4]/n,sample.1[5]/n,sample.1[6]/n);
+                sample.1=[0;7];sample.0=Some(now);
+            }else if sample.0.is_none(){sample.0=Some(now);}
+        });
         self.prepared_gxm_frame=Some(PreparedFrame{frame,
             texture_revision:self.texture_provider.content_revision(),
             clock:self.compositor.clock_ms(),size:(self.stage_w,self.stage_h)});

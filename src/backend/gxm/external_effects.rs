@@ -11,7 +11,7 @@ struct Uniform {name:String,offset:usize,count:usize}
 struct Metadata {abi:u32,source_hash:String,uniforms:Vec<Uniform>}
 #[derive(Deserialize,Serialize)]
 struct Converted {abi:u32,source_hash:String,cg_hash:String,cg:String,uniforms:Vec<Uniform>}
-struct Program {handle:u32,uniforms:Vec<Uniform>,builtin_gray:bool,builtin_mosaic:bool,builtin_blur:bool,builtin_kawase:bool,translation_kind:u32}
+struct Program {handle:u32,uniforms:Vec<Uniform>,builtin_gray:bool,builtin_cmul:bool,builtin_mosaic:bool,builtin_blur:bool,builtin_kawase:bool,translation_kind:u32}
 thread_local!{static PROGRAMS:RefCell<BTreeMap<String,Program>>=RefCell::new(BTreeMap::new());}
 thread_local!{static REVISION:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
 fn changed(){REVISION.with(|r|r.set(r.get().saturating_add(1)));}
@@ -64,7 +64,7 @@ pub(super) fn register(id:&str,source:&[u8],package:&[u8])->Result<(),String>{
    unsafe{art3m1s_gxm_external_release(handle)};return Err(format!("GXP uniform mismatch: {}",u.name));
   }
  }
- changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms:meta.uniforms,builtin_gray:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false,translation_kind:0}){unsafe{art3m1s_gxm_external_release(old.handle)}}});
+ changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms:meta.uniforms,builtin_gray:false,builtin_cmul:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false,translation_kind:0}){unsafe{art3m1s_gxm_external_release(old.handle)}}});
  Ok(())
 }
 pub(super) fn register_source(id:&str,source:&[u8])->Result<(),String>{
@@ -75,7 +75,7 @@ pub(super) fn register_source_at(id:&str,file:&str,source:&[u8])->Result<(),Stri
  if let Some((name,package))=super::bundled_effects::lookup(&hash(source)){
   unsafe{art3m1s_gxm_shader_stage(3)}; // builtin
   register(id,source,package)?;
-  PROGRAMS.with(|p|{if let Some(program)=p.borrow_mut().get_mut(id){program.builtin_gray=name=="gray";program.builtin_mosaic=name=="mosaic";program.builtin_blur=matches!(name,"blur_h"|"blur_v");program.builtin_kawase=matches!(name,"blur_k"|"blur_kx"|"blur_ky");program.translation_kind=match name{"blur_h"=>1,"blur_v"=>2,"blur_k"=>3,"blur_kx"=>4,"blur_ky"=>5,"gray"=>6,_=>0};}});
+  PROGRAMS.with(|p|{if let Some(program)=p.borrow_mut().get_mut(id){program.builtin_gray=name=="gray";program.builtin_cmul=name=="cmul";program.builtin_mosaic=name=="mosaic";program.builtin_blur=matches!(name,"blur_h"|"blur_v");program.builtin_kawase=matches!(name,"blur_k"|"blur_kx"|"blur_ky");program.translation_kind=match name{"blur_h"=>1,"blur_v"=>2,"blur_k"=>3,"blur_kx"=>4,"blur_ky"=>5,"gray"=>6,_=>0};}});
   crate::core_info!("[shader-builtin] id={} implementation={} bytes={} no runtime conversion/compile",id,name,package.len());
   return Ok(());
  }
@@ -100,7 +100,7 @@ pub(super) fn register_source_at(id:&str,file:&str,source:&[u8])->Result<(),Stri
    unsafe{art3m1s_gxm_external_release(handle)};return Err(format!("GXP uniform mismatch: {}",u.name));
   }
  }
- changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms,builtin_gray:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false,translation_kind:0}){unsafe{art3m1s_gxm_external_release(old.handle)}}});Ok(())
+ changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms,builtin_gray:false,builtin_cmul:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false,translation_kind:0}){unsafe{art3m1s_gxm_external_release(old.handle)}}});Ok(())
 }
 fn conversion_valid(c:&Converted,source:&[u8])->bool{
  if c.abi!=2||c.source_hash!=hash(source)||c.cg.len()>256*1024||c.cg_hash!=hash(c.cg.as_bytes()){return false;}
@@ -147,6 +147,18 @@ pub(super) fn premultiplied_gray(effect:&ShaderEffect)->bool{
  && effect.uniforms.get("alpha").is_none_or(|v|v.as_slice()==[1.])
  && PROGRAMS.with(|p|p.borrow().get(&effect.name).is_some_and(|p|p.builtin_gray))
 }
+// The bundled cmul shader scales premultiplied RGB and leaves alpha intact
+// when no mask is bound and alpha is one. Gains outside [0,1] can produce RGB
+// above alpha: keep those isolation boundaries (including intermediate clamps).
+pub(super) fn premultiplied_cmul(effect:&ShaderEffect)->bool{
+ effect.mask_texture.is_none() && effect.user_texture.is_none()
+ && effect.uniforms.get("alpha").is_none_or(|v|v.as_slice()==[1.])
+ && ["red","green","blue"].iter().all(|key|effect.uniforms.get(*key)
+     .is_some_and(|v|v.len()==1 && v[0].is_finite() && (0. ..=1.).contains(&v[0])))
+ && PROGRAMS.with(|p|p.borrow().get(&effect.name).is_some_and(|p|p.builtin_cmul))
+}
+#[cfg(test)]
+pub(super) fn mark_test_builtin_cmul(id:&str){PROGRAMS.with(|p|p.borrow_mut().get_mut(id).unwrap().builtin_cmul=true);changed();}
 #[cfg(test)]
 pub(super) fn mark_test_builtin_gray(id:&str){PROGRAMS.with(|p|p.borrow_mut().get_mut(id).unwrap().builtin_gray=true);}
 pub(super) fn encode(effect:Option<&ShaderEffect>,alpha:f32,color:[f32;3])->CustomDraw{

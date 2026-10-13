@@ -319,7 +319,8 @@ fn passthrough_group_inner(frame: &DrawList, index: usize, width: u32, height: u
             // neutral wrapper adds no operation. Only flatten during rebuild:
             // keep the outer retained result and its existing slot policy.
             || (rebuilding && (super::external_effects::premultiplied_gray(&n.effect)
-                || super::external_effects::premultiplied_spatial_filter(&n.effect)))
+                || super::external_effects::premultiplied_spatial_filter(&n.effect)
+                || (n.mask_range.is_none() && super::external_effects::premultiplied_cmul(&n.effect))))
             || (n.effect.name==GROUP_COMPOSITE_SHADER && (scalar(&n.effect,"blendMode",0.0)==0.0
                 || (scalar(&n.effect,"blendMode",0.0)==2.0 && screen_prefix.is_some_and(|p|p<n.start)))))) { return false; }
     if identity_blur || scalar(e,"opaque",0.0)==0.0 { return true; }
@@ -752,6 +753,18 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
         for cmd in frame.commands.iter().chain(&frame.mask_commands) {
             if let Some(packet)=&cmd.recovered_packet {packet.prepare();}
         }
+        thread_local! {static REPORT:std::cell::Cell<Option<std::time::Instant>>=const{std::cell::Cell::new(None)};}
+        REPORT.with(|last|{
+            let now=std::time::Instant::now();
+            if last.get().is_none_or(|t|now.duration_since(t).as_secs()>=15){
+                last.set(Some(now));
+                for (i,g) in frame.shader_groups.iter().enumerate().take(12){
+                    crate::core_info!("[recovered-group] index={} stage={}x{} range={}..{} neutral={} fused={} clip={:?} mask={:?} effect={:?}",
+                        i,width,height,g.start,g.end,passthrough_group_inner(frame,i,width,height,true),
+                        fused_group(frame,i,width,height).is_some(),g.clip_bounds,g.mask_range,g.effect);
+                }
+            }
+        });
         *caches=RetainedGroups::default();
         unsafe {super::art3m1s_gxm_frame_begin(width,height)};
         let mut stats=[0,0];
@@ -1678,6 +1691,45 @@ mod tests {
             assert!(!passthrough_group_inner(&f,0,960,544,true),"{name}");
             f.shader_groups[0].effect.uniforms.remove(name);
         }
+    }
+    #[test]
+    fn neutral_wrappers_around_verified_cmul_preserve_color_pass(){
+        let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
+        let id="cmul_wrapper_test";
+        super::super::external_effects::register_source(id,src).unwrap();
+        let mut f=neutral_frame();
+        f.shader_groups.insert(0,test_group(id,0,2));
+        for (key,value) in [("red",1.),("green",0.94509804),("blue",0.8901961)]{
+            f.shader_groups[0].effect.uniforms.insert(key.into(),vec![value]);
+        }
+        f.shader_groups.push(test_group(GROUP_COMPOSITE_SHADER,0,2));
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        super::super::external_effects::mark_test_builtin_cmul(id);
+        assert!(passthrough_group_inner(&f,1,960,544,true));
+        assert!(passthrough_group_inner(&f,2,960,544,true));
+        assert!(!passthrough_group_inner(&f,0,960,544,true));
+        let mut nodes=NodeCache::default();let mut stats=[0,0];
+        EVENTS.with(|v|v.borrow_mut().clear());
+        render_range(&f,0,2,3,960,544,&mut stats,true,&mut nodes,false);
+        assert_eq!(stats,[3,2]);
+        EVENTS.with(|v|assert_eq!(v.borrow().iter().filter(|e|*e=="begin-group").count(),1));
+        for bad in [-0.1,1.01,f32::INFINITY,f32::NAN]{
+            f.shader_groups[0].effect.uniforms.insert("red".into(),vec![bad]);
+            assert!(!passthrough_group_inner(&f,2,960,544,true));
+        }
+        f.shader_groups[0].effect.uniforms.insert("red".into(),vec![1.]);
+        f.shader_groups[0].mask_range=Some([0,1]);
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        f.shader_groups[0].mask_range=None;
+        f.shader_groups[0].effect.mask_texture=Some(TextureId(7));
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        f.shader_groups[0].effect.mask_texture=None;
+        f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        f.shader_groups[0].effect.uniforms.remove("alpha");
+        super::super::external_effects::register_source(id,src).unwrap();
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        super::super::external_effects::clear();
     }
     #[test]
     fn rebuilding_neutral_external_wrapper_keeps_filter_and_retained_boundary(){
