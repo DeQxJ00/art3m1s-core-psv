@@ -28,10 +28,15 @@ struct Entry {
 pub(crate) struct SceneBuildCache {
     entries: HashMap<String, Entry>,
     dynamic: HashSet<String>,
+    // Frame-local only: Scene is immutable during one build; addresses are
+    // identity keys, never dereferenced and never reused across begin().
+    candidates: HashMap<usize, bool>,
     revision: Option<u64>,
     pub hits: u64,
     pub builds: u64,
     frames: u64,
+    profile_frames: u64,
+    profile_ns: [u64;3],
 }
 impl SceneBuildCache {
     pub fn begin(&mut self, revision: u64, retry: bool, dynamic: impl Iterator<Item = String>) {
@@ -39,14 +44,27 @@ impl SceneBuildCache {
             self.entries.clear();
         }
         self.revision = Some(revision);
+        if self.frames % 120 == 0 { self.profile_frames += 1; }
+        self.candidates.clear();
         self.dynamic.clear();
         self.dynamic.extend(dynamic);
         for entry in self.entries.values_mut() {
             entry.seen = false;
         }
     }
+    // Sparse CPU diagnostics; all frame construction still executes normally.
+    pub(super) fn profile_mark(&self)->Option<std::time::Instant> {
+        (self.frames % 120 == 0).then(std::time::Instant::now)
+    }
+    pub(super) fn profile_add(&mut self,slot:usize,start:Option<std::time::Instant>) {
+        if let Some(start)=start {self.profile_ns[slot]+=start.elapsed().as_nanos() as u64;}
+    }
+    pub fn profile_sample(&self)->Option<(u64,[u64;3])> {
+        (self.frames % 300 == 0 && self.profile_frames>0).then(||(self.profile_frames,self.profile_ns.map(|ns|ns/self.profile_frames/1000)))
+    }
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.candidates.clear();
         self.revision = None;
     }
     pub fn finish(&mut self) {
@@ -99,16 +117,20 @@ impl SceneBuildCache {
         self.hits += 1;
         true
     }
-    pub(super) fn candidate(&self, scene: &Scene, id: &str) -> bool {
+    pub(super) fn candidate(&mut self, scene: &Scene, id: &str) -> bool {
         let Some(layer) = scene.get(id) else {
             return false;
         };
+        let key=layer as *const super::scene::Layer as usize;
+        if let Some(&candidate)=self.candidates.get(&key){return candidate;}
         // Cross-layer shader resource references and live tweens are evaluated
         // normally. Their static children can still use independent fragments.
-        !self.dynamic.contains(id)
+        let candidate = !self.dynamic.contains(id)
             && layer.tweens.is_empty()
             && layer.props.shader.as_deref().is_none_or(str::is_empty)
-            && layer.children.iter().all(|id| self.candidate(scene, id))
+            && layer.children.iter().all(|id| self.candidate(scene, id));
+        self.candidates.insert(key,candidate);
+        candidate
     }
     pub(super) fn store(
         &mut self,
@@ -121,7 +143,7 @@ impl SceneBuildCache {
     ) {
         let count = frame.commands.len() - start[0] + frame.mask_commands.len() - start[1];
         // Bound extra CPU command storage, never retain extra GPU textures.
-        self.entries.remove(id);
+        let previous = self.entries.remove_entry(id);
         let used: usize = self
             .entries
             .values()
@@ -130,31 +152,40 @@ impl SceneBuildCache {
         if count == 0 || used + count > 1024 || self.entries.len() >= 128 {
             return;
         }
-        let mut nodes = Vec::new();
+        let (key,mut nodes,mut fragment)=previous.map(|(key,entry)|(key,entry.nodes,entry.frame))
+            .unwrap_or_else(||(id.to_owned(),Vec::new(),DrawList::new()));
+        let mut cursor=0;
         fn collect(
             scene: &Scene,
             id: &str,
             edits: Option<&HashMap<String, String>>,
             out: &mut Vec<Stamp>,
+            cursor: &mut usize,
         ) {
             if let Some(l) = scene.get(id) {
-                out.push(Stamp {
-                    id: id.into(),
-                    revision: l.query_revision,
-                    edited: edits.and_then(|e| e.get(id)).cloned(),
-                });
+                let edited=edits.and_then(|e|e.get(id));
+                if let Some(stamp)=out.get_mut(*cursor) {
+                    if stamp.id!=id {id.clone_into(&mut stamp.id);}
+                    stamp.revision=l.query_revision;
+                    if stamp.edited.as_ref()!=edited {stamp.edited=edited.cloned();}
+                } else {
+                    out.push(Stamp {id:id.into(),revision:l.query_revision,edited:edited.cloned()});
+                }
+                *cursor+=1;
                 for c in &l.children {
-                    collect(scene, c, edits, out);
+                    collect(scene, c, edits, out, cursor);
                 }
             }
         }
-        collect(scene, id, edits, &mut nodes);
-        let mut fragment = DrawList {
-            commands: frame.commands[start[0]..].to_vec(),
-            command_keys: frame.command_keys[start[0]..].to_vec(),
-            mask_commands: frame.mask_commands[start[1]..].to_vec(),
-            shader_groups: frame.shader_groups[start[2]..].to_vec(),
-        };
+        collect(scene, id, edits, &mut nodes, &mut cursor);
+        nodes.truncate(cursor);
+        // Refresh every dependency and command, preserving only CPU capacity.
+        // Old mask/group offsets are discarded before applying the new origin.
+        fragment.clear_for_rebuild();
+        fragment.commands.extend_from_slice(&frame.commands[start[0]..]);
+        fragment.command_keys.extend_from_slice(&frame.command_keys[start[0]..]);
+        fragment.mask_commands.extend_from_slice(&frame.mask_commands[start[1]..]);
+        fragment.shader_groups.extend_from_slice(&frame.shader_groups[start[2]..]);
         for g in &mut fragment.shader_groups {
             g.start -= start[0];
             g.end -= start[0];
@@ -164,7 +195,7 @@ impl SceneBuildCache {
             }
         }
         self.entries.insert(
-            id.into(),
+            key,
             Entry {
                 parent,
                 nodes,

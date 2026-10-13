@@ -305,6 +305,17 @@ impl CoreRuntime {
     ///
     /// `trans_type`：`[load type=0..2]` 指定时在加载完成后执行一次转场
     /// （与 trans 标签 type 同值）；缺省瞬切。
+    /// Opt-in host benchmark; use the normal read-only save restoration path.
+    pub fn benchmark_load_save(&mut self, file: &str) -> i32 {
+        if file.is_empty() || file.len()>128 || file=="." || file==".." ||
+            !file.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) { return -1; }
+        if !self.interpreter.has_load_handler() { return 0; }
+        match self.handle_load_game(file, None) {
+            Ok(()) => 1,
+            Err(error) => { crate::core_error!("[save-bench] load failed: {}", error); -1 }
+        }
+    }
+
     pub(super) fn handle_load_game(
         &mut self,
         file: &str,

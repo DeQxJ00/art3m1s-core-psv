@@ -679,6 +679,13 @@ impl GxmTextureProvider {
                 self.remove(&name);
             }
         }
+        let mut idle_gpu=self.warm.parts().gpu+self.entries.values().filter(|e|e.reclaimable)
+            .map(|e|e.cache_bytes()-e.rgba.capacity()).sum::<usize>();
+        let gpu_limit=IDLE_GPU_BUDGET.min(idle_limit);
+        // Do not allocate/clone/sort the eviction queue when no eviction is
+        // needed. Pinning, budget accounting, diagnostics and physical-memory
+        // pressure handling below still run on every frame.
+        if idle_bytes>idle_limit || idle_gpu>gpu_limit {
         // One recency order across both tiers. Old decoded scenes must not
         // evict GPU copies of a hot animation merely because they are CPU-only.
         let mut reclaim:Vec<_>=idle.into_iter().map(|(used,name,bytes)|(used,name,0,bytes)).collect();
@@ -694,9 +701,6 @@ impl GxmTextureProvider {
         let tier_order=|tier|if near_claim{match tier{1|3=>0,0=>1,_=>2}}else{usize::from(tier==2)};
         reclaim.sort_unstable_by(|a,b|(!self.low_priority_idle(&a.1),tier_order(a.2),a.0,&a.1,a.2)
             .cmp(&(!self.low_priority_idle(&b.1),tier_order(b.2),b.0,&b.1,b.2)));
-        let mut idle_gpu=self.warm.parts().gpu+self.entries.values().filter(|e|e.reclaimable)
-            .map(|e|e.cache_bytes()-e.rgba.capacity()).sum::<usize>();
-        let gpu_limit=IDLE_GPU_BUDGET.min(idle_limit);
         for (_,name,tier,gpu_bytes) in reclaim {
             if idle_bytes<=idle_limit&&idle_gpu<=gpu_limit {break;}
             if !names.contains(&name)&&self.low_priority_idle(&name) {
@@ -753,6 +757,7 @@ impl GxmTextureProvider {
                     name,if tier==0{"gpu"}else{"decoded"},before-idle_bytes,before,idle_bytes,
                     idle_limit,self.decoded.contains_key(&name),names.len(),self.reclaim_samples);
             }
+        }
         }
         self.retain_count += 1;
         if let Some(b)=account.as_mut(){b.set_idle(idle_bytes);}

@@ -110,6 +110,9 @@ pub struct CoreRuntime {
     last_submitted_texture_revision: u64,
     #[cfg(all(target_os="vita",feature="gxm-backend",feature="emote-recovery"))]
     prepared_gxm_frame: Option<render::PreparedFrame>,
+    /// Empty CPU command storage from a retired submission; never a saved pose.
+    #[cfg(all(target_os="vita",feature="gxm-backend",feature="emote-recovery"))]
+    reusable_gxm_frame: crate::render_pipeline::draw::DrawList,
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     scene_build_cache: crate::compositor::build_cache::SceneBuildCache,
     text_renderer: Option<Box<dyn TextRenderer>>,
@@ -295,6 +298,8 @@ impl CoreRuntime {
             last_submitted_texture_revision: 0,
             #[cfg(all(target_os="vita",feature="gxm-backend",feature="emote-recovery"))]
             prepared_gxm_frame: None,
+            #[cfg(all(target_os="vita",feature="gxm-backend",feature="emote-recovery"))]
+            reusable_gxm_frame: Default::default(),
             #[cfg(all(target_os="vita",feature="gxm-backend"))]
             scene_build_cache: Default::default(),
             text_renderer: None,

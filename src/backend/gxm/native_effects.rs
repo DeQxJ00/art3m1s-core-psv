@@ -44,6 +44,10 @@ unsafe extern "C" {
     fn art3m1s_gxm_group_input_reuse_enabled()->i32;
     fn art3m1s_gxm_group_begin_cached_input(slot:u32)->i32;
     fn art3m1s_gxm_group_begin() -> i32;
+    #[cfg(feature="emote-recovery")]
+    fn art3m1s_gxm_recovered_group_begin() -> i32;
+    #[cfg(feature="emote-recovery")]
+    fn art3m1s_gxm_recovered_frame_hint();
     fn art3m1s_gxm_overlay_cache_enabled() -> i32;
     fn art3m1s_gxm_overlay_end_cached(slot:u32, bounds:*const f32) -> i32;
     fn art3m1s_gxm_group_mask_begin() -> i32;
@@ -452,7 +456,7 @@ fn draw_command(cmd:&DrawCommand,width:u32,height:u32) {
             let isolate=cmd.opacity!=1. || cmd.color!=ColorFilter::default()
                 || cmd.shader.is_some() || cmd.blend!=BlendMode::Alpha;
             let composite=if isolate { recovered_composite(cmd,width,height) } else {None};
-            if isolate && (composite.is_none() || unsafe{art3m1s_gxm_group_begin()}==0) {
+            if isolate && (composite.is_none() || unsafe{art3m1s_gxm_recovered_group_begin()}==0) {
                 unsafe{art3m1s_gxm_recovered_frame_error()};return;
             }
             let result=unsafe{art3m1s_recovery_packet_draw(packet.handle(),affine.as_ptr(),1.,
@@ -556,7 +560,23 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
                     index=group.end;continue;
                 }
             }
-            if unsafe { art3m1s_gxm_group_begin() } != 0 {
+            // The innermost single-packet shader group is also a recovered
+            // parent. No intervening target or nested isolation can consume DS.
+            #[cfg(feature="emote-recovery")]
+            let recovered_parent=group.end==group.start+1
+                && frame.commands[group.start].recovered_packet.is_some()
+                && frame.commands[group.start].opacity==1.
+                && frame.commands[group.start].color==ColorFilter::default()
+                && frame.commands[group.start].shader.is_none()
+                && frame.commands[group.start].blend==BlendMode::Alpha
+                && next_group(frame,group.start,group.end,inner).is_none();
+            let opened=unsafe {
+                #[cfg(feature="emote-recovery")]
+                {if recovered_parent {art3m1s_gxm_recovered_group_begin()} else {art3m1s_gxm_group_begin()}}
+                #[cfg(not(feature="emote-recovery"))]
+                {art3m1s_gxm_group_begin()}
+            };
+            if opened != 0 {
                 render_range(frame, group.start, group.end, inner, width, height, stats, allow_flatten,nodes,admit);
                 if let Some(all_passes)=half_passes {
                     if all_passes.len()==chain.len() && unsafe{
@@ -750,6 +770,10 @@ fn overlay_span(frame:&DrawList,width:u32,height:u32,previous:Option<&RetainedGr
 pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&mut RetainedGroups) {
     // Foreign packets bypass quad caches; ordered state commands are indivisible.
     if frame.commands.iter().chain(&frame.mask_commands).any(|c|c.recovered_packet.is_some()) {
+        // A background group may return to the main target before a portrait.
+        // Allow that fresh main scene to acquire unused private DS immediately.
+        #[cfg(feature="emote-recovery")]
+        unsafe{art3m1s_gxm_recovered_frame_hint()};
         for cmd in frame.commands.iter().chain(&frame.mask_commands) {
             if let Some(packet)=&cmd.recovered_packet {packet.prepare();}
         }
@@ -1325,6 +1349,10 @@ mod tests {
         event("begin-group".into());
         1
     }
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_recovered_group_begin() -> i32 { art3m1s_gxm_group_begin() }
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_recovered_frame_hint() {}
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_group_mask_begin() -> i32 {
         event("begin-mask".into());

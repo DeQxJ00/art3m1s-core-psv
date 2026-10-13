@@ -2161,6 +2161,11 @@ impl Interpreter {
     /// `sys`/`gscr`/`conf`/`scr`/`log` 等 Lua 表（`loadconv` → `fload_pluto`），
     /// 否则即便变量已恢复，承载游戏态与存档槽位的 Lua 表仍是旧的。
     /// **必须在 [`Self::restore_variables`] 之后调用**。
+    /// Diagnostic loaders must wait until the game registered its restore hook.
+    pub fn has_load_handler(&self) -> bool {
+        self.engine_ctx.lock().unwrap().event_handlers.contains_key("onLoad")
+    }
+
     pub fn fire_load_handler(&mut self) -> Result<()> {
         self.fire_load_handler_with_params(&HashMap::new())
     }

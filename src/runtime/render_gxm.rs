@@ -95,7 +95,8 @@ impl CoreRuntime {
         self.sync_backlog_snapshot();
         let backlog_us=started.elapsed().as_micros() as u64;
         let mut timing=crate::profiler::FrameProfile::default();timing.enabled=true;
-        let (frame,_,_) = self.build_bound_scene(true,None,Some(&mut timing),DrawList::default());
+        let reusable=std::mem::take(&mut self.reusable_gxm_frame);
+        let (frame,_,_) = self.build_bound_scene(true,None,Some(&mut timing),reusable);
         thread_local! {static SAMPLE:std::cell::RefCell<(Option<std::time::Instant>,[u64;7])>=const{std::cell::RefCell::new((None,[0;7]))};}
         SAMPLE.with(|sample|{
             let mut sample=sample.borrow_mut();
@@ -180,7 +181,12 @@ impl CoreRuntime {
                 && prepared.size==(self.stage_w,self.stage_h)
                 && prepared.texture_revision==self.texture_provider.content_revision()
                 && !RenderPipeline::new(&self.compositor).is_transition_in_progress() {
-                self.last_submitted_frame=Some(prepared.frame);
+                if let Some(mut retired)=self.last_submitted_frame.replace(prepared.frame){
+                    // The previous submission remains available through transition
+                    // capture and the host GPU fence. Release its contents here,
+                    // reusing only Vec capacity for the next CPU build.
+                    retired.clear_for_rebuild();self.reusable_gxm_frame=retired;
+                }
                 self.last_submitted_texture_revision=prepared.texture_revision;
                 self.last_rendered_clock_ms=prepared.clock;
                 used_prepared=true;
@@ -296,11 +302,23 @@ impl CoreRuntime {
         } else {
             pipeline.build_with_content(&mut self.texture_provider, content_for, text_for)
         };
+        let pipeline_ns=crate::profiler::FrameProfile::elapsed(scene_started);
         self.scene_build_cache.finish();
         if let Some((hits,builds,entries))=self.scene_build_cache.sample() {
             crate::core_info!("[scene-fragments] hits={} builds={} entries={}",hits,builds,entries);
         }
+        let stencil_started=profile.as_ref().and_then(|p|p.mark());
         frame.materialize_stencil_groups(crate::render_pipeline::shader::ALPHA_MASK_SHADER);
+        let stencil_ns=crate::profiler::FrameProfile::elapsed(stencil_started);
+        if let Some((samples,us))=self.scene_build_cache.profile_sample(){
+            crate::core_info!("[scene-cache-profile] sparse_frames={} replay_us={} candidate_us={} store_us={}; cumulative sampled averages",samples,us[0],us[1],us[2]);
+        }
+        if profile.as_ref().is_some_and(|p|p.enabled){
+            thread_local!{static PARTS:std::cell::RefCell<[u64;3]>=const{std::cell::RefCell::new([0;3])};}
+            PARTS.with(|parts|{let mut parts=parts.borrow_mut();parts[0]+=1;parts[1]+=pipeline_ns;parts[2]+=stencil_ns;
+                if parts[0]==300{crate::core_info!("[scene-parts] frames={} pipeline_us={} stencil_us={}; averages",parts[0],parts[1]/parts[0]/1000,parts[2]/parts[0]/1000);*parts=[0;3];}
+            });
+        }
         if let Some(p) = profile.as_deref_mut() {
             p.frame_scene_ns = crate::profiler::FrameProfile::elapsed(scene_started);
         }

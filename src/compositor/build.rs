@@ -154,6 +154,13 @@ fn visit(
     file_overrides: Option<&std::collections::HashMap<String, String>>,
     cache: &mut Option<&mut super::build_cache::SceneBuildCache>,
 ) {
+    // Hidden, non-tweening subtrees cannot contribute commands or callbacks.
+    // Reject them before recursively testing fragment-cache eligibility.
+    if let Some(layer) = scene.get(id) {
+        if layer.host_hidden || (layer.tweens.is_empty() && !layer.props.is_visible()) {
+            return;
+        }
+    }
     if cache.is_none() {
         visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,
             provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
@@ -162,15 +169,16 @@ fn visit(
     let parent=super::build_cache::ParentState {transform:parent_transform,opacity:parent_opacity,
         clip:parent_clip,shader:inherited_shader.clone(),keys:record_command_keys,crop_allowed:sprite_crop_allowed(scene,id)};
     if let Some(c)=cache.as_deref_mut() {
-        if c.replay(scene,id,&parent,file_overrides,frame){return;}
+        let mark=c.profile_mark();let hit=c.replay(scene,id,&parent,file_overrides,frame);c.profile_add(0,mark);
+        if hit{return;}
     }
-    let remember=cache.as_ref().is_some_and(|c|c.candidate(scene,id));
+    let remember=if let Some(c)=cache.as_deref_mut(){let mark=c.profile_mark();let yes=c.candidate(scene,id);c.profile_add(1,mark);yes}else{false};
     let start=[frame.commands.len(),frame.mask_commands.len(),frame.shader_groups.len()];
     // A cached parent owns the complete fragment; avoid duplicating every child.
     let mut held=if remember {cache.take()} else {None};
     visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,
         provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
-    if let Some(c)=held.as_deref_mut(){c.store(scene,id,parent,file_overrides,frame,start);}
+    if let Some(c)=held.as_deref_mut(){let mark=c.profile_mark();c.store(scene,id,parent,file_overrides,frame,start);c.profile_add(2,mark);}
     if remember {*cache=held;}
 }
 

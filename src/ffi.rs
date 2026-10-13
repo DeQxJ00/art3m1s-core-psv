@@ -1198,6 +1198,14 @@ pub unsafe extern "C" fn art3m1s_runtime_destroy(rt: *mut CoreRuntime) {
 
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_benchmark_load_save(rt: *mut CoreRuntime, file: *const std::ffi::c_char) -> i32 {
+    if rt.is_null() || file.is_null() { return -1; }
+    let Ok(file) = (unsafe { std::ffi::CStr::from_ptr(file) }).to_str() else { return -1; };
+    unsafe { &mut *rt }.benchmark_load_save(file)
+}
+
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_runtime_stage_width(rt: *const CoreRuntime) -> u32 {
     if rt.is_null() {
         return 0;
