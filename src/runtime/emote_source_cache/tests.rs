@@ -35,7 +35,7 @@ use crate::image_cache_budget::CacheBudget;
     budget.lock().unwrap().set_idle(0);
     {let mut s=c.state.lock().unwrap();c.evict_locked(&mut s,24,false);assert!(s.entries.is_empty());}
 }
-fn source(c:&Cache,size:usize)->Arc<Source>{Arc::new(Source{bytes:Arc::new(vec![0;size]),_reservation:c.reserve(size),_charge:Charge::observed(Owner::Source,size),parsed:Mutex::new(None)})}
+fn source(c:&Cache,size:usize)->Arc<Source>{Arc::new(Source{bytes:Arc::new(vec![0;size]),_reservation:c.reserve(size).map(Arc::new),_charge:Arc::new(Charge::observed(Owner::Source,size)),parsed:Mutex::new(None),#[cfg(feature="emote-recovery")] recovered:Mutex::new(None)})}
 #[test]fn repeated_load_shares_bytes_and_pressure_does_not_free_a_live_upload(){
     let budget=CacheBudget::new(80);let c=Cache::new(budget.clone(),64);
     let a=c.read_with("models\\one.psb",|c,_,_|Ok(source(c,32))).unwrap();
@@ -88,8 +88,8 @@ fn parsed_data_is_shared_but_players_are_independent_and_leases_survive_eviction
     let bytes=std::fs::read(std::env::var("EMOTE_CACHE_TEST_MODEL").unwrap()).unwrap();
     let budget=CacheBudget::new(64*1024*1024);let c=Cache::new(budget.clone(),32*1024*1024);
     let raw_size=bytes.capacity();
-    let a=c.read_with("model",|c,_,_|Ok(Arc::new(Source{bytes:Arc::new(bytes),_reservation:c.reserve(raw_size),
-        _charge:Charge::observed(Owner::Source,raw_size),parsed:Mutex::new(None)}))).unwrap();
+    let a=c.read_with("model",|c,_,_|Ok(Arc::new(Source{bytes:Arc::new(bytes),_reservation:c.reserve(raw_size).map(Arc::new),
+        _charge:Arc::new(Charge::observed(Owner::Source,raw_size)),parsed:Mutex::new(None),#[cfg(feature="emote-recovery")] recovered:Mutex::new(None)}))).unwrap();
     let first=c.model(&a,"model").unwrap();let second=c.model(&a,"model").unwrap();
     assert!(Arc::ptr_eq(&first,&second));assert!(first.source_document().is_none());
     assert_eq!(Arc::strong_count(&a.bytes),1); // Cached model owns no texture buffer.
@@ -111,8 +111,8 @@ fn eight_models_share_parsed_hits_and_evict_within_the_combined_quota(){
     for i in 1..=8 {
         let path=format!("model{i:02}.psb");let bytes=std::fs::read(root.join(&path)).unwrap();
         let size=bytes.capacity();
-        let raw=c.read_with(&path,|c,_,_|Ok(Arc::new(Source{bytes:Arc::new(bytes),_reservation:c.reserve(size),
-            _charge:Charge::observed(Owner::Source,size),parsed:Mutex::new(None)}))).unwrap();
+        let raw=c.read_with(&path,|c,_,_|Ok(Arc::new(Source{bytes:Arc::new(bytes),_reservation:c.reserve(size).map(Arc::new),
+            _charge:Arc::new(Charge::observed(Owner::Source,size)),parsed:Mutex::new(None),#[cfg(feature="emote-recovery")] recovered:Mutex::new(None)}))).unwrap();
         let first=c.model(&raw,&path).unwrap();drop(raw);
         let hit=c.read_with(&path,|_,_,_|panic!("repeat must use retained bytes")).unwrap();
         let second=c.model(&hit,&path).unwrap();assert!(Arc::ptr_eq(&first,&second));
@@ -140,8 +140,8 @@ fn parse_scratch_yields_to_published_data_and_transfers_without_double_charging(
 
 fn fixture_source(c:&Cache,path:&std::path::Path)->Arc<Source>{
     let bytes=std::fs::read(path).unwrap();let size=bytes.capacity();
-    Arc::new(Source{bytes:Arc::new(bytes),_reservation:Some(c.reserve(size).unwrap()),
-        _charge:Charge::observed(Owner::Source,size),parsed:Mutex::new(None)})
+    Arc::new(Source{bytes:Arc::new(bytes),_reservation:Some(Arc::new(c.reserve(size).unwrap())),
+        _charge:Arc::new(Charge::observed(Owner::Source,size)),parsed:Mutex::new(None),#[cfg(feature="emote-recovery")] recovered:Mutex::new(None)})
 }
 #[test]
 #[ignore = "requires EMOTE_CACHE_TEST_MODELS external fixture directory"]
@@ -191,4 +191,13 @@ fn preparse_pressure_keeps_bytes_for_retry_demand_and_cancellation(){
     }));
     c.plan(&[]);assert_eq!(budget.lock().unwrap().emote,0);assert_eq!(budget.lock().unwrap().emote_scratch,0);
     assert!(!c.process_one_with(|_,_,_|panic!("cancelled work must not run")));
+}
+
+#[test]fn shared_backing_keeps_budget_after_source_eviction_without_a_source_cycle(){
+ let budget=CacheBudget::new(128);let c=Cache::new(budget.clone(),64);
+ let original=c.read_with("model",|c,_,_|Ok(source(c,32))).unwrap();
+ let backing=original.bytes.clone();let reservation=original._reservation.clone();let charge=original._charge.clone();
+ let weak=Arc::downgrade(&original);drop(original);c.clear();
+ assert!(weak.upgrade().is_none());assert_eq!(backing.len(),32);assert_eq!(budget.lock().unwrap().emote,32);
+ drop(backing);drop(charge);drop(reservation);assert_eq!(budget.lock().unwrap().emote,0);
 }

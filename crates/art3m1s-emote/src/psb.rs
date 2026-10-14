@@ -308,6 +308,22 @@ pub fn normalize_psb_header(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
     }
 }
 
+/// Normalize only the owned header; resource bytes and allocation stay unchanged.
+/// All validation completes before modifying the caller's buffer.
+pub fn normalize_psb_header_in_place(data: &mut [u8]) -> Result<()> {
+    let header = parse_header(data)?;
+    if header.encryption_flags & !1 != 0 {
+        return Err(EmoteError::Unsupported("encrypted PSB bodies are not implemented yet".into()));
+    }
+    validate_body_start(data, &header)?;
+    if let Some(key) = header.header_key {
+        let end = PsbHeader::encoded_length(header.version)?;
+        crypt_header(&mut data[8..end], key);
+        data[6..8].fill(0);
+    }
+    Ok(())
+}
+
 fn parse_header(data: &[u8]) -> Result<PsbHeader> {
     if data.len() < 8 || data.get(0..4) != Some(PSB_MAGIC) {
         return Err(EmoteError::InvalidFormat("missing PSB signature".into()));
@@ -762,6 +778,12 @@ mod tests {
         encrypted[6..8].copy_from_slice(&1u16.to_le_bytes());
         crypt_header(&mut encrypted[8..56], 439_510_497);
         assert_eq!(normalize_psb_header(&encrypted).unwrap().as_ref(), plain.as_slice());
+        let mut inplace = encrypted.clone();let ptr = inplace.as_ptr();
+        normalize_psb_header_in_place(&mut inplace).unwrap();
+        assert_eq!(inplace, plain);assert_eq!(inplace.as_ptr(), ptr);
+        normalize_psb_header_in_place(&mut inplace).unwrap();assert_eq!(inplace, plain);
+        let mut invalid = encrypted[..7].to_vec();let before = invalid.clone();
+        assert!(normalize_psb_header_in_place(&mut invalid).is_err());assert_eq!(invalid, before);
         encrypted[20] ^= 1;
         assert!(normalize_psb_header(&encrypted).is_err());
         plain[6] = 2;

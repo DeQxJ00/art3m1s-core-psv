@@ -35,7 +35,8 @@ impl CoreRuntime {
         if super::ogv_cache::pending(){super::surface_loader::wake_models(self.png_comments.clone());}
         if let Some(paths)=self.interpreter.query_emote_timeline(&mut self.emote_timeline_cursor){
             let paths:Vec<_>=paths.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect();
-            super::emote_source_cache::plan(&paths,self.png_comments.clone());
+            let recovered=self.emote.lock().unwrap().recovered_backend();
+            super::emote_source_cache::plan(&paths,self.png_comments.clone(),recovered);
         }
         let timeline_started=std::time::Instant::now();
         if let Some(future)=self.interpreter.query_surface_timeline(&mut self.surface_timeline_cursor) {

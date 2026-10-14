@@ -3,7 +3,7 @@ use super::*;
 use std::ffi::CString;
 use crate::render_pipeline::recovered::RecoveredPacket;
 unsafe extern "C" {
- fn art3m1s_recovery_create(path:*const std::ffi::c_char,data:*const u8,len:usize,width:u32,height:u32)->u64;
+ fn art3m1s_recovery_create_prepared(path:*const std::ffi::c_char,model:u64,width:u32,height:u32,lease:*mut std::ffi::c_void,release:extern "C" fn(*mut std::ffi::c_void))->u64;
  fn art3m1s_recovery_destroy(id:u64);
  fn art3m1s_recovery_command(id:u64,op:u32,label:*const std::ffi::c_char,args:*const f32,flags:u32)->i32;
  fn art3m1s_recovery_query(id:u64,op:u32,label:*const std::ffi::c_char,out:*mut f32)->i32;
@@ -12,14 +12,16 @@ unsafe extern "C" {
 }
 pub(super) struct RecoveryInstance {id:u64,owner:std::thread::ThreadId,bytes:u64,width:u32,height:u32}
 impl RecoveryInstance {
- pub(super) fn new(path:&str,bytes:&[u8],width:u32,height:u32)->Result<Self,String>{
-  crate::core_info!("[recovered-emote] create model={path} surface={width}x{height} bytes={}",bytes.len());
-  let normalized=art3m1s_emote::normalize_psb_header(bytes).map_err(|e|format!("recovered E-Mote PSB {path}: {e}"))?;
-  let bytes=normalized.as_ref();
+ pub(super) fn new(path:&str,source:&Arc<super::super::emote_source_cache::Source>,width:u32,height:u32)->Result<Self,String>{
+  crate::core_info!("[recovered-emote] create model={path} surface={width}x{height} bytes={}",source.bytes.len());
+  let model=super::super::emote_source_cache::recovered(source,path)?;
   let path=CString::new(path).map_err(|_|"recovery path contains NUL")?;
-  let id=unsafe{art3m1s_recovery_create(path.as_ptr(),bytes.as_ptr(),bytes.len(),width,height)};
-  if id==0{return Err("recovered E-Mote create failed (owner thread, PSB v2/v3/v4 and valid logical canvas required)".into());}
-  Ok(Self{id,owner:std::thread::current().id(),bytes:bytes.len() as u64,width,height})
+  let model_id=model.id;
+  let lease=Arc::into_raw(model) as *mut std::ffi::c_void;
+  // C owns this lease only on success, until deferred owner-thread teardown.
+  let id=unsafe{art3m1s_recovery_create_prepared(path.as_ptr(),model_id,width,height,lease,release_model)};
+  if id==0{release_model(lease);return Err("recovered E-Mote create failed (owner thread, PSB v2/v3/v4 and valid logical canvas required)".into());}
+  Ok(Self{id,owner:std::thread::current().id(),bytes:source.bytes.len() as u64,width,height})
  }
  fn owner(&self)->Result<(),String>{if self.owner==std::thread::current().id(){Ok(())}else{Err("recovered E-Mote operation requires its render owner thread".into())}}
  pub(super) fn source_bytes(&self)->u64{self.bytes}
@@ -54,3 +56,7 @@ impl RecoveryInstance {
  }
 }
 impl Drop for RecoveryInstance {fn drop(&mut self){unsafe{art3m1s_recovery_destroy(self.id)}}}
+
+extern "C" fn release_model(lease:*mut std::ffi::c_void){
+ unsafe{drop(Arc::from_raw(lease as *const super::super::emote_source_cache::RecoveredModel));}
+}

@@ -7,6 +7,11 @@ use art3m1s_emote::{EmoteModel,PsbDocument,PsbResourceData};
 use crate::image_cache_budget::SharedCacheBudget;
 use crate::resource_ledger::{Charge, Owner};
 
+#[cfg(feature="emote-recovery")]
+mod recovered;
+#[cfg(feature="emote-recovery")]
+pub(super) use recovered::RecoveredModel;
+
 const DEFERRED: &str = "model prefetch deferred: cache pressure";
 const CANCELLED: &str = "model preparse cancelled";
 // Temporary shared-pool headroom, separate from the retained model quota.
@@ -22,14 +27,16 @@ impl Drop for Reservation {
 pub(super) struct Source {
     pub bytes: Arc<Vec<u8>>,
     // Instances hold Source, not just bytes, until their last upload succeeds.
-    _reservation: Option<Reservation>,
-    _charge: Charge,
+    _reservation: Option<Arc<Reservation>>,
+    _charge: Arc<Charge>,
     parsed:Mutex<Option<Arc<ParsedModel>>>,
+    #[cfg(feature="emote-recovery")]
+    recovered:Mutex<Option<Arc<RecoveredModel>>>,
 }
 impl Source {
     pub fn uncached(bytes: Vec<u8>) -> Arc<Self> {
         let charge=Charge::observed(Owner::Source,bytes.capacity());
-        Arc::new(Self { bytes:Arc::new(bytes), _reservation:None, _charge:charge,parsed:Mutex::new(None) })
+        Arc::new(Self { bytes:Arc::new(bytes), _reservation:None, _charge:Arc::new(charge),parsed:Mutex::new(None),#[cfg(feature="emote-recovery")] recovered:Mutex::new(None) })
     }
 }
 pub(super) struct ParsedModel {
@@ -57,11 +64,12 @@ struct State {
     hits:u64, misses:u64, prefetch_hits:u64, evictions:u64,
 }
 pub(super) struct Cache { parse_gate:Mutex<()>, state:Mutex<State>, wake:Condvar, budget:SharedCacheBudget, limit:usize,
-    parsed_live:Arc<AtomicUsize>,parsed_hits:AtomicUsize,parsed_misses:AtomicUsize }
+    parsed_live:Arc<AtomicUsize>,parsed_hits:AtomicUsize,parsed_misses:AtomicUsize,
+    #[cfg(feature="emote-recovery")] recovered_prefetch:std::sync::atomic::AtomicBool }
 fn key(path:&str)->String { path.replace('\\',"/") }
 impl Cache {
     fn new(budget:SharedCacheBudget,limit:usize)->Self { Self{parse_gate:Mutex::new(()),state:Mutex::new(State::default()),wake:Condvar::new(),budget,limit,
-        parsed_live:Arc::new(AtomicUsize::new(0)),parsed_hits:AtomicUsize::new(0),parsed_misses:AtomicUsize::new(0)} }
+        parsed_live:Arc::new(AtomicUsize::new(0)),parsed_hits:AtomicUsize::new(0),parsed_misses:AtomicUsize::new(0),#[cfg(feature="emote-recovery")] recovered_prefetch:std::sync::atomic::AtomicBool::new(false)} }
     fn model(&self,source:&Arc<Source>,path:&str)->Result<Arc<ParsedModel>,String>{
         self.model_with(source,path,None)
     }
@@ -230,7 +238,11 @@ impl Cache {
         let mut defer=result.as_ref().err().is_some_and(|e|e==DEFERRED);
         if let Ok(source)=&result {
             if self.valid(&path,ticket){
-                match self.model_with(source,&path,Some(ticket)){
+                #[cfg(feature="emote-recovery")]
+                let prepared=if self.recovered_prefetch.load(Ordering::Relaxed){self.recovered_model(source,&path,Some(ticket)).map(|_|())}else{self.model_with(source,&path,Some(ticket)).map(|_|())};
+                #[cfg(not(feature="emote-recovery"))]
+                let prepared=self.model_with(source,&path,Some(ticket)).map(|_|());
+                match prepared{
                     Ok(_)=>{},
                     Err(e) if e==DEFERRED=>{defer=true;},
                     Err(e)=>{crate::core_info!("[emote-model-cache] preparse skipped path={} reason={}",path,e);},
@@ -270,10 +282,14 @@ fn load_source(cache:&Cache,path:&str,ticket:u64,prefetch:bool)->Result<Arc<Sour
         true
     })?;
     crate::core_info!("[emote-source-cache] read path={} bytes={} read_us={} prefetch={}",path,bytes.len(),started.elapsed().as_micros(),prefetch);
+    // Retain one normalized backing allocation for both parsers. Recovered
+    // templates can then borrow it without a second full texture/PSB copy.
+    #[cfg(feature="emote-recovery")]
+    let bytes={let mut owned=bytes;art3m1s_emote::normalize_psb_header_in_place(&mut owned).map_err(|e|e.to_string())?;owned};
     charge.commit(bytes.capacity());
     if bytes.capacity()!=size {drop(reservation.take());reservation=cache.reserve(bytes.capacity());}
     if bytes.get(..4)!=Some(b"PSB\0"){return Err(format!("invalid PSB signature: {path}"));}
-    Ok(Arc::new(Source{bytes:Arc::new(bytes),_reservation:reservation,_charge:charge,parsed:Mutex::new(None)}))
+    Ok(Arc::new(Source{bytes:Arc::new(bytes),_reservation:reservation.map(Arc::new),_charge:Arc::new(charge),parsed:Mutex::new(None),#[cfg(feature="emote-recovery")] recovered:Mutex::new(None)}))
 }
 fn read_bytes(path:&str,size:usize,valid:impl Fn()->bool)->Result<Vec<u8>,String> {
     let mut bytes=Vec::new();bytes.try_reserve_exact(size).map_err(|e|e.to_string())?;bytes.resize(size,0);
@@ -303,6 +319,8 @@ fn read_bytes(path:&str,size:usize,valid:impl Fn()->bool)->Result<Vec<u8>,String
 static SESSION:Mutex<Option<Arc<Cache>>>=Mutex::new(None);
 fn session()->Arc<Cache> {SESSION.lock().unwrap().get_or_insert_with(||Arc::new(Cache::new(crate::image_cache_budget::session_budget(),LIMIT))).clone()}
 pub(super) fn read(path:&str)->Result<Arc<Source>,String>{session().read_with(path,|c,p,t|load_source(c,p,t,false))}
+#[cfg(feature="emote-recovery")]
+pub(super) fn recovered(source:&Arc<Source>,path:&str)->Result<Arc<RecoveredModel>,String>{session().recovered_model(source,path,None)}
 pub(super) fn parsed(source:&Arc<Source>,path:&str)->Result<Arc<ParsedModel>,String>{session().model(source,path)}
 pub(super) fn invalidate(path:&str){if let Some(c)=SESSION.lock().unwrap().as_ref(){c.state.lock().unwrap().entries.remove(&key(path));}}
 pub(super) fn reset(){if let Some(c)=SESSION.lock().unwrap().take(){c.clear();}}
@@ -311,7 +329,12 @@ pub(super) fn reclaim(needed:usize){if let Some(c)=SESSION.lock().unwrap().as_re
 pub(super) fn process_one()->bool{let c=SESSION.lock().unwrap().clone();c.is_some_and(|c|c.process_one())}
 pub(super) fn pending()->bool{SESSION.lock().unwrap().as_ref().is_some_and(|c|!c.state.lock().unwrap().queue.is_empty())}
 #[cfg(all(target_os="vita",feature="gxm-backend"))]
-pub(super) fn plan(paths:&[String],comments:super::png_comments::SharedComments){session().plan(paths);super::surface_loader::wake_models(comments);}
+pub(super) fn plan(paths:&[String],comments:super::png_comments::SharedComments,recovered_backend:bool){
+ let c=session();
+ #[cfg(feature="emote-recovery")] c.recovered_prefetch.store(recovered_backend,Ordering::Relaxed);
+ #[cfg(not(feature="emote-recovery"))] let _=recovered_backend;
+ c.plan(paths);super::surface_loader::wake_models(comments);
+}
 
 /// Independent optional HUD extension: allocated source bytes, retained models,
 /// hits, misses, prefetch hits, evictions, planned models, resident planned models.

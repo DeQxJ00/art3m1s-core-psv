@@ -182,6 +182,8 @@ impl EmoteState {
         true
     }
 
+    pub(super) fn recovered_backend(&self)->bool {self.backend==EmoteBackend::Recovered}
+
     pub(super) fn set_backend(&mut self, backend: EmoteBackend) -> usize {
         if self.backend == backend {
             return 0;
@@ -252,7 +254,7 @@ impl EmoteState {
         let instance = match self.backend {
             EmoteBackend::Recovered => {
                 #[cfg(feature = "emote-recovery")]
-                { EmoteInstanceSlot::Recovered(recovery::RecoveryInstance::new(&path,&bytes.bytes,width,height)?) }
+                { EmoteInstanceSlot::Recovered(recovery::RecoveryInstance::new(&path,&bytes,width,height)?) }
                 #[cfg(not(feature = "emote-recovery"))]
                 { return Err("recovered E-Mote backend requires emote-recovery feature".into()); }
             }
