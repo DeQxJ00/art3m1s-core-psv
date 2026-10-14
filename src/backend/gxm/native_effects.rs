@@ -261,7 +261,7 @@ fn translated_chain(frame:&DrawList,chain:&[usize],inner:usize,width:u32,height:
         if g.mask_range.is_some()||!full_stage_clip(g.clip_bounds,width,height){0}
         else{super::external_effects::translation_kind(&g.effect)}
     }).collect();
-    if kinds.contains(&0)||(g.end==g.start+1&&kinds.as_slice()==[6]){return None;}
+    if kinds.contains(&0){return None;}
     Some(kinds)
 }
 fn opaque_cover(c: &DrawCommand, width: u32, height: u32) -> bool {
@@ -322,9 +322,8 @@ fn passthrough_group_inner(frame: &DrawList, index: usize, width: u32, height: u
             // pixels and still executes in its own isolation. A transparent,
             // neutral wrapper adds no operation. Only flatten during rebuild:
             // keep the outer retained result and its existing slot policy.
-            || (rebuilding && (super::external_effects::premultiplied_gray(&n.effect)
-                || super::external_effects::premultiplied_spatial_filter(&n.effect)
-                || (n.mask_range.is_none() && super::external_effects::premultiplied_cmul(&n.effect))))
+            || (rebuilding && (super::external_effects::premultiplied_spatial_filter(&n.effect)
+                || (n.mask_range.is_none() && super::external_effects::premultiplied_color(&n.effect))))
             || (n.effect.name==GROUP_COMPOSITE_SHADER && (scalar(&n.effect,"blendMode",0.0)==0.0
                 || (scalar(&n.effect,"blendMode",0.0)==2.0 && screen_prefix.is_some_and(|p|p<n.start)))))) { return false; }
     if identity_blur || scalar(e,"opaque",0.0)==0.0 { return true; }
@@ -1767,6 +1766,48 @@ mod tests {
         for bad in [-0.1,1.01,f32::INFINITY,f32::NAN]{
             f.shader_groups[0].effect.uniforms.insert("red".into(),vec![bad]);
             assert!(!passthrough_group_inner(&f,2,960,544,true));
+            assert_eq!(super::super::external_effects::translation_kind(&f.shader_groups[0].effect),0);
+        }
+        f.shader_groups[0].effect.uniforms.insert("red".into(),vec![1.]);
+        f.shader_groups[0].mask_range=Some([0,1]);
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        f.shader_groups[0].mask_range=None;
+        f.shader_groups[0].effect.mask_texture=Some(TextureId(7));
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        f.shader_groups[0].effect.mask_texture=None;
+        f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        f.shader_groups[0].effect.uniforms.remove("alpha");
+        super::super::external_effects::register_source(id,src).unwrap();
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        super::super::external_effects::clear();
+    }
+    #[test]
+    fn neutral_wrappers_around_verified_sepia_preserve_color_pass(){
+        let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
+        let id="sepia_wrapper_test";
+        super::super::external_effects::register_source(id,src).unwrap();
+        let mut f=neutral_frame();
+        f.shader_groups.insert(0,test_group(id,0,2));
+        for (key,value) in [("red",1.),("green",0.94509804),("blue",0.8901961)]{
+            f.shader_groups[0].effect.uniforms.insert(key.into(),vec![value]);
+        }
+        f.shader_groups.push(test_group(GROUP_COMPOSITE_SHADER,0,2));
+        assert!(!passthrough_group_inner(&f,2,960,544,true));
+        super::super::external_effects::mark_test_builtin_sepia(id);
+        assert_eq!(super::super::external_effects::translation_kind(&f.shader_groups[0].effect),6);
+        assert!(passthrough_group_inner(&f,1,960,544,true));
+        assert!(passthrough_group_inner(&f,2,960,544,true));
+        assert!(!passthrough_group_inner(&f,0,960,544,true));
+        let mut nodes=NodeCache::default();let mut stats=[0,0];
+        EVENTS.with(|v|v.borrow_mut().clear());
+        render_range(&f,0,2,3,960,544,&mut stats,true,&mut nodes,false);
+        assert_eq!(stats,[3,2]);
+        EVENTS.with(|v|assert_eq!(v.borrow().iter().filter(|e|*e=="begin-group").count(),1));
+        for bad in [-0.1,1.01,f32::INFINITY,f32::NAN]{
+            f.shader_groups[0].effect.uniforms.insert("red".into(),vec![bad]);
+            assert!(!passthrough_group_inner(&f,2,960,544,true));
+            assert_eq!(super::super::external_effects::translation_kind(&f.shader_groups[0].effect),0);
         }
         f.shader_groups[0].effect.uniforms.insert("red".into(),vec![1.]);
         f.shader_groups[0].mask_range=Some([0,1]);
@@ -1889,6 +1930,32 @@ mod tests {
         super::super::external_effects::clear();
     }
     #[test]
+    fn pointwise_colors_share_translation_and_invalidation_contract(){
+        use super::super::external_effects as effects;
+        let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
+        for (id,mark) in [("color_gray",effects::mark_test_builtin_gray as fn(&str)),
+            ("color_multiply",effects::mark_test_builtin_cmul as fn(&str)),
+            ("color_sepia",effects::mark_test_builtin_sepia as fn(&str))] {
+            effects::register_source(id,src).unwrap();
+            let mut f=neutral_frame();f.shader_groups=vec![test_group(id,0,1)];
+            for key in ["red","green","blue"]{f.shader_groups[0].effect.uniforms.insert(key.into(),vec![0.8]);}
+            assert!(translated_chain(&f,&[0],0,960,544).is_none());
+            mark(id);
+            assert_eq!(translated_chain(&f,&[0],0,960,544),Some(vec![6]));
+            f.shader_groups[0].end=2;
+            assert_eq!(translated_chain(&f,&[0],0,960,544),Some(vec![6]));
+            f.shader_groups[0].effect.user_texture=Some(TextureId(9));
+            assert!(translated_chain(&f,&[0],0,960,544).is_none());
+            f.shader_groups[0].effect.user_texture=None;
+            f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
+            assert!(translated_chain(&f,&[0],0,960,544).is_none());
+            f.shader_groups[0].effect.uniforms.remove("alpha");
+            effects::register_source(id,src).unwrap();
+            assert!(translated_chain(&f,&[0],0,960,544).is_none());
+        }
+        effects::clear();
+    }
+    #[test]
     fn translated_filters_require_verified_coordinates_and_independent_sources(){
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
         for (id,kind) in [("pan_h",1),("pan_v",2),("pan_gray",6)] {
@@ -1921,7 +1988,7 @@ mod tests {
         f.shader_groups=vec![test_group("pan_gray",0,2)];
         assert_eq!(translated_chain(&f,&[0],0,960,544),Some(vec![6]));
         f.shader_groups[0].end=1;
-        assert!(translated_chain(&f,&[0],0,960,544).is_none()); // cheap single sprite
+        assert_eq!(translated_chain(&f,&[0],0,960,544),Some(vec![6])); // one policy for single/multiple sources
         super::super::external_effects::clear();
     }
     #[test]
