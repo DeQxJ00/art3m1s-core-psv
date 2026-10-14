@@ -40,7 +40,7 @@ impl RecoveryInstance {
    EmoteLayerCommand::Step|EmoteLayerCommand::Skip=>return Err("recovery Step/Skip semantics are not yet implemented".into()),
   };
   let label=CString::new(label).map_err(|_|"recovery label contains NUL")?;
-  if unsafe{art3m1s_recovery_command(self.id,op,label.as_ptr(),args.as_ptr(),flags)}==1{Ok(())}else{Err(format!("recovery command {op} rejected (unsupported values or missing label)"))}
+  if unsafe{art3m1s_recovery_command(self.id,op,label.as_ptr(),args.as_ptr(),flags)}==1{Ok(())}else{Err(format!("recovery command {op} rejected: label={:?} flags={flags} args={args:?}",label.to_string_lossy()))}
  }
  pub(super) fn query(&self,op:u32,label:&str)->Result<f32,String>{self.owner()?;let label=CString::new(label).map_err(|_|"recovery query label contains NUL")?;let mut value=0.;
   if unsafe{art3m1s_recovery_query(self.id,op,label.as_ptr(),&mut value)}==1{Ok(value)}else{Err("recovery query failed".into())}}
