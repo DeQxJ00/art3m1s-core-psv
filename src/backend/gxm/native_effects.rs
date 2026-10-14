@@ -252,7 +252,7 @@ fn translated_chain(frame:&DrawList,chain:&[usize],inner:usize,width:u32,height:
     let g=&frame.shader_groups[chain[0]];
     if g.start>=g.end||g.end>frame.commands.len()||g.end-g.start>32
         ||next_group(frame,g.start,g.end,inner).is_some(){return None;}
-    if frame.commands[g.start..g.end].iter().any(|c|c.shader.is_some()||c.mesh.is_some()
+    if frame.commands[g.start..g.end].iter().any(|c|c.recovered_packet.is_some()||c.shader.is_some()||c.mesh.is_some()
         ||c.stencil.is_some()||c.native_emote.is_some()||c.color.grayscale||c.color.negative
         ||!matches!(c.blend,BlendMode::Alpha|BlendMode::PremultipliedAlpha)
         ||!full_stage_clip(c.clip_bounds,width,height)){return None;}
@@ -487,7 +487,10 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
             stats[0]+=1;
             // A proven neutral boundary needs no composite shader at all.
             // This must precede fusion, matching the retained-cache exclusion.
-            if (allow_flatten || frame.commands[group.start..group.end].iter().any(|c|c.recovered_packet.is_some()))
+            // Packet frames bypass retained quad caches, but unrelated backgrounds
+            // still permit independently proven neutral boundaries and pass chains.
+            let neutral_allowed=allow_flatten||frame.commands.iter().any(|c|c.recovered_packet.is_some());
+            if neutral_allowed
                 && passthrough_group_inner(frame,group_index,width,height,true) {
                 stats[1]+=1;
                 render_range(frame,group.start,group.end,group_index,width,height,stats,allow_flatten,nodes,admit);
@@ -542,7 +545,7 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
                     // Script-generated intermediate layers sit between the
                     // unary passes. Cross only independently proven neutral
                     // boundaries, never an opacity, mask or blend operation.
-                    if allow_flatten && passthrough_group_inner(frame,i,width,height,true) {
+                    if neutral_allowed && passthrough_group_inner(frame,i,width,height,true) {
                         stats[0]+=1;stats[1]+=1;inner=i;continue;
                     }
                     if !super::external_effects::registered(&g.effect.name){break;}
@@ -558,7 +561,10 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
             let half_passes=half_blur_chain(frame,&chain,inner,width,height).then(||
                 chain.iter().rev().filter_map(|&i|
                     encode(&group_command(&frame.shader_groups[i],width,height),width,height)).collect::<Vec<_>>());
-            if allow_flatten && let Some(kinds)=translated_chain(frame,&chain,inner,width,height) {
+            // The host owns this content/revision-keyed effect cache. Unlike
+            // retained quad snapshots it can survive a foreign packet elsewhere
+            // in the frame. translated_chain rejects packets inside its input.
+            if neutral_allowed && let Some(kinds)=translated_chain(frame,&chain,inner,width,height) {
                 let passes:Vec<_>=chain.iter().rev().filter_map(|&i|
                     encode(&group_command(&frame.shader_groups[i],width,height),width,height)).collect();
                 let sources:Vec<_>=frame.commands[group.start..group.end].iter().filter_map(|c|encode(c,width,height)).collect();
@@ -1700,6 +1706,36 @@ mod tests {
         for id in [42,43] {let mut c=group_command(&g,960,544);c.texture=TextureId(id);
             c.shader=None;c.blend=BlendMode::Alpha;f.push(c);}
         f.shader_groups.push(g);f
+    }
+    #[test]
+    fn packet_frame_caches_only_independent_background_blur(){
+        use super::super::external_effects as effects;
+        let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
+        let mut f=neutral_frame();f.shader_groups.clear();
+        for (id,step) in [("packet_blur_h","width"),("packet_blur_v","height")] {
+            effects::register_source(id,src).unwrap();effects::mark_test_translation(id,if step=="width"{1}else{2});
+            let mut g=test_group(id,0,1);
+            g.effect.uniforms.insert("weights".into(),vec![0.2,0.16,0.12,0.07,0.03,0.015,0.004,0.001]);
+            g.effect.uniforms.insert(step.into(),vec![1./960.]);
+            f.shader_groups.push(g);f.shader_groups.push(test_group(GROUP_COMPOSITE_SHADER,0,1));
+        }
+        // The foreign packet is OUTSIDE the background effect range.
+        f.commands[1].recovered_packet=Some(crate::render_pipeline::recovered::RecoveredPacket::failed());
+        let mut nodes=NodeCache::default();let mut stats=[0,0];
+        EVENTS.with(|v|v.borrow_mut().clear());
+        render_range(&f,0,1,4,960,544,&mut stats,false,&mut nodes,false);
+        EVENTS.with(|v|{
+            let v=v.borrow();assert_eq!(v.iter().filter(|e|*e=="begin-group").count(),1);
+            assert!(!v.iter().any(|e|e.starts_with("node-source")));
+            assert!(v.iter().any(|e|e=="translated:1:2"));
+        });
+        assert_eq!(stats,[4,2]);
+        // The same outer frame must never cache dynamic input from a packet.
+        f.commands[0].recovered_packet=f.commands[1].recovered_packet.clone();
+        EVENTS.with(|v|v.borrow_mut().clear());
+        render_range(&f,0,1,4,960,544,&mut [0,0],false,&mut nodes,false);
+        EVENTS.with(|v|assert!(!v.borrow().iter().any(|e|e.starts_with("translated:"))));
+        effects::clear();
     }
     #[test]
     fn recovered_parent_accepts_adjacent_packets_without_nested_isolation(){

@@ -532,10 +532,36 @@ impl Loader {
         // Promote an immediately needed image ahead of speculative requests.
         promote(&mut state,path);
         while state.entries.get(path).is_some_and(|e| e.pending) && !state.stop {
-            state = self.shared.wake.wait(state).unwrap();
+            state = self.wait_demand(state,path);
         }
         drop(state);
         if start.elapsed().as_micros() >= 1000 { crate::core_info!("[surface-prefetch] demand-wait path={} us={}", path, start.elapsed().as_micros()); }
+    }
+    fn wait_demand<'a>(&'a self,state:std::sync::MutexGuard<'a,State>,_path:&str)->std::sync::MutexGuard<'a,State>{
+        #[cfg(target_os="vita")]
+        {
+            // The linked pthread shim accepts MONOTONIC condition attributes
+            // but interprets timed deadlines as wall time (immediate timeout).
+            // Only foreground cache misses use this bounded sleep/recheck;
+            // release the state lock so the lower-priority loader can finish.
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            self.shared.state.lock().unwrap()
+        }
+        #[cfg(not(target_os="vita"))]
+        {
+        // Recheck the protected predicate even if a platform wake is delayed.
+        // A timeout never cancels a decode or exposes an incomplete payload.
+        let (state,result)=self.shared.wake.wait_timeout(state,std::time::Duration::from_secs(2)).unwrap();
+        if result.timed_out(){
+            crate::core_warn!("[surface-prefetch] demand-timeout path={} pending={} payload={} active={:?} queued={} stop={}",
+                _path,state.entries.get(_path).is_some_and(|e|e.pending),
+                state.entries.get(_path).is_some_and(|e|e.payload.is_some()),
+                state.active,state.queue_len(),state.stop);
+            self.shared.wake.notify_all();
+        }
+        state
+        }
     }
     fn key(&self, path: &str) -> Option<String> {
         let state = self.shared.state.lock().unwrap();
@@ -559,7 +585,7 @@ impl Loader {
         state.entries.get_mut(&key)?.retry_bytes = 0;
         promote(&mut state,&key);
         while state.entries.get(&key).is_some_and(|e| e.pending) && !state.stop {
-            state = self.shared.wake.wait(state).unwrap();
+            state = self.wait_demand(state,&key);
         }
         let entry = state.entries.get_mut(&key)?;
         entry.demanded = false;
@@ -1002,6 +1028,27 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn demand_rechecks_completed_payload_without_notification(){
+        let shared=Arc::new(Shared{state:Mutex::new(State::default()),wake:Condvar::new(),cache:None,budget:BUDGET});
+        let loader=Loader{shared:shared.clone(),worker:Mutex::new(None)};
+        let mut entry=story_entry(Payload::encoded(vec![7]));
+        entry.payload=None;entry.pending=true;
+        let mut state=shared.state.lock().unwrap();state.entries.insert("image".into(),entry);
+        let publisher_shared=shared.clone();
+        let publisher=std::thread::spawn(move||{
+            let mut state=publisher_shared.state.lock().unwrap();
+            let entry=state.entries.get_mut("image").unwrap();
+            entry.payload=Some(Payload::encoded(vec![7]));entry.pending=false;
+            // Deliberately omit notification to exercise the predicate retry.
+        });
+        state=loader.wait_demand(state,"image");
+        assert!(!state.entries["image"].pending);
+        assert!(state.entries["image"].payload.is_some());
+        drop(state);publisher.join().unwrap();
+        assert!(loader.take("image").is_some());
+        assert!(loader.take("image").is_none());
+    }
     fn story_entry(payload:Payload)->Entry{
         Entry{refs:1,ticket:1,bind_order:1,prepared:true,story_suppressed:false,pending:false,
             deferred:false,demanded:false,speculative:true,payload:Some(payload),kind:Kind::Image,leased:false,retry_bytes:0}
