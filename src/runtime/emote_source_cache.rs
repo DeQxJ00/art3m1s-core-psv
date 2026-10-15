@@ -63,12 +63,12 @@ struct State {
     queue:VecDeque<(String,u64)>, plan:Vec<String>, serial:u64,
     hits:u64, misses:u64, prefetch_hits:u64, evictions:u64,
 }
-pub(super) struct Cache { parse_gate:Mutex<()>, state:Mutex<State>, wake:Condvar, budget:SharedCacheBudget, limit:usize,
+pub(super) struct Cache { parse_gate:Mutex<()>, state:Mutex<State>, wake:Condvar, budget:SharedCacheBudget, limit:usize, max_entries:usize,
     parsed_live:Arc<AtomicUsize>,parsed_hits:AtomicUsize,parsed_misses:AtomicUsize,
     #[cfg(feature="emote-recovery")] recovered_prefetch:std::sync::atomic::AtomicBool }
 fn key(path:&str)->String { path.replace('\\',"/") }
 impl Cache {
-    fn new(budget:SharedCacheBudget,limit:usize)->Self { Self{parse_gate:Mutex::new(()),state:Mutex::new(State::default()),wake:Condvar::new(),budget,limit,
+    fn new(budget:SharedCacheBudget,limit:usize)->Self { Self{parse_gate:Mutex::new(()),state:Mutex::new(State::default()),wake:Condvar::new(),budget,limit,max_entries:4,
         parsed_live:Arc::new(AtomicUsize::new(0)),parsed_hits:AtomicUsize::new(0),parsed_misses:AtomicUsize::new(0),#[cfg(feature="emote-recovery")] recovered_prefetch:std::sync::atomic::AtomicBool::new(false)} }
     fn model(&self,source:&Arc<Source>,path:&str)->Result<Arc<ParsedModel>,String>{
         self.model_with(source,path,None)
@@ -98,7 +98,7 @@ impl Cache {
             let size=PsbDocument::parse_scratch_estimate(&source.bytes).map_err(|e|e.to_string())?;
             // Oversized/unknown models keep the normal on-demand path.
             if size>32*1024*1024{return Err("model preparse scratch estimate exceeds limit".into());}
-            Some(self.reserve_scratch(size).ok_or_else(||DEFERRED.to_owned())?)
+            Some(self.reserve_scratch_for(size,Some(path)).ok_or_else(||DEFERRED.to_owned())?)
         }else{None};
         self.parsed_misses.fetch_add(1,Ordering::Relaxed);
         let document=PsbDocument::from_shared_bytes(source.bytes.clone()).map_err(|e|e.to_string())?;
@@ -111,7 +111,7 @@ impl Cache {
         let descriptors=textures.len()*(16*std::mem::size_of::<usize>()+11*std::mem::size_of::<(String,std::ops::Range<usize>)>())
             +textures.keys().map(String::capacity).sum::<usize>();
         let bytes=model.retained_bytes_estimate()+descriptors+std::mem::size_of::<ParsedModel>();
-        let reservation=if source._reservation.is_some(){self.reserve_with_credit(bytes,&mut scratch)}else{None};
+        let reservation=if source._reservation.is_some(){self.reserve_with_credit_for(bytes,&mut scratch,prefetch.map(|_|path))}else{None};
         drop(scratch);
         let retained=reservation.is_some();
         self.parsed_live.fetch_add(bytes,Ordering::Relaxed);
@@ -121,9 +121,9 @@ impl Cache {
         Ok(parsed)
     }
     fn evict_locked(&self,s:&mut State,needed:usize,source_growth:bool) {
-        self.evict_with_credit(s,needed,source_growth,0);
+        self.evict_with_credit(s,needed,source_growth,0,0);
     }
-    fn evict_with_credit(&self,s:&mut State,needed:usize,source_growth:bool,credit:usize) {
+    fn evict_with_credit(&self,s:&mut State,needed:usize,source_growth:bool,credit:usize,protected:usize) {
         loop {
             let b=self.budget.lock().unwrap();
             // IDLE is lower priority: its occupied bytes may delay admission,
@@ -135,15 +135,27 @@ impl Cache {
             if fits { break; }
             // Leased source bytes cannot be reclaimed yet; never pretend that
             // removing a map entry released an allocation still used by a model.
-            let oldest=s.entries.iter().filter(|(_,e)|Arc::strong_count(&e.source)==1)
+            let oldest=s.entries.iter().filter(|(p,e)|Arc::strong_count(&e.source)==1&&!s.plan[..protected].contains(p))
                 .min_by_key(|(p,e)|(s.plan.contains(p),e.order)).map(|(p,_)|p.clone());
             let Some(path)=oldest else { break; };
             s.entries.remove(&path);s.evictions+=1;
         }
     }
-    fn reserve_scratch(&self,size:usize)->Option<ParseScratch>{
+    // Speculation may replace a later model, but never an earlier planned one.
+    // Once a foreground reader joins the job it has ordinary demand priority.
+    fn protected_prefix(s:&State,path:Option<&str>)->Option<usize>{
+        match path {
+            None=>Some(0),
+            Some(path) if s.pending.get(path).is_some_and(|p|p.demanded)=>Some(0),
+            Some(path)=>s.plan.iter().position(|p|p==path).map(|i|i+1),
+        }
+    }
+    #[cfg(test)]
+    fn reserve_scratch(&self,size:usize)->Option<ParseScratch>{self.reserve_scratch_for(size,None)}
+    fn reserve_scratch_for(&self,size:usize,path:Option<&str>)->Option<ParseScratch>{
         super::ogv_cache::reclaim(size);
-        let mut s=self.state.lock().unwrap();self.evict_locked(&mut s,size,false);
+        let mut s=self.state.lock().unwrap();let protected=Self::protected_prefix(&s,path)?;
+        self.evict_with_credit(&mut s,size,false,0,protected);
         let mut b=self.budget.lock().unwrap();
         if size>b.limit.saturating_sub(b.ready.max(b.ready_goal)+b.idle+b.video+b.emote+b.emote_scratch){
             let goal=b.emote+b.emote_scratch+size;b.request_emote(goal);return None;
@@ -153,10 +165,14 @@ impl Cache {
     }
     fn reserve(&self,size:usize)->Option<Reservation> {self.reserve_with_credit(size,&mut None)}
     fn reserve_with_credit(&self,size:usize,scratch:&mut Option<ParseScratch>)->Option<Reservation> {
+        self.reserve_with_credit_for(size,scratch,None)
+    }
+    fn reserve_with_credit_for(&self,size:usize,scratch:&mut Option<ParseScratch>,path:Option<&str>)->Option<Reservation> {
         super::ogv_cache::reclaim(size);
         if size>self.limit {return None;}
         let credit=scratch.as_ref().map_or(0,|s|s.bytes);
-        let mut s=self.state.lock().unwrap();self.evict_with_credit(&mut s,size,true,credit);
+        let mut s=self.state.lock().unwrap();let protected=Self::protected_prefix(&s,path)?;
+        self.evict_with_credit(&mut s,size,true,credit,protected);
         let mut b=self.budget.lock().unwrap();
         if size>self.limit.saturating_sub(b.emote) {return None;}
         if size>b.limit.saturating_sub(b.ready.max(b.ready_goal)+b.idle+b.video+b.emote+b.emote_scratch.saturating_sub(credit)) {
@@ -166,12 +182,24 @@ impl Cache {
         b.emote_scratch-=credit;if let Some(s)=scratch.as_mut(){s.bytes=0;}
         b.emote+=size;b.clear_emote_request();Some(Reservation{budget:self.budget.clone(),bytes:size})
     }
+    fn entry_room(&self,s:&mut State,path:&str,prefetch:bool)->bool {
+        if s.entries.contains_key(path){return true;}
+        let Some(protected)=Self::protected_prefix(s,prefetch.then_some(path)) else{return false;};
+        while s.entries.len()>=self.max_entries {
+            let victim=s.entries.iter().filter(|(p,e)|Arc::strong_count(&e.source)==1&&!s.plan[..protected].contains(p))
+                .min_by_key(|(p,e)|(s.plan.contains(p),e.order)).map(|(p,_)|p.clone());
+            let Some(victim)=victim else{return false;};
+            s.entries.remove(&victim);s.evictions+=1;
+        }
+        true
+    }
     fn finish(&self,path:&str,ticket:u64,result:Result<Arc<Source>,String>,prefetched:bool)->Result<Arc<Source>,String> {
         let mut s=self.state.lock().unwrap();
         if s.pending.get(path).is_some_and(|p|p.ticket==ticket) {
+            let room=result.as_ref().is_ok_and(|source|source._reservation.is_some())&&self.entry_room(&mut s,path,prefetched);
             s.pending.remove(path);
             if let Ok(source)=&result {
-                if source._reservation.is_some() {
+                if source._reservation.is_some()&&room {
                     s.serial+=1;let order=s.serial;
                     s.entries.insert(path.into(),Entry{source:source.clone(),order,prefetched});
                 }
@@ -191,7 +219,7 @@ impl Cache {
                 return Ok(source);
             }
             if let Some(p)=s.pending.get_mut(&path) {
-                if p.active { p.demanded=true;s=self.wake.wait(s).unwrap();continue; }
+                if p.active { p.demanded=true;self.wake.notify_all();s=self.wake.wait(s).unwrap();continue; }
                 // Reuse bytes when demand takes over a job waiting for scratch.
                 if let Some(source)=p.source.take(){
                     let ticket=p.ticket;p.active=true;p.demanded=true;
@@ -210,6 +238,16 @@ impl Cache {
     }
     fn valid(&self,path:&str,ticket:u64)->bool {
         self.state.lock().unwrap().pending.get(path).is_some_and(|p|p.ticket==ticket)
+    }
+    fn read_turn(&self,path:&str,ticket:u64,prefetch:bool)->bool {
+        let mut s=self.state.lock().unwrap();
+        loop {
+            let Some(p)=s.pending.get(path).filter(|p|p.ticket==ticket) else{return false;};
+            // Pause unrelated speculation between chunks, retaining progress.
+            // A foreground consumer of this same prefetch must never wait here.
+            if !prefetch||p.demanded||!s.pending.values().any(|p|p.active&&p.demanded){return true;}
+            s=self.wake.wait(s).unwrap();
+        }
     }
     fn plan(&self,paths:&[String]) {
         let mut s=self.state.lock().unwrap();
@@ -269,12 +307,13 @@ impl Cache {
 fn load_source(cache:&Cache,path:&str,ticket:u64,prefetch:bool)->Result<Arc<Source>,String> {
     let size=crate::ffi::query_asset_size(path).ok_or_else(||format!("model not found: {path}"))? as usize;
     if prefetch&&size>cache.limit{return Err("model exceeds prefetch quota".into());}
-    let mut reservation=cache.reserve(size);
+    if prefetch&&!cache.entry_room(&mut cache.state.lock().unwrap(),path,true){return Err(DEFERRED.into());}
+    let mut reservation=cache.reserve_with_credit_for(size,&mut None,prefetch.then_some(path));
     if prefetch&&reservation.is_none(){return Err("model prefetch deferred: cache pressure".into());}
     let mut charge=Charge::reserve(Owner::Source,size);
     let started=std::time::Instant::now();
     let bytes=read_bytes(path,size,||{
-        if !cache.valid(path,ticket){return false;}
+        if !cache.read_turn(path,ticket,prefetch){return false;}
         #[cfg(all(target_os="vita",feature="gxm-backend"))]
         if prefetch&&super::surface_loader::model_should_yield(){
             return cache.state.lock().unwrap().pending.get(path).is_some_and(|p|p.demanded);
@@ -287,7 +326,7 @@ fn load_source(cache:&Cache,path:&str,ticket:u64,prefetch:bool)->Result<Arc<Sour
     #[cfg(feature="emote-recovery")]
     let bytes={let mut owned=bytes;art3m1s_emote::normalize_psb_header_in_place(&mut owned).map_err(|e|e.to_string())?;owned};
     charge.commit(bytes.capacity());
-    if bytes.capacity()!=size {drop(reservation.take());reservation=cache.reserve(bytes.capacity());}
+    if bytes.capacity()!=size {drop(reservation.take());reservation=cache.reserve_with_credit_for(bytes.capacity(),&mut None,prefetch.then_some(path));}
     if bytes.get(..4)!=Some(b"PSB\0"){return Err(format!("invalid PSB signature: {path}"));}
     Ok(Arc::new(Source{bytes:Arc::new(bytes),_reservation:reservation.map(Arc::new),_charge:Arc::new(charge),parsed:Mutex::new(None),#[cfg(feature="emote-recovery")] recovered:Mutex::new(None)}))
 }
@@ -318,6 +357,15 @@ fn read_bytes(path:&str,size:usize,valid:impl Fn()->bool)->Result<Vec<u8>,String
 }
 static SESSION:Mutex<Option<Arc<Cache>>>=Mutex::new(None);
 fn session()->Arc<Cache> {SESSION.lock().unwrap().get_or_insert_with(||Arc::new(Cache::new(crate::image_cache_budget::session_budget(),LIMIT))).clone()}
+// Applied by the host before loading a game; never changes live player state.
+#[unsafe(no_mangle)]
+pub extern "C" fn art3m1s_emote_source_cache_configure(count:usize,mib:usize)->i32 {
+    if !(1..=16).contains(&count)||!(8..=128).contains(&mib){return 0;}
+    let mut slot=SESSION.lock().unwrap();
+    if let Some(old)=slot.take(){old.clear();}
+    let mut cache=Cache::new(crate::image_cache_budget::session_budget(),mib*1024*1024);
+    cache.max_entries=count;*slot=Some(Arc::new(cache));1
+}
 pub(super) fn read(path:&str)->Result<Arc<Source>,String>{session().read_with(path,|c,p,t|load_source(c,p,t,false))}
 #[cfg(feature="emote-recovery")]
 pub(super) fn recovered(source:&Arc<Source>,path:&str)->Result<Arc<RecoveredModel>,String>{session().recovered_model(source,path,None)}

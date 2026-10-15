@@ -837,8 +837,12 @@ impl UserData for EngineApi {
                 this.ctx.lock().unwrap().callbacks.debug(1, "[surface-prefetch] enabled portrait-layer cache compatibility", true);
             }
 
+            let restored = crate::emote_restore::repair_source(&path, repaired.as_deref().unwrap_or(&bytes));
+            if restored.is_some() {
+                this.ctx.lock().unwrap().callbacks.debug(1, "[emote-restore] enabled ordered face reconstruction", true);
+            }
             // lua.load 接受 &[u8]，文本源码与 luac 字节码均可。
-            lua.load(repaired.as_deref().unwrap_or(&bytes[..]))
+            lua.load(restored.as_deref().or(repaired.as_deref()).unwrap_or(&bytes[..]))
                 .set_name(path.as_str())
                 .exec()
                 .map_err(|e| mlua::Error::external(format!("include 执行 {path} 失败: {e}")))?;

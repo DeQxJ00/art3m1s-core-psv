@@ -1,5 +1,27 @@
 use super::*;
 use crate::image_cache_budget::CacheBudget;
+#[test]fn speculative_model_read_pauses_for_demand_and_resumes_without_restart(){
+    use std::{sync::mpsc, time::Duration};
+    let c=Arc::new(Cache::new(CacheBudget::new(128),64));
+    c.plan(&["background".into(),"foreground".into()]);
+    let ticket={let mut s=c.state.lock().unwrap();
+        let p=s.pending.get_mut("foreground").unwrap();p.active=true;p.demanded=true;
+        s.pending["background"].ticket};
+    let foreground_ticket=c.state.lock().unwrap().pending["foreground"].ticket;
+    assert!(c.read_turn("foreground",foreground_ticket,false));
+    let (tx,rx)=mpsc::channel();let worker=c.clone();
+    let join=std::thread::spawn(move||tx.send(worker.read_turn("background",ticket,true)).unwrap());
+    assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+    {c.state.lock().unwrap().pending.remove("foreground");}c.wake.notify_all();
+    assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());join.join().unwrap();
+    assert_eq!(c.state.lock().unwrap().pending["background"].ticket,ticket);
+}
+#[test]fn demanded_prefetch_bypasses_pause_and_cancelled_read_exits(){
+    let c=Cache::new(CacheBudget::new(128),64);c.plan(&["a".into(),"b".into()]);
+    let ticket={let mut s=c.state.lock().unwrap();for p in s.pending.values_mut(){p.active=true;p.demanded=true;}s.pending["a"].ticket};
+    assert!(c.read_turn("a",ticket,true));
+    c.clear();assert!(!c.read_turn("a",ticket,true));
+}
 #[test]fn pressure_deferred_prefetch_retries_after_idle_release_and_cancel_drops_the_job(){
     let budget=CacheBudget::new(100);let c=Cache::new(budget.clone(),64);
     budget.lock().unwrap().set_idle(100);c.plan(&["next".into()]);
@@ -200,4 +222,73 @@ fn preparse_pressure_keeps_bytes_for_retry_demand_and_cancellation(){
  let weak=Arc::downgrade(&original);drop(original);c.clear();
  assert!(weak.upgrade().is_none());assert_eq!(backing.len(),32);assert_eq!(budget.lock().unwrap().emote,32);
  drop(backing);drop(charge);drop(reservation);assert_eq!(budget.lock().unwrap().emote,0);
+}
+
+#[test]fn later_prefetch_cannot_evict_the_next_model_but_demand_can_proceed(){
+    let c=Cache::new(CacheBudget::new(128),64);
+    drop(c.read_with("near",|c,_,_|Ok(source(c,32))).unwrap());
+    let active=c.read_with("active",|c,_,_|Ok(source(c,32))).unwrap();
+    c.plan(&["near".into(),"far".into()]);
+    assert!(c.reserve_with_credit_for(32,&mut None,Some("far")).is_none());
+    drop(c.read_with("near",|_,_,_|panic!("near model must stay cached")).unwrap());
+    c.state.lock().unwrap().pending.get_mut("far").unwrap().demanded=true;
+    let demand=c.reserve_with_credit_for(32,&mut None,Some("far")).unwrap();
+    assert!(!c.state.lock().unwrap().entries.contains_key("near"));
+    assert_eq!(c.budget.lock().unwrap().emote,64);drop(demand);drop(active);
+}
+#[test]fn speculative_admission_reclaims_cold_entries_and_can_replace_later_models(){
+    let c=Cache::new(CacheBudget::new(128),64);
+    drop(c.read_with("near",|c,_,_|Ok(source(c,32))).unwrap());
+    drop(c.read_with("cold",|c,_,_|Ok(source(c,32))).unwrap());
+    c.plan(&["near".into(),"far".into()]);
+    let far=c.reserve_with_credit_for(32,&mut None,Some("far")).unwrap();
+    {let s=c.state.lock().unwrap();assert!(s.entries.contains_key("near"));assert!(!s.entries.contains_key("cold"));}
+    drop(far);c.clear();
+    drop(c.read_with("far",|c,_,_|Ok(source(c,64))).unwrap());
+    c.plan(&["near".into(),"far".into()]);
+    assert!(c.reserve_with_credit_for(32,&mut None,Some("near")).is_some());
+    assert!(!c.state.lock().unwrap().entries.contains_key("far"));
+}
+#[test]fn speculative_scratch_and_parsed_admission_preserve_earlier_models(){
+    let budget=CacheBudget::new(100);let c=Cache::new(budget.clone(),64);
+    drop(c.read_with("near",|c,_,_|Ok(source(c,32))).unwrap());
+    let active=c.read_with("active",|c,_,_|Ok(source(c,32))).unwrap();
+    c.plan(&["near".into(),"far".into()]);budget.lock().unwrap().set_ready(36);
+    assert!(c.reserve_scratch_for(16,Some("far")).is_none());
+    budget.lock().unwrap().set_ready(0);
+    let mut scratch=Some(c.reserve_scratch_for(16,Some("far")).unwrap());
+    assert!(c.reserve_with_credit_for(8,&mut scratch,Some("far")).is_none());
+    assert_eq!(budget.lock().unwrap().emote_scratch,16);
+    drop(scratch);drop(active);
+    drop(c.read_with("near",|_,_,_|panic!("scratch must preserve near model")).unwrap());
+    c.plan(&[]);
+    assert!(c.reserve_with_credit_for(8,&mut None,Some("far")).is_none());
+    assert!(c.reserve_scratch_for(8,Some("far")).is_none());
+}
+
+#[test]fn count_limit_evicts_lru_without_changing_live_model_bytes(){
+    let mut c=Cache::new(CacheBudget::new(256),128);c.max_entries=2;
+    let active=c.read_with("active",|c,_,_|Ok(source(c,16))).unwrap();
+    drop(c.read_with("cold",|c,_,_|Ok(source(c,16))).unwrap());
+    drop(c.read_with("next",|c,_,_|Ok(source(c,16))).unwrap());
+    {let s=c.state.lock().unwrap();assert_eq!(s.entries.len(),2);assert!(s.entries.contains_key("active"));assert!(!s.entries.contains_key("cold"));}
+    let next=c.read_with("next",|_,_,_|panic!("retained")).unwrap();
+    let extra=c.read_with("extra",|c,_,_|Ok(source(c,16))).unwrap();
+    assert_eq!(extra.bytes.len(),16);assert_eq!(c.state.lock().unwrap().entries.len(),2);
+    assert!(!c.state.lock().unwrap().entries.contains_key("extra"));
+    assert_eq!(active.bytes.len(),16);drop(next);drop(extra);drop(active);
+}
+#[test]fn count_limit_preserves_earlier_prefetch_and_budget_still_limits_capacity(){
+    let mut c=Cache::new(CacheBudget::new(256),32);c.max_entries=1;
+    drop(c.read_with("near",|c,_,_|Ok(source(c,16))).unwrap());
+    c.plan(&["near".into(),"far".into()]);
+    assert!(!c.entry_room(&mut c.state.lock().unwrap(),"far",true));
+    drop(c.read_with("near",|_,_,_|panic!("protected")).unwrap());
+    c.clear();c.max_entries=4;
+    drop(c.read_with("a",|c,_,_|Ok(source(c,24))).unwrap());
+    drop(c.read_with("b",|c,_,_|Ok(source(c,24))).unwrap());
+    assert_eq!(c.state.lock().unwrap().entries.len(),1);
+    let oversized=c.read_with("large",|c,_,_|Ok(source(c,48))).unwrap();
+    assert_eq!(oversized.bytes.len(),48);assert!(oversized._reservation.is_none());
+    assert!(!c.state.lock().unwrap().entries.contains_key("large"));
 }

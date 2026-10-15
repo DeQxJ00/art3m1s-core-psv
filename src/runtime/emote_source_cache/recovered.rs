@@ -35,7 +35,7 @@ impl Cache {
   // A hard C allocation cap, not an assumed scene-size estimate. Normalization
   // can copy the input once; its temporary copy is covered separately.
   let cap:usize=if prefetch.is_some(){8*1024*1024}else{0};
-  let mut scratch=if prefetch.is_some(){Some(self.reserve_scratch(cap.saturating_add(source.bytes.len())).ok_or_else(||DEFERRED.to_owned())?)}else{None};
+  let mut scratch=if prefetch.is_some(){Some(self.reserve_scratch_for(cap.saturating_add(source.bytes.len()),Some(path)).ok_or_else(||DEFERRED.to_owned())?)}else{None};
   self.parsed_misses.fetch_add(1,Ordering::Relaxed);
   let normalized=art3m1s_emote::normalize_psb_header(&source.bytes).map_err(|e|e.to_string())?;
   let (backing,source_reservation,source_charge,extra)=match normalized {
@@ -47,7 +47,7 @@ impl Cache {
   if prepared.0==0{return Err("recovered scene preparation failed or exceeded background allocation cap".into());}
   if !valid(){return Err(CANCELLED.into());}
   let bytes=size+extra+std::mem::size_of::<RecoveredModel>()+2*std::mem::size_of::<usize>();
-  let reservation=if source._reservation.is_some(){self.reserve_with_credit(bytes,&mut scratch)}else{None};
+  let reservation=if source._reservation.is_some(){self.reserve_with_credit_for(bytes,&mut scratch,prefetch.map(|_|path))}else{None};
   drop(scratch);
   let retained=reservation.is_some();
   self.parsed_live.fetch_add(bytes,Ordering::Relaxed);

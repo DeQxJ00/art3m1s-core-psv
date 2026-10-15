@@ -60,6 +60,7 @@ pub use ogv_timeline::OgvTimelineCursor;
 pub use emote_timeline::EmoteTimelineCursor;
 pub use surface_timeline::SurfaceTimelineCursor;
 mod message_roles;
+mod emote_restore;
 mod toolbar_roles;
 pub use message_roles::MessageLayerIds;
 #[cfg(feature = "backend-luau")]
