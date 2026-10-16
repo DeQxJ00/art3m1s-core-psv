@@ -441,8 +441,10 @@ impl GxmTextureProvider {
             // Allocation pressure is not a source/decode failure. Keep an owned
             // static image for a later frame, after normal retirement has freed
             // GPU memory; never reread the archive in this resolve call.
+            // The owned buffer already exists. Use the configured budget, not
+            // a smaller per-image cutoff that makes large sprites decode again.
             if !video && retain_pixels && !self.entries.contains_key(name)
-                && expected <= self.idle_budget.min(16 * 1024 * 1024)
+                && expected <= self.idle_budget
                 && let PixelStorage::Owned(mut data) = pixels
             {
                 data.transfer(Owner::Provider);
@@ -2142,6 +2144,29 @@ mod tests {
         for n in ["second","third"]{assert!(p.resolve(n).is_none());p.retain(&HashSet::new());}
         FAIL_UPLOAD.store(0,Ordering::Relaxed);
         assert!(p.idle_parts().total()<=p.idle_budget);
+    }
+
+    #[test]
+    fn failed_large_upload_preserves_pixels_until_gpu_recovery(){
+        let _guard=LOCK.lock().unwrap();
+        let mut bytes=Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2100,2541,image::Rgba([4,5,6,123]))
+            .write_to(&mut bytes,image::ImageFormat::Png).unwrap();
+        let bytes=bytes.into_inner();let reads=Rc::new(Cell::new(0));let count=reads.clone();
+        let mut p=GxmTextureProvider::new().with_source(move |_|{count.set(count.get()+1);Some(bytes.clone())});
+        p.idle_budget=32*1024*1024;
+        FAIL_UPLOAD.store(1,Ordering::Relaxed);
+        let first=p.resolve("large-sprite");
+        p.retain(&HashSet::from(["large-sprite".into()]));
+        let retry=p.resolve("large-sprite");
+        FAIL_UPLOAD.store(0,Ordering::Relaxed);
+        assert!(first.is_none()&&retry.is_none());
+        assert_eq!(reads.get(),1);assert_eq!(p.timing.decoded,1);
+        assert_eq!(p.decoded["large-sprite"].rgba.len(),2100*2541*4);
+        let (id,_)=p.resolve("large-sprite").unwrap();
+        assert_eq!(p.pixel_alpha(id,0,0),Some(123));
+        assert_eq!(reads.get(),1);assert_eq!(p.timing.decoded,1);
+        assert!(p.decoded.is_empty());
     }
 
     #[test]
