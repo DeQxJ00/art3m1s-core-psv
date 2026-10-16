@@ -24,6 +24,14 @@ mod scene_activity;
 mod vertex_cache;
 
 pub(super) type SharedEmoteState = Arc<Mutex<EmoteState>>;
+// Must remain on its creating render thread. Also joins if host construction
+// exits early, before any pending foreign packet can be submitted.
+#[cfg(feature="emote-recovery")]
+pub(super) struct DeferredEmoteCapture(std::marker::PhantomData<std::rc::Rc<()>>);
+#[cfg(feature="emote-recovery")]
+impl DeferredEmoteCapture {pub(super) fn new()->Self{Self(std::marker::PhantomData)}}
+#[cfg(feature="emote-recovery")]
+impl Drop for DeferredEmoteCapture {fn drop(&mut self){recovery::finish_capture();}}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct EmoteProfileStats {
@@ -422,6 +430,10 @@ impl EmoteState {
         &mut self,
         provider: &mut dyn TextureProvider,
     ) -> (HashMap<String, Vec<DrawCommand>>, HashSet<String>) {
+        self.build_commands_mode(provider,false)
+    }
+    fn build_commands_mode(&mut self,provider:&mut dyn TextureProvider,_deferred:bool)
+        -> (HashMap<String,Vec<DrawCommand>>,HashSet<String>) {
         let mut commands = HashMap::new();
         let mut retained = HashSet::new();
         #[cfg(feature = "emote-recovery")]
@@ -429,7 +441,7 @@ impl EmoteState {
             let ids: Vec<_> = self.layers.values().filter_map(|slots| match slots.pending.as_ref().or(slots.active.as_ref()) {
                 Some(EmoteInstanceSlot::Recovered(instance)) => Some(instance.id()), _ => None,
             }).collect();
-            let handles = recovery::capture_batch(&ids);
+            let handles = recovery::capture_batch(&ids,_deferred);
             ids.into_iter().zip(handles).collect::<HashMap<_,_>>()
         };
         for (layer_id, slots) in &mut self.layers {
@@ -1286,6 +1298,10 @@ impl CoreRuntime {
             .lock()
             .unwrap()
             .build_commands(&mut self.texture_provider)
+    }
+    #[cfg(feature="emote-recovery")]
+    pub(super) fn build_emote_commands_deferred(&mut self)->(HashMap<String,Vec<DrawCommand>>,HashSet<String>){
+        self.emote.lock().unwrap().build_commands_mode(&mut self.texture_provider,true)
     }
 }
 

@@ -10,6 +10,8 @@ unsafe extern "C" {
  fn art3m1s_recovery_advance(id:u64,frames:f32)->i32;
  fn art3m1s_recovery_capture(id:u64)->u64;
  fn art3m1s_recovery_capture_batch(ids:*const u64,out:*mut u64,count:u32);
+ fn art3m1s_recovery_capture_begin(ids:*const u64,out:*mut u64,count:u32)->i32;
+ fn art3m1s_recovery_capture_finish();
 }
 pub(super) struct RecoveryInstance {id:u64,owner:std::thread::ThreadId,bytes:u64,width:u32,height:u32}
 impl RecoveryInstance {
@@ -68,8 +70,10 @@ extern "C" fn release_model(lease:*mut std::ffi::c_void){
 }
 
 // Returned handles must all be adopted by RecoveredPacket in this owner call.
-pub(super) fn capture_batch(ids:&[u64])->Vec<u64>{
+pub(super) fn capture_batch(ids:&[u64],deferred:bool)->Vec<u64>{
  let mut out=vec![0;ids.len()];
+ if deferred && ids.len()==2 && unsafe{art3m1s_recovery_capture_begin(ids.as_ptr(),out.as_mut_ptr(),2)}==1{return out;}
  for (input,output) in ids.chunks(64).zip(out.chunks_mut(64)){unsafe{art3m1s_recovery_capture_batch(input.as_ptr(),output.as_mut_ptr(),input.len() as u32)}}
  out
 }
+pub(super) fn finish_capture(){unsafe{art3m1s_recovery_capture_finish()}}

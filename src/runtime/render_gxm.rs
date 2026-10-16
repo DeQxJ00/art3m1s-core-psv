@@ -252,6 +252,17 @@ impl CoreRuntime {
         mut profile: Option<&mut crate::profiler::FrameProfile>,
         reusable: DrawList,
     ) -> (DrawList, usize, usize) {
+        // Build packet identities first. Their CPU evaluation can overlap text
+        // and ordinary scene construction; all packets join before retention
+        // or rendering. The guard is owner-only and also covers early exits.
+        #[cfg(feature="emote-recovery")]
+        let capture_join=super::emote::DeferredEmoteCapture::new();
+        let emote_started = profile.as_ref().and_then(|p| p.mark());
+        #[cfg(feature="emote-recovery")]
+        let (mut emote_map, emote_files) = self.build_emote_commands_deferred();
+        #[cfg(not(feature="emote-recovery"))]
+        let (mut emote_map, emote_files) = self.build_emote_commands();
+        let emote_setup_ns=crate::profiler::FrameProfile::elapsed(emote_started);
         let text_started = profile.as_ref().and_then(|p| p.mark());
         let text_map = self.build_text_commands();
         if let Some(p) = profile.as_deref_mut() {
@@ -259,11 +270,6 @@ impl CoreRuntime {
         }
         let text_layer_count = text_map.len();
         let text_command_count = text_map.values().map(Vec::len).sum();
-        let emote_started = profile.as_ref().and_then(|p| p.mark());
-        let (mut emote_map, emote_files) = self.build_emote_commands();
-        if let Some(p) = profile.as_deref_mut() {
-            p.frame_emote_ns = crate::profiler::FrameProfile::elapsed(emote_started);
-        }
         // A video changes the provider generation on every decoded frame.
         // Avoid building fragments that cannot survive until the next frame.
         let cache_static_images = self.video.video_state().video_layers.is_empty();
@@ -322,6 +328,14 @@ impl CoreRuntime {
         }
         if let Some(p) = profile.as_deref_mut() {
             p.frame_scene_ns = crate::profiler::FrameProfile::elapsed(scene_started);
+        }
+        let join_started=profile.as_ref().and_then(|p|p.mark());
+        #[cfg(feature="emote-recovery")]
+        drop(capture_join);
+        if let Some(p)=profile.as_deref_mut(){
+            // Owner setup + remaining join/packet work; overlapped worker time
+            // is already inside text/scene wall time and must not be added.
+            p.frame_emote_ns=emote_setup_ns+crate::profiler::FrameProfile::elapsed(join_started);
         }
         let retain_started = profile.as_ref().and_then(|p| p.mark());
         let mut used_files = scene_snapshot
