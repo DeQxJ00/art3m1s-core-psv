@@ -40,7 +40,8 @@ impl RecoveryInstance {
    EmoteLayerCommand::StopTimeline{label}=>(7,label,[0.;4],0),
    EmoteLayerCommand::Pass=>(8,String::new(),[0.;4],0),
    EmoteLayerCommand::SetMeshDivisionRatio{ratio}=>(9,String::new(),[ratio,0.,0.,0.],0),
-   EmoteLayerCommand::Step|EmoteLayerCommand::Skip=>return Err("recovery Step/Skip semantics are not yet implemented".into()),
+   EmoteLayerCommand::Step=>(10,String::new(),[0.;4],0),
+   EmoteLayerCommand::Skip=>(11,String::new(),[0.;4],0),
   };
   let label=CString::new(label).map_err(|_|"recovery label contains NUL")?;
   if unsafe{art3m1s_recovery_command(self.id,op,label.as_ptr(),args.as_ptr(),flags)}==1{Ok(())}else{Err(format!("recovery command {op} rejected: label={:?} flags={flags} args={args:?}",label.to_string_lossy()))}
