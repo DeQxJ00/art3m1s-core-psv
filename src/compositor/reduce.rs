@@ -876,6 +876,11 @@ impl Compositor {
                     .flat_map(|layer| layer.tweens.iter().filter_map(|t| t.set_id))
                     .collect();
                 self.scene.delete(&id);
+                // Animation ownership ends with the subtree, even if the script
+                // reuses its IDs before the next clock tick.
+                self.anime_states.retain(|animated_id, _| {
+                    !layer_id_is_same_or_descendant(animated_id, &id)
+                });
                 self.remove_message_layers_in_subtree(&id);
                 anim::remove_tween_sets(&mut self.scene, &set_ids);
                 // 图层没了，对应的 lyedit 加工态也随之作废。
@@ -1632,6 +1637,40 @@ mod tests {
         c.advance(100);
         assert_eq!(c.scene().get("90").unwrap().file.as_deref(), Some("g1"));
         assert!(c.anime_states.is_empty());
+    }
+
+    #[test]
+    fn deleted_subtree_cannot_animate_reused_ids() {
+        for via_tween in [false, true] {
+            let mut c = Compositor::new();
+            for id in ["1.2.0", "1.20.0"] {
+                for (mode, file, time) in [
+                    ("init", Some("static_0"), None),
+                    ("add", Some("static_1"), Some(50)),
+                    ("end", None, Some(100)),
+                ] {
+                    c.apply_event(&Event::Anime {
+                        id: id.into(), mode: mode.into(), file: file.map(str::to_string),
+                        mask: None, time, loop_count: Some(-1), props: HashMap::new(),
+                    });
+                }
+            }
+            if via_tween {
+                let mut event = set_tween("1.2", "alpha", "255", "0", 10);
+                if let Event::LayerTween { delete, .. } = &mut event { *delete = true; }
+                c.apply_event(&event);
+                c.advance(10);
+            } else {
+                c.apply_event(&Event::Layer(LayerEvent::Delete { id: "1.2".into() }));
+            }
+            assert!(!c.anime_states.contains_key("1.2.0"));
+            assert!(c.anime_states.contains_key("1.20.0"));
+            // No intervening frame between delete and reuse in the direct path.
+            c.apply_event(&create("1.2.0", "replacement"));
+            c.advance(75);
+            assert_eq!(c.scene().get("1.2.0").unwrap().file.as_deref(), Some("replacement"));
+            assert_eq!(c.scene().get("1.20.0").unwrap().file.as_deref(), Some("static_1"));
+        }
     }
 
     fn set_tween(id: &str, param: &str, from: &str, to: &str, time: u64) -> Event {

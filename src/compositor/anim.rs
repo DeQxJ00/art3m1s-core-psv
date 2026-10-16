@@ -719,6 +719,12 @@ pub(crate) fn update_anime_frames(
     let mut changed = false;
     let mut finished: Vec<String> = Vec::new();
     for (layer_id, state) in states.iter() {
+        // A completed delete tween can remove an animated subtree too.
+        // Never leave playback attached to a future reuse of the same ID.
+        if scene.get(layer_id).is_none() {
+            finished.push(layer_id.clone());
+            continue;
+        }
         if state.frames.is_empty() || state.total_duration_ms == 0 {
             continue;
         }
