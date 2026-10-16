@@ -105,6 +105,7 @@ pub(crate) fn build_frame_reusing_cached(
             root_opacity,
             None,
             None,
+            true,
             provider,
             &mut frame,
             record_command_keys,
@@ -125,17 +126,6 @@ fn push_scene_command(
     else { frame.push(command); }
 }
 
-// Effects can depend on the full image's UV domain or intermediate bounds.
-// Keep that domain unchanged even when a child explicitly clears inheritance.
-fn sprite_crop_allowed(scene:&Scene,id:&str)->bool{
-    let mut current=Some(id);
-    while let Some(id)=current{
-        if scene.get(id).is_some_and(|l|l.props.shader.as_deref().is_some_and(|s|!s.is_empty())){return false;}
-        current=id.rsplit_once('.').map(|v|v.0);
-    }
-    true
-}
-
 /// 递归访问一个节点：合成本地变换，向子节点继承，产出绘制命令。
 #[allow(clippy::too_many_arguments)]
 fn visit(
@@ -146,6 +136,7 @@ fn visit(
     parent_opacity: f32,
     parent_clip: Option<[f32; 4]>,
     inherited_shader: Option<ShaderEffect>,
+    parent_crop_allowed: bool,
     provider: &mut dyn TextureProvider,
     frame: &mut DrawList,
     record_command_keys: bool,
@@ -154,6 +145,10 @@ fn visit(
     file_overrides: Option<&std::collections::HashMap<String, String>>,
     cache: &mut Option<&mut super::build_cache::SceneBuildCache>,
 ) {
+    // A shader anywhere on the ancestor path preserves the original UV domain,
+    // even when a descendant explicitly clears inherited shader state.
+    let crop_allowed = parent_crop_allowed && scene.get(id).is_none_or(|l|
+        l.props.shader.as_deref().is_none_or(str::is_empty));
     // Hidden, non-tweening subtrees cannot contribute commands or callbacks.
     // Reject them before recursively testing fragment-cache eligibility.
     if let Some(layer) = scene.get(id) {
@@ -161,13 +156,15 @@ fn visit(
             return;
         }
     }
-    if cache.is_none() {
-        visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,
+    // Live nodes and their ancestors cannot replay a static fragment. Keep
+    // the cache available to their static children, without cloning parent shader state.
+    if cache.as_deref().is_none_or(|c| c.is_dynamic_path(id)) {
+        visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
             provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
         return;
     }
     let parent=super::build_cache::ParentState {transform:parent_transform,opacity:parent_opacity,
-        clip:parent_clip,shader:inherited_shader.clone(),keys:record_command_keys,crop_allowed:sprite_crop_allowed(scene,id)};
+        clip:parent_clip,shader:inherited_shader.clone(),keys:record_command_keys,crop_allowed};
     if let Some(c)=cache.as_deref_mut() {
         let mark=c.profile_mark();let hit=c.replay(scene,id,&parent,file_overrides,frame);c.profile_add(0,mark);
         if hit{return;}
@@ -176,7 +173,7 @@ fn visit(
     let start=[frame.commands.len(),frame.mask_commands.len(),frame.shader_groups.len()];
     // A cached parent owns the complete fragment; avoid duplicating every child.
     let mut held=if remember {cache.take()} else {None};
-    visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,
+    visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
         provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
     if let Some(c)=held.as_deref_mut(){let mark=c.profile_mark();c.store(scene,id,parent,file_overrides,frame,start);c.profile_add(2,mark);}
     if remember {*cache=held;}
@@ -185,7 +182,7 @@ fn visit(
 #[allow(clippy::too_many_arguments)]
 fn visit_uncached(
     scene:&Scene,id:&str,now_ms:u64,parent_transform:Affine2,parent_opacity:f32,
-    parent_clip:Option<[f32;4]>,inherited_shader:Option<ShaderEffect>,provider:&mut dyn TextureProvider,
+    parent_clip:Option<[f32;4]>,inherited_shader:Option<ShaderEffect>,crop_allowed:bool,provider:&mut dyn TextureProvider,
     frame:&mut DrawList,record_command_keys:bool,content_for:&mut Option<&mut LayerDrawSource<'_>>,
     text_for:&mut Option<&mut LayerDrawSource<'_>>,file_overrides:Option<&std::collections::HashMap<String,String>>,
     cache:&mut Option<&mut super::build_cache::SceneBuildCache>,
@@ -220,7 +217,7 @@ fn visit_uncached(
     };
     let clip_bounds = subtree_clip_bounds(&props, world, parent_clip, provider);
     let children = scene.children_borrowed(id);
-    let local_shader = declared_shader(scene, &props, provider);
+    let local_shader = declared_shader(scene, id, &props, provider, cache);
     let group_shader = local_shader
         .as_ref()
         .and_then(|shader| shader.clone())
@@ -247,7 +244,7 @@ fn visit_uncached(
             // lyedit 结果已是最终像素，不再叠加蒙版。
             (Some(mask), None) if !mask.is_empty() => provider.resolve_with_mask(file, mask).map(|(id,size)|(id,size,None)),
             _ if override_name.is_none()&&command_shader.is_none()&&props.clip_rect().is_none()
-                &&sprite_crop_allowed(scene,id)&&!layer.event_handlers.values().any(|h|h.enabled)
+                &&crop_allowed&&!layer.event_handlers.values().any(|h|h.enabled)
                 &&(intermediate_render||blend_mode(&props)==BlendMode::Alpha)
                 &&(intermediate_render||color_filter(&props).is_identity())=>provider.resolve_sprite(file),
             _ => provider.resolve(file).map(|(id,size)|(id,size,None)),
@@ -363,6 +360,7 @@ fn visit_uncached(
             opacity,
             clip_bounds,
             command_shader.clone(),
+            crop_allowed,
             provider,
             frame,
             record_command_keys,
@@ -471,8 +469,10 @@ fn group_blend_uniform(props: &LayerProps) -> f32 {
 /// `Some(None)` means the layer explicitly specified `shader=""`.
 fn declared_shader(
     scene: &Scene,
+    id: &str,
     props: &LayerProps,
     provider: &mut dyn TextureProvider,
+    cache: &mut Option<&mut super::build_cache::SceneBuildCache>,
 ) -> Option<Option<ShaderEffect>> {
     let Some(shader_name) = props.shader.as_deref() else {
         return None;
@@ -481,13 +481,9 @@ fn declared_shader(
         return Some(None);
     }
 
-    let mut uniforms = BTreeMap::new();
-    for name in &props.shader_constants {
-        let value = shader_uniform_value(props, name);
-        if let Some(value) = value {
-            uniforms.insert(name.clone(), value);
-        }
-    }
+    let uniforms=if let Some(cache)=cache.as_deref_mut() {cache.shader_uniforms(id,props)} else {
+        props.shader_constants.iter().filter_map(|name|shader_uniform_value(props,name).map(|value|(name.clone(),value))).collect::<BTreeMap<_,_>>()
+    };
 
     let user_texture = props
         .shader_textures
@@ -520,7 +516,7 @@ fn declared_shader(
     }))
 }
 
-fn shader_uniform_value(props: &LayerProps, name: &str) -> Option<Vec<f32>> {
+pub(super) fn shader_uniform_value(props: &LayerProps, name: &str) -> Option<Vec<f32>> {
     let raw = props
         .custom
         .get(name)

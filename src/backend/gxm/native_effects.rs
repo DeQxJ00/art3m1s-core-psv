@@ -232,7 +232,7 @@ fn half_blur_chain(frame:&DrawList,chain:&[usize],inner:usize,width:u32,height:u
     let g=&frame.shader_groups[chain[0]];
     if g.end!=g.start+1 || next_group(frame,g.start,g.end,inner).is_some(){return false;}
     let c=&frame.commands[g.start];
-    if c.opacity!=1. || c.shader.is_some() || c.mesh.is_some() || c.stencil.is_some()
+    if c.recovered_packet.is_some() || c.opacity!=1. || c.shader.is_some() || c.mesh.is_some() || c.stencil.is_some()
         || c.native_emote.is_some() || !matches!(c.blend,BlendMode::Alpha|BlendMode::PremultipliedAlpha)
         || !full_stage_clip(c.clip_bounds,width,height)
         // Use the already prepared opacity certificate, including the full image,
@@ -265,7 +265,7 @@ fn translated_chain(frame:&DrawList,chain:&[usize],inner:usize,width:u32,height:
     Some(kinds)
 }
 fn opaque_cover(c: &DrawCommand, width: u32, height: u32) -> bool {
-    if c.opacity != 1.0 || c.mesh.is_some() || c.stencil.is_some() || c.native_emote.is_some()
+    if c.recovered_packet.is_some() || c.opacity != 1.0 || c.mesh.is_some() || c.stencil.is_some() || c.native_emote.is_some()
         || !full_stage_clip(c.clip_bounds,width,height) || c.shader.is_some()
         || !matches!(c.blend,BlendMode::Alpha|BlendMode::PremultipliedAlpha) { return false; }
     let m=c.transform.matrix2;let t=c.transform.translation;
@@ -697,8 +697,18 @@ impl RetainedGroup {
         self.programs=super::external_effects::revision();
     }
 }
+fn group_has_recovered(frame:&DrawList,index:usize)->bool {
+    let g=&frame.shader_groups[index];
+    frame.commands.get(g.start..g.end).is_none_or(|commands|commands.iter().any(|c|c.recovered_packet.is_some()))
+        || frame.shader_groups[..=index].iter().filter(|n|
+            n.start>=g.start && n.end<=g.end && n.start<n.end)
+            .filter_map(|n|n.mask_range).any(|[a,b]|
+                frame.mask_commands.get(a..b).is_none_or(|commands|
+                    commands.iter().any(|c|c.recovered_packet.is_some())))
+}
 fn retainable_group(frame:&DrawList,index:usize,width:u32,height:u32)->Option<&ShaderGroup>{
     let g=frame.shader_groups.get(index)?;let e=&g.effect;
+    if group_has_recovered(frame,index){return None;}
     let commands=frame.commands.get(g.start..g.end)?;
     // This is an existing isolated character group, not a new isolation
     // boundary. Exact command/mask/texture checks still invalidate every pose.
@@ -741,7 +751,7 @@ fn overlay_span(frame:&DrawList,width:u32,height:u32,previous:Option<&RetainedGr
     let mut start=frame.commands.len();
     for i in (floor..frame.commands.len()).rev(){
         let c=&frame.commands[i];
-        if c.blend!=BlendMode::Alpha||c.shader.is_some()||c.mesh.is_some()||c.stencil.is_some()||c.native_emote.is_some()
+        if c.recovered_packet.is_some()||c.blend!=BlendMode::Alpha||c.shader.is_some()||c.mesh.is_some()||c.stencil.is_some()||c.native_emote.is_some()
             ||c.color.grayscale||c.color.negative||!c.transform.is_finite(){break;}
         start=i;
     }
@@ -778,7 +788,8 @@ fn overlay_span(frame:&DrawList,width:u32,height:u32,previous:Option<&RetainedGr
     Some(ShaderGroup{key:None,start,end,effect:ShaderEffect{name:GROUP_COMPOSITE_SHADER.into(),uniforms:Default::default(),mask_texture:None,user_texture:None},clip_bounds:Some(bounds),mask_range:None})
 }
 pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&mut RetainedGroups) {
-    // Foreign packets bypass quad caches; ordered state commands are indivisible.
+    // Prepare foreign packets, then cache only independent ordinary groups.
+    // Packet commands and their containing groups remain live and indivisible.
     if frame.commands.iter().chain(&frame.mask_commands).any(|c|c.recovered_packet.is_some()) {
         // A background group may return to the main target before a portrait.
         // Allow that fresh main scene to acquire unused private DS immediately.
@@ -799,12 +810,6 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
                 }
             }
         });
-        *caches=RetainedGroups::default();
-        unsafe {super::art3m1s_gxm_frame_begin(width,height)};
-        let mut stats=[0,0];
-        render_range(frame,0,frame.commands.len(),frame.shader_groups.len(),width,height,&mut stats,false,&mut caches.nodes,false);
-        unsafe {art3m1s_gxm_report_groups(stats[0],stats[1]);super::art3m1s_gxm_frame_end()};
-        return;
     }
     unsafe { super::art3m1s_gxm_frame_begin(width, height) };
     let mut stats=[0,0];
@@ -842,7 +847,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
     while scopes.len()>1 && index>=scopes.last().unwrap().0 {scopes.pop();}
     let &(scope_end,scope_limit)=scopes.last().unwrap();
     if let Some((gi,g))=next_group(frame,index,scope_end,scope_limit){
-    if enabled && passthrough_group(frame,gi,width,height){
+    if enabled && passthrough_group_inner(frame,gi,width,height,group_has_recovered(frame,gi)){
         stats[0]+=1;stats[1]+=1;
         scopes.push((g.end,gi));continue;
     }
@@ -2166,6 +2171,36 @@ mod tests {
         assert!(!caches.overlay_blocked); // Reconsider the text cache on a new layout.
     }
 
+    #[test]
+    fn foreign_packet_keeps_independent_mask_cache_but_never_enters_it() {
+        let mut f=neutral_frame();
+        f.shader_groups[0].mask_range=Some([0,1]);
+        let mask=f.commands[0].clone();f.mask_commands.push(mask);
+        let mut actor=f.commands[0].clone();
+        actor.recovered_packet=Some(crate::render_pipeline::recovered::RecoveredPacket::failed());
+        f.commands.push(actor.clone());
+        let mut caches=RetainedGroups::default();
+        for _ in 0..4 {render_cached(&f,960,544,&mut caches);}
+        EVENTS.with(|v|v.borrow_mut().clear());
+        f.commands[2].transform.translation.x+=7.;
+        render_cached(&f,960,544,&mut caches);
+        EVENTS.with(|v|assert!(v.borrow().iter().any(|e|e=="cached")));
+        assert!(caches.slots.iter().any(|c|c.baked));
+        f.mask_commands[0].opacity=0.5;
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut caches);
+        EVENTS.with(|v|assert!(!v.borrow().iter().any(|e|e=="cached")));
+        // Direct content and nested mask dependencies both forbid caching.
+        f.mask_commands[0]=actor.clone();
+        assert!(retainable_group(&f,0,960,544).is_none());
+        assert!(!node_cache::eligible(&f,0));
+        f.shader_groups.push(test_group(GROUP_COMPOSITE_SHADER,0,2));
+        assert!(group_has_recovered(&f,1));
+        f.mask_commands.clear();f.shader_groups[0].mask_range=None;
+        f.commands[0]=actor.clone();assert!(retainable_group(&f,1,960,544).is_none());
+        f.shader_groups.clear();f.commands=vec![f.commands[1].clone();40];
+        f.commands.insert(5,actor);
+        assert_eq!(overlay_tail(&f,960,544).unwrap().start,6);
+    }
     #[test]
     fn retained_local_mask_is_baked_once_and_invalidated_by_mask_changes() {
         let mut f = neutral_frame();

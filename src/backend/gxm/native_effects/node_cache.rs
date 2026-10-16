@@ -23,7 +23,7 @@ pub(super) struct NodeCache {
 
 pub(super) fn eligible(frame:&DrawList,gi:usize)->bool {
     let g=&frame.shader_groups[gi];
-    if g.start>=g.end || g.end>frame.commands.len() || g.end-g.start>4096
+    if group_has_recovered(frame,gi) || g.start>=g.end || g.end>frame.commands.len() || g.end-g.start>4096
         || frame.mask_commands.len()>4096 || g.mask_range.is_some()
         || frame.commands[g.start..g.end].iter().any(|c|
             c.mesh.is_some()||c.native_emote.is_some()||c.stencil.is_some()) {return false;}

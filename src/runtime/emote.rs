@@ -424,11 +424,26 @@ impl EmoteState {
     ) -> (HashMap<String, Vec<DrawCommand>>, HashSet<String>) {
         let mut commands = HashMap::new();
         let mut retained = HashSet::new();
+        #[cfg(feature = "emote-recovery")]
+        let mut recovered = {
+            let ids: Vec<_> = self.layers.values().filter_map(|slots| match slots.pending.as_ref().or(slots.active.as_ref()) {
+                Some(EmoteInstanceSlot::Recovered(instance)) => Some(instance.id()), _ => None,
+            }).collect();
+            let handles = recovery::capture_batch(&ids);
+            ids.into_iter().zip(handles).collect::<HashMap<_,_>>()
+        };
         for (layer_id, slots) in &mut self.layers {
             let Some(instance) = slots.pending.as_mut().or(slots.active.as_mut()) else {
                 continue;
             };
-            match instance.build_commands(provider, &mut retained) {
+            #[cfg(feature = "emote-recovery")]
+            let result = match instance {
+                EmoteInstanceSlot::Recovered(instance) => instance.build_captured_commands(recovered.remove(&instance.id()).unwrap_or(0)),
+                _ => instance.build_commands(provider, &mut retained),
+            };
+            #[cfg(not(feature = "emote-recovery"))]
+            let result = instance.build_commands(provider, &mut retained);
+            match result {
                 Ok(draws) if !draws.is_empty() => {
                     commands.insert(layer_id.clone(), draws);
                 }

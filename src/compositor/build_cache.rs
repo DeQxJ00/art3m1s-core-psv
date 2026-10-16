@@ -2,7 +2,8 @@
 use super::scene::Scene;
 use crate::render_pipeline::draw::{DrawList, ShaderEffect};
 use glam::Affine2;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use super::props::LayerProps;
 
 #[derive(Clone, PartialEq)]
 pub(super) struct ParentState {
@@ -18,6 +19,14 @@ struct Stamp {
     revision: u64,
     edited: Option<String>,
 }
+struct ShaderValues {
+    names: Vec<String>,
+    raw: Vec<Option<String>>,
+    width: Option<f32>,
+    height: Option<f32>,
+    values: BTreeMap<String, Vec<f32>>,
+    seen: bool,
+}
 struct Entry {
     parent: ParentState,
     nodes: Vec<Stamp>,
@@ -27,7 +36,10 @@ struct Entry {
 #[derive(Default)]
 pub(crate) struct SceneBuildCache {
     entries: HashMap<String, Entry>,
+    shader_values: HashMap<String, ShaderValues>,
     dynamic: HashSet<String>,
+    // A live descendant invalidates only its ancestors, not sibling fragments.
+    dynamic_ancestors: HashSet<String>,
     // Frame-local only: Scene is immutable during one build; addresses are
     // identity keys, never dereferenced and never reused across begin().
     candidates: HashMap<usize, bool>,
@@ -44,10 +56,19 @@ impl SceneBuildCache {
             self.entries.clear();
         }
         self.revision = Some(revision);
+        for values in self.shader_values.values_mut() { values.seen=false; }
         if self.frames % 120 == 0 { self.profile_frames += 1; }
         self.candidates.clear();
         self.dynamic.clear();
         self.dynamic.extend(dynamic);
+        self.dynamic_ancestors.clear();
+        for id in &self.dynamic {
+            let mut parent = id.as_str();
+            while let Some((prefix, _)) = parent.rsplit_once('.') {
+                if !self.dynamic_ancestors.insert(prefix.to_owned()) { break; }
+                parent = prefix;
+            }
+        }
         for entry in self.entries.values_mut() {
             entry.seen = false;
         }
@@ -64,15 +85,40 @@ impl SceneBuildCache {
     }
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.shader_values.clear();
         self.candidates.clear();
         self.revision = None;
     }
     pub fn finish(&mut self) {
         self.entries.retain(|_, entry| entry.seen);
+        self.shader_values.retain(|_, values| values.seen);
         self.frames += 1;
     }
     pub fn sample(&self) -> Option<(u64, u64, usize)> {
         (self.frames % 300 == 0).then_some((self.hits, self.builds, self.entries.len()))
+    }
+    // Only parsed scalar constants are retained. Cross-layer texture names,
+    // provider generations and mask/user handles are resolved live by build.rs.
+    // Compare authored inputs, not scene revision IDs (which can repeat after
+    // a new scene/save). Resolved tween properties participate in this key.
+    pub(super) fn shader_uniforms(&mut self, id: &str, props: &LayerProps) -> BTreeMap<String, Vec<f32>> {
+        if let Some(entry)=self.shader_values.get_mut(id) {
+            if entry.names==props.shader_constants && entry.width==props.width && entry.height==props.height
+                && entry.raw.iter().zip(&entry.names).all(|(raw,name)|raw.as_ref()==props.custom.get(name)) {
+                entry.seen=true;
+                return entry.values.clone();
+            }
+        }
+        let values: BTreeMap<_,_>=props.shader_constants.iter().filter_map(|name|
+            super::build::shader_uniform_value(props,name).map(|value|(name.clone(),value))).collect();
+        if props.shader_constants.len()<=64 && props.shader_constants.iter().map(|n|n.len()+props.custom.get(n).map_or(0,String::len)).sum::<usize>()<=4096
+            && (self.shader_values.len()<128 || self.shader_values.contains_key(id)) {
+            self.shader_values.insert(id.to_owned(),ShaderValues {
+                names:props.shader_constants.clone(),raw:props.shader_constants.iter().map(|n|props.custom.get(n).cloned()).collect(),
+                width:props.width,height:props.height,values:values.clone(),seen:true,
+            });
+        }
+        values
     }
     pub(super) fn replay(
         &mut self,
@@ -117,7 +163,13 @@ impl SceneBuildCache {
         self.hits += 1;
         true
     }
+    pub(super) fn is_dynamic_path(&self, id: &str) -> bool {
+        self.dynamic.contains(id) || self.dynamic_ancestors.contains(id)
+    }
     pub(super) fn candidate(&mut self, scene: &Scene, id: &str) -> bool {
+        // Reject known live dependency paths before walking static siblings.
+        // Rebuilt each frame, so disappearing/renamed content can become static.
+        if self.is_dynamic_path(id) { return false; }
         let Some(layer) = scene.get(id) else {
             return false;
         };
@@ -125,8 +177,7 @@ impl SceneBuildCache {
         if let Some(&candidate)=self.candidates.get(&key){return candidate;}
         // Cross-layer shader resource references and live tweens are evaluated
         // normally. Their static children can still use independent fragments.
-        let candidate = !self.dynamic.contains(id)
-            && layer.tweens.is_empty()
+        let candidate = layer.tweens.is_empty()
             && layer.props.shader.as_deref().is_none_or(str::is_empty)
             && layer.children.iter().all(|id| self.candidate(scene, id));
         self.candidates.insert(key,candidate);
@@ -149,7 +200,8 @@ impl SceneBuildCache {
             .values()
             .map(|e| e.frame.commands.len() + e.frame.mask_commands.len())
             .sum();
-        if count == 0 || used + count > 1024 || self.entries.len() >= 128 {
+        // Empty fragments still save traversal; dependency and retry checks apply.
+        if used + count > 1024 || self.entries.len() >= 128 {
             return;
         }
         let (key,mut nodes,mut fragment)=previous.map(|(key,entry)|(key,entry.nodes,entry.frame))
@@ -299,6 +351,56 @@ mod tests {
         assert_eq!(materialized, reference);
         got
     }
+    #[test]
+    fn shader_constants_follow_values_even_when_scene_ids_repeat() {
+        let mut c=SceneBuildCache::default();let mut props=LayerProps::default();
+        props.shader_constants=vec!["gain".into(),"width".into()];props.width=Some(960.);
+        props.custom.insert("gain".into(),"1, 0.5, invalid".into());
+        let first=c.shader_uniforms("same",&props);assert_eq!(first["gain"],vec![1.,0.5]);
+        assert_eq!(c.shader_uniforms("same",&props),first);
+        props.custom.insert("gain".into(),"0.25".into());props.width=Some(544.);
+        let changed=c.shader_uniforms("same",&props);assert_eq!(changed["gain"],vec![0.25]);assert_eq!(changed["width"],vec![544.]);
+        props.shader_constants=vec!["height".into()];props.height=Some(16.);
+        let restored=c.shader_uniforms("same",&props);assert_eq!(restored.len(),1);assert_eq!(restored["height"],vec![16.]);
+        c.begin(1,false,std::iter::empty());c.finish();assert!(c.shader_values.is_empty());
+    }
+
+    #[test]
+    fn live_descendant_rejects_ancestors_without_visiting_static_siblings() {
+        let mut s = scene();
+        s.create("1.nested.actor", None);
+        let mut c = SceneBuildCache::default();
+        c.begin(1, false, std::iter::once("1.nested.actor".into()));
+        assert!(!c.candidate(&s, "1"));
+        assert!(c.candidates.is_empty());
+        assert!(c.candidate(&s, "1.body"));
+        assert!(c.candidate(&s, "2"));
+        c.begin(1, false, std::iter::empty());
+        assert!(c.candidate(&s, "1"));
+        s.rename("1.nested", "2.nested");
+        c.begin(1, false, std::iter::once("2.nested.actor".into()));
+        assert!(c.candidate(&s, "1"));
+        assert!(!c.candidate(&s, "2"));
+    }
+
+    #[test]
+    fn empty_subtree_replays_then_invalidates_new_content_and_retry() {
+        let mut s=Scene::new();s.create("1.empty.child",None);
+        let mut p=Provider::default();let mut c=SceneBuildCache::default();
+        check(&s,&mut p,&mut c,0,1,false,None,true);
+        let builds=c.builds;
+        check(&s,&mut p,&mut c,0,1,false,None,true);
+        assert_eq!(c.builds,builds);assert_eq!(c.hits,1);
+        s.create("1.empty.sprite",Some("pending".into()));p.inner.mark_missing("pending");
+        assert!(check(&s,&mut p,&mut c,0,1,false,None,true).commands.is_empty());
+        p.inner=MockProvider::new();
+        assert_eq!(check(&s,&mut p,&mut c,0,1,true,None,true).commands.len(),1);
+        s.get_mut("1.empty.sprite").unwrap().props.left=Some(23.);
+        check(&s,&mut p,&mut c,0,1,false,None,true);
+        s.replace_with(Scene::new());s.create("1.empty.child",Some("restored".into()));
+        assert_eq!(check(&s,&mut p,&mut c,0,1,false,None,true).commands.len(),1);
+    }
+
     #[test]
     fn cached_images_keep_live_text_and_relocate_group_masks() {
         let s = scene();

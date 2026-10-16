@@ -9,6 +9,7 @@ unsafe extern "C" {
  fn art3m1s_recovery_query(id:u64,op:u32,label:*const std::ffi::c_char,out:*mut f32)->i32;
  fn art3m1s_recovery_advance(id:u64,frames:f32)->i32;
  fn art3m1s_recovery_capture(id:u64)->u64;
+ fn art3m1s_recovery_capture_batch(ids:*const u64,out:*mut u64,count:u32);
 }
 pub(super) struct RecoveryInstance {id:u64,owner:std::thread::ThreadId,bytes:u64,width:u32,height:u32}
 impl RecoveryInstance {
@@ -47,9 +48,14 @@ impl RecoveryInstance {
  pub(super) fn advance(&mut self,frames:f32)->bool{
   if self.owner().is_err(){return false;}unsafe{art3m1s_recovery_advance(self.id,frames)==1}
  }
+ pub(super) fn id(&self)->u64{self.id}
  pub(super) fn build_commands(&mut self)->Result<Vec<DrawCommand>,String>{
+  let handle=if self.owner().is_ok(){unsafe{art3m1s_recovery_capture(self.id)}}else{0};
+  self.build_captured_commands(handle)
+ }
+ pub(super) fn build_captured_commands(&mut self,handle:u64)->Result<Vec<DrawCommand>,String>{
   // Keep failures in the ordered list: frame_begin would erase an error set here.
-  let packet=if self.owner().is_ok(){RecoveredPacket::from_handle(unsafe{art3m1s_recovery_capture(self.id)})}else{None}
+  let packet=if self.owner().is_ok(){RecoveredPacket::from_handle(handle)}else{None}
    .unwrap_or_else(||{crate::core_warn!("recovered packet capture failed; submitting explicit failed snapshot");RecoveredPacket::failed()});
   let size=TextureInfo{width:self.width,height:self.height};
   Ok(vec![DrawCommand{texture:TextureId(0),size,transform:Affine2::IDENTITY,opacity:1.,blend:BlendMode::Alpha,color:ColorFilter::default(),clip:ClipRect::full(size),clip_bounds:Some([0.,0.,self.width as f32,self.height as f32]),shader:None,mesh:None,stencil:None,native_emote:None,recovered_packet:Some(packet)}])
@@ -59,4 +65,11 @@ impl Drop for RecoveryInstance {fn drop(&mut self){unsafe{art3m1s_recovery_destr
 
 extern "C" fn release_model(lease:*mut std::ffi::c_void){
  unsafe{drop(Arc::from_raw(lease as *const super::super::emote_source_cache::RecoveredModel));}
+}
+
+// Returned handles must all be adopted by RecoveredPacket in this owner call.
+pub(super) fn capture_batch(ids:&[u64])->Vec<u64>{
+ let mut out=vec![0;ids.len()];
+ for (input,output) in ids.chunks(64).zip(out.chunks_mut(64)){unsafe{art3m1s_recovery_capture_batch(input.as_ptr(),output.as_mut_ptr(),input.len() as u32)}}
+ out
 }
