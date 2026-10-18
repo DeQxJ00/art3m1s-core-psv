@@ -25,9 +25,20 @@ fn shader_event_file(event: &Event) -> Option<&str> {
     }
 }
 
-fn shader_is_hlsl(file: &str) -> bool {
+fn shader_is_supported(file: &str) -> bool {
     file.rsplit(['/', '\\']).next().and_then(|name|name.rsplit_once('.'))
-        .is_some_and(|(name,extension)|!name.is_empty() && extension.eq_ignore_ascii_case("hlsl"))
+        .is_some_and(|(name,extension)|!name.is_empty() && ["hlsl","glsl","sb"].iter().any(|e|extension.eq_ignore_ascii_case(e)))
+}
+
+// Console binaries cannot execute on GXM. Prefer the package's matching PC
+// source; mobile source is a fallback with its own formulas, never a binary port.
+fn shader_source_candidates(file:&str)->Vec<String>{
+    let normalized=file.replace('\\',"/");
+    let Some(stem)=normalized.strip_suffix("_p.sb") else{return vec![file.into()];};
+    let Some((root,name))=stem.rsplit_once("/ps/") else{return Vec::new();};
+    if name.is_empty()||name.split('/').any(|p|p==".."||p=="."){return Vec::new();}
+    ["pc","sw","mb"].iter().map(|platform|
+        format!("{root}/{platform}/{name}.{}",if *platform=="pc"{"hlsl"}else{"glsl"})).collect()
 }
 
 fn report_shader_progress(done: usize, total: usize, file: &str, stage: i32) {
@@ -117,7 +128,7 @@ impl CoreRuntime {
     ) {
         const EVENT_TRACE_LIMIT: usize = 24;
         let shader_requests=events.iter().filter(|e|shader_event_file(&e.event).is_some()).count();
-        let shader_total=events.iter().filter_map(|e|shader_event_file(&e.event)).filter(|file|shader_is_hlsl(file)).count();
+        let shader_total=events.iter().filter_map(|e|shader_event_file(&e.event)).filter(|file|shader_is_supported(file)).count();
         let mut shader_done=0;
         if shader_requests>0 { report_shader_progress(0,shader_total,"",8); }
 
@@ -309,7 +320,7 @@ impl CoreRuntime {
                 }
                 Event::Custom { tag, params } if tag == "lyshader" => {
                     let file=shader_event_file(event).unwrap_or("");
-                    let counted=shader_is_hlsl(file);
+                    let counted=shader_is_supported(file);
                     if counted { report_shader_progress(shader_done,shader_total,file,0); }
                     let ok=self.handle_shader_load(params);
                     if counted { shader_done+=1; }
@@ -319,7 +330,7 @@ impl CoreRuntime {
                     crate::core_debug!("[runtime] 未处理的自定义标签: {tag}");
                 }
                 Event::ShaderLoad { id, file } => {
-                    let counted=shader_is_hlsl(file);
+                    let counted=shader_is_supported(file);
                     if counted { report_shader_progress(shader_done,shader_total,file,0); }
                     let ok=self.load_shader(id, file);
                     if counted { shader_done+=1; }
@@ -624,19 +635,31 @@ impl CoreRuntime {
 
     fn load_shader(&mut self, id: &str, file: &str) -> bool {
         #[cfg(all(target_os="vita",feature="gxm-native-renderer"))]
-        if !shader_is_hlsl(file) {
-            crate::core_info!("[shader] skipped non-HLSL id={} file={}", id, file);
-            return true;
+        if !shader_is_supported(file) {
+            crate::core_warn!("[shader] unsupported source format id={} file={}", id, file);
+            return false;
         }
-        let source = match crate::ffi::request_file(file) {
-            Ok(source) => source,
-            Err(error) => {
-                crate::core_warn!("[shader] 读取失败 id={} file={}: {}", id, file, error);
-                return false;
+        let mut selected=None;
+        for path in shader_source_candidates(file){
+            if let Ok(source)=crate::ffi::request_file(&path){
+                selected=Some((path,source));break;
             }
+        }
+        let Some((source_path,source))=selected else {
+            #[cfg(all(target_os="vita",feature="gxm-native-renderer"))]
+            {
+                // Missing source cannot validate a disk cache; use only the explicit PSV fallback map.
+                return match self.renderer.register_hlsl_shader_at(id,file,&[]) {
+                    Ok(())=>true,
+                    Err(error)=>{crate::core_warn!("[shader] source/fallback unavailable id={} file={}: {}",id,file,error);false}
+                };
+            }
+            #[cfg(not(all(target_os="vita",feature="gxm-native-renderer")))]
+            {crate::core_warn!("[shader] source unavailable id={} requested={}",id,file);return false;}
         };
+        if source_path!=file {crate::core_info!("[shader] companion-source fallback requested={} source={}; not console binary execution",file,source_path);}
         #[cfg(all(target_os="vita",feature="gxm-backend"))]
-        let result=self.renderer.register_hlsl_shader_at(id,file,&source);
+        let result=self.renderer.register_hlsl_shader_at(id,&source_path,&source);
         #[cfg(not(all(target_os="vita",feature="gxm-backend")))]
         let result=self.renderer.register_hlsl_shader(id,&source);
         match result {
@@ -1360,6 +1383,14 @@ mod tests {
 
 
     #[test]
+    fn console_shader_requires_matching_companion_source_path(){
+        assert_eq!(super::shader_source_candidates("system/shader/ps/ma/blur_h_a_p.sb"),
+            ["system/shader/pc/ma/blur_h_a.hlsl","system/shader/sw/ma/blur_h_a.glsl","system/shader/mb/ma/blur_h_a.glsl"]);
+        assert!(super::shader_source_candidates("custom/effect_p.sb").is_empty());
+        assert!(super::shader_source_candidates("system/shader/ps/../effect_p.sb").is_empty());
+        assert_eq!(super::shader_source_candidates("system/shader/mb/gray.glsl"),["system/shader/mb/gray.glsl"]);
+    }
+    #[test]
     fn shader_progress_counts_requests_not_other_events() {
         let shader=Event::ShaderLoad {id:"test".into(),file:"system/shader/test.hlsl".into()};
         let legacy=Event::Custom {tag:"lyshader".into(),params:Default::default()};
@@ -1371,11 +1402,11 @@ mod tests {
     }
 
     #[test]
-    fn shader_progress_only_counts_hlsl_including_dx11() {
+    fn shader_progress_counts_source_and_console_companions() {
         let paths=["pc/e.hlsl","pc/dx11/e.HLSL","mb/e.glsl","shader.cg","image.hlsl.png","dir.hlsl/e","", ".hlsl", "pc\\a.HlSl"];
-        assert_eq!(paths.map(super::shader_is_hlsl),[true,true,false,false,false,false,false,false,true]);
+        assert_eq!(paths.map(super::shader_is_supported),[true,true,true,false,false,false,false,false,true]);
         let events=paths.map(|file| Event::ShaderLoad{id:"probe".into(),file:file.into()});
-        assert_eq!(events.iter().filter_map(super::shader_event_file).filter(|f|super::shader_is_hlsl(f)).count(),3);
+        assert_eq!(events.iter().filter_map(super::shader_event_file).filter(|f|super::shader_is_supported(f)).count(),4);
     }
 
     use super::{

@@ -186,7 +186,8 @@ impl CoreRuntime {
         #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
         let provider = {
             let paths = Arc::clone(&self.magic_paths);
-            let mut provider=GxmTextureProvider::new();
+            let image_paths=Arc::clone(&self.magic_paths);
+            let mut provider=GxmTextureProvider::new().with_image_path_resolver(move |name|magic_path::resolve_path(&image_paths,name));
             provider.set_ignore_background_alpha(self.ignore_background_alpha);
             provider.with_cache_budget(crate::image_cache_budget::session_budget()).with_tracked_prefetch(move |name| {
                 let resolved = magic_path::resolve_path(&paths, name);

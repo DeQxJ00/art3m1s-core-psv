@@ -15,7 +15,8 @@ impl Format {
         }
     }
     pub fn pvrtc1(self)->bool{matches!(self,Self::PvrtcRgb2|Self::PvrtcRgba2|Self::PvrtcRgb4|Self::PvrtcRgba4)}
-    pub fn opaque(self)->bool{matches!(self,Self::Bc4|Self::Bc4Signed|Self::Bc5|Self::Bc5Signed|Self::PvrtcRgb2|Self::PvrtcRgb4|Self::Etc1)}
+    // Asset policy: DXT1/BC1 is the opaque compression format; alpha assets use BC3.
+    pub fn opaque(self)->bool{matches!(self,Self::Bc1|Self::Bc4|Self::Bc4Signed|Self::Bc5|Self::Bc5Signed|Self::PvrtcRgb2|Self::PvrtcRgb4|Self::Etc1)}
     pub fn bytes(self,w:u32,h:u32)->usize{
         let (bw,bh,n)=self.block();let min=if self.pvrtc1(){2}else{1};
         w.div_ceil(bw).max(min) as usize*h.div_ceil(bh).max(min) as usize*n
@@ -136,7 +137,7 @@ pub(crate) fn header_dimensions(b:&[u8])->Option<(u32,u32)>{
     #[test] fn all_formats_sizes_and_rejection(){
         for (code,channel,f) in [(7,0,Format::Bc1),(9,0,Format::Bc2),(11,0,Format::Bc3),(12,0,Format::Bc4),(12,1,Format::Bc4Signed),(13,0,Format::Bc5),(13,1,Format::Bc5Signed),
             (0,0,Format::PvrtcRgb2),(1,0,Format::PvrtcRgba2),(2,0,Format::PvrtcRgb4),(3,0,Format::PvrtcRgba4),(4,0,Format::Pvrtc2_2),(5,0,Format::Pvrtc2_4),(6,0,Format::Etc1)]{
-            let b=pvr(code,channel,32,16);let t=parse(&b).unwrap();assert_eq!(t.format,f);assert_eq!(t.data.len(),f.storage_bytes(32,16));
+            let b=pvr(code,channel,32,16);let t=parse(&b).unwrap();assert_eq!(t.format,f);assert_eq!(t.opaque,f.opaque());assert_eq!(t.data.len(),f.storage_bytes(32,16));
             for n in 0..b.len(){assert!(parse(&b[..n]).is_err());}
             for (at,val) in [(4,2),(28,0),(28,4097),(32,2),(36,2),(40,6),(44,32),(48,u32::MAX)]{
                 let mut bad=b.clone();bad[at..at+4].copy_from_slice(&val.to_le_bytes());assert!(parse(&bad).is_err());
@@ -148,7 +149,7 @@ pub(crate) fn header_dimensions(b:&[u8])->Option<(u32,u32)>{
         for (cc,format) in [(b"DXT1",Format::Bc1),(b"DXT3",Format::Bc2),(b"DXT5",Format::Bc3),(b"BC4U",Format::Bc4),(b"BC4S",Format::Bc4Signed),(b"BC5U",Format::Bc5),(b"BC5S",Format::Bc5Signed)]{
             let mut b=vec![0;128+format.bytes(17,9)];b[..4].copy_from_slice(b"DDS ");
             for (at,v) in [(4,124u32),(12,9),(16,17),(76,32),(80,4)]{b[at..at+4].copy_from_slice(&v.to_le_bytes());}b[84..88].copy_from_slice(cc);
-            assert_eq!(parse(&b).unwrap().format,format);assert_eq!(parse(&b).unwrap().width,17);
+            assert_eq!(parse(&b).unwrap().opaque,format.opaque());assert_eq!(parse(&b).unwrap().format,format);assert_eq!(parse(&b).unwrap().width,17);
             b[112..116].copy_from_slice(&0x200u32.to_le_bytes());assert!(parse(&b).is_err());
         }
         for code in [71,72,74,75,77,78,80,81,83,84] {
@@ -164,7 +165,7 @@ pub(crate) fn header_dimensions(b:&[u8])->Option<(u32,u32)>{
                 for (at,v) in [(4,124u32),(12,h),(16,w),(76,32),(80,4)] {b[at..at+4].copy_from_slice(&v.to_le_bytes());}
                 b[84..88].copy_from_slice(cc);b[32..37].copy_from_slice(b"GXMSW");
                 let t=parse(&b).unwrap();assert!(t.swizzled);assert_eq!(t.data.len(),f.storage_bytes(w,h));
-                assert_eq!((t.width,t.height),(w,h));assert_eq!(t.format,f);
+                assert_eq!((t.width,t.height),(w,h));assert_eq!(t.format,f);assert_eq!(t.opaque,f==Format::Bc1);
                 assert!(parse(&b[..b.len()-1]).is_err());
                 b.push(0);assert!(parse(&b).is_err());b.pop();
                 b[28..32].copy_from_slice(&2u32.to_le_bytes());assert!(parse(&b).is_err());b[28..32].fill(0);

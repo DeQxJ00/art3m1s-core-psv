@@ -7,6 +7,15 @@ use crate::render_pipeline::draw::ShaderEffect;
 const MAX_VALUES:usize=128;
 #[derive(Deserialize,Serialize,Clone)]
 struct Uniform {name:String,offset:usize,count:usize}
+impl Uniform {
+ fn bind(&self,dst:&mut [f32],effect:&ShaderEffect,alpha:f32,color:[f32;3]) {
+  // The shared descriptor uses float32 slots. Script values override draw
+  // defaults; absent components keep those defaults, never another program's values.
+  if self.name=="alpha"{dst[0]=alpha;}
+  else if self.name=="colorMultiply"{for(a,b)in dst.iter_mut().zip(color){*a=b;}}
+  if let Some(values)=effect.uniforms.get(&self.name){for(a,b)in dst.iter_mut().zip(values){if b.is_finite(){*a=*b;}}}
+ }
+}
 #[derive(Deserialize)]
 struct Metadata {abi:u32,source_hash:String,uniforms:Vec<Uniform>}
 #[derive(Deserialize,Serialize)]
@@ -22,10 +31,11 @@ pub(super) struct CustomDraw {pub program:u32,pub values:[f32;MAX_VALUES],pub us
 impl Default for CustomDraw {fn default()->Self{Self{program:0,values:[0.;MAX_VALUES],user_texture:0}}}
 unsafe extern "C" {
  fn art3m1s_gxm_shader_stage(stage:i32);
- fn art3m1s_gxm_external_conversion_enabled()->i32;
  fn art3m1s_gxm_external_cache_path(file:*const std::ffi::c_char,out:*mut std::ffi::c_char,size:usize)->i32;
  fn art3m1s_gxm_external_shared_cache_path(file:*const std::ffi::c_char,out:*mut std::ffi::c_char,size:usize)->i32;
+ fn art3m1s_gxm_external_load_cached(id:*const std::ffi::c_char,key:*const std::ffi::c_char,cg:*const std::ffi::c_char)->u32;
  fn art3m1s_gxm_external_compile(id:*const std::ffi::c_char,key:*const std::ffi::c_char,cg:*const std::ffi::c_char)->u32;
+ fn art3m1s_gxm_external_conversion_enabled()->i32;
  fn art3m1s_gxm_external_compiler_end();
  fn art3m1s_gxm_external_register(data:*const u8,len:usize)->u32;
  fn art3m1s_gxm_external_uniform(handle:u32,name:*const std::ffi::c_char,offset:u32,count:u32)->i32;
@@ -54,8 +64,11 @@ fn parse_hashed<'a>(source_hash:&str,package:&'a[u8])->Result<(Metadata,&'a[u8])
  Ok((meta,gxp))
 }
 pub(super) fn register(id:&str,source:&[u8],package:&[u8])->Result<(),String>{
+ register_hashed(id,&hash(source),package)
+}
+fn register_hashed(id:&str,source_hash:&str,package:&[u8])->Result<(),String>{
  if id.is_empty()||id.len()>128||matches!(id,"group-composite"|"alpha-mask"|"rule-trans"|"sprite"){return Err("reserved/invalid shader id".into());}
- let(meta,gxp)=parse(source,package)?;
+ let(meta,gxp)=parse_hashed(source_hash,package)?;
  let handle=unsafe{art3m1s_gxm_external_register(gxp.as_ptr(),gxp.len())};
  if handle==0{return Err("host rejected GXP program".into());}
  for u in &meta.uniforms{
@@ -67,18 +80,65 @@ pub(super) fn register(id:&str,source:&[u8],package:&[u8])->Result<(),String>{
  changed();PROGRAMS.with(|p|{if let Some(old)=p.borrow_mut().insert(id.into(),Program{handle,uniforms:meta.uniforms,builtin_gray:false,builtin_cmul:false,builtin_sepia:false,builtin_mosaic:false,builtin_blur:false,builtin_kawase:false,translation_kind:0}){unsafe{art3m1s_gxm_external_release(old.handle)}}});
  Ok(())
 }
+#[cfg(test)]
+pub(super) fn register_test_source(id:&str,source:&[u8])->Result<(),String>{
+ // Scene tests install synthetic programs directly without a device compiler.
+ let (_,layout)=crate::render_pipeline::hlsl::translate_cg_effect(source)?;
+ let uniforms:Vec<_>=layout.into_iter().map(|u|serde_json::json!({"name":u.name,"offset":u.offset,"count":u.count})).collect();
+ register(id,source,&tests::fixture(source,serde_json::json!(uniforms)))
+}
 pub(super) fn register_source(id:&str,source:&[u8])->Result<(),String>{
  register_source_at(id,id,source)
 }
+// Only source-hash-selected implementations enter here. Mobile gray/sepia have
+// additive RGB terms and deliberately do not inherit PC premultiplication proofs.
+fn builtin_contract(name:&str)->&str {
+ let name=super::bundled_effects::contract(name);
+ match name {
+  "glsl_mb_blur_h"|"glsl_sw_blur_h"=>"blur_h",
+  "glsl_mb_blur_v"|"glsl_sw_blur_v"=>"blur_v",
+  "glsl_mb_cmul"|"glsl_sw_cmul"=>"cmul",
+  _=>name,
+ }
+}
+fn register_builtin(id:&str,name:&str,canonical_hash:&str,package:&[u8],fallback:bool)->Result<(),String>{
+ unsafe{art3m1s_gxm_shader_stage(3)};
+ register_hashed(id,canonical_hash,package)?;
+  let implementation=name;
+  let name=builtin_contract(name);
+  PROGRAMS.with(|p|{if let Some(program)=p.borrow_mut().get_mut(id){program.builtin_gray=name=="gray";program.builtin_cmul=name=="cmul";program.builtin_sepia=name=="sepia";program.builtin_mosaic=name=="mosaic";program.builtin_blur=matches!(name,"blur_h"|"blur_v");program.builtin_kawase=matches!(name,"blur_k"|"blur_kx"|"blur_ky");program.translation_kind=match name{"blur_h"=>1,"blur_v"=>2,"blur_k"=>3,"blur_kx"=>4,"blur_ky"=>5,"gray"=>6,_=>0};}});
+  crate::core_info!("[shader-builtin] id={} implementation={} bytes={} fallback={}",id,implementation,package.len(),fallback);
+ Ok(())
+}
 pub(super) fn register_source_at(id:&str,file:&str,source:&[u8])->Result<(),String>{
  if id.is_empty()||id.len()>128||matches!(id,"group-composite"|"alpha-mask"|"rule-trans"|"sprite"){return Err("reserved/invalid shader id".into());}
- if let Some((name,package))=super::bundled_effects::lookup(&hash(source)){
-  unsafe{art3m1s_gxm_shader_stage(3)}; // builtin
-  register(id,source,package)?;
-  PROGRAMS.with(|p|{if let Some(program)=p.borrow_mut().get_mut(id){program.builtin_gray=name=="gray";program.builtin_cmul=name=="cmul";program.builtin_sepia=name=="sepia";program.builtin_mosaic=name=="mosaic";program.builtin_blur=matches!(name,"blur_h"|"blur_v");program.builtin_kawase=matches!(name,"blur_k"|"blur_kx"|"blur_ky");program.translation_kind=match name{"blur_h"=>1,"blur_v"=>2,"blur_k"=>3,"blur_kx"=>4,"blur_ky"=>5,"gray"=>6,_=>0};}});
-  crate::core_info!("[shader-builtin] id={} implementation={} bytes={} no runtime conversion/compile",id,name,package.len());
-  return Ok(());
+ if let Some((name,canonical_hash,package))=super::bundled_effects::lookup(&hash(source)){
+  match register_builtin(id,name,canonical_hash,package,false){
+   Ok(())=>return Ok(()),
+   Err(e)=>{crate::core_warn!("[shader-builtin] unavailable id={}: {}; trying cache",id,e);},
+  }
  }
+ let mut cache_error=match register_cached_source_at(id,file,source,false){
+  Ok(())=>return Ok(()),Err(e)=>e,
+ };
+ if let Some((name,canonical_hash,package))=super::bundled_effects::equivalent(&hash(source)){
+  match register_builtin(id,name,canonical_hash,package,false){
+   Ok(())=>return Ok(()),Err(e)=>cache_error=e,
+  }
+ }
+ if unsafe{art3m1s_gxm_external_conversion_enabled()}!=0 && !source.is_empty(){
+  match register_cached_source_at(id,file,source,true){
+   Ok(())=>return Ok(()),Err(e)=>cache_error=format!("{cache_error}; generation: {e}"),
+  }
+ }
+ if let Some((name,canonical_hash,package))=super::bundled_effects::fallback(file){
+  crate::core_warn!("[shader-fallback] id={} file={} implementation={}; cache unavailable: {}; same-function PSV approximation",id,file,name,cache_error);
+  return register_builtin(id,name,canonical_hash,package,true);
+ }
+ Err(format!("no built-in match, valid shader cache or mapped PSV fallback: {cache_error}"))
+}
+fn register_cached_source_at(id:&str,file:&str,source:&[u8],allow_generate:bool)->Result<(),String>{
+ if source.is_empty(){return Err("source unavailable; cannot validate shader cache".into());}
  let id_c=CString::new(file).map_err(|_|"invalid shader path")?;
  let mut base=[0u8;1024];
  let cache=if unsafe{art3m1s_gxm_external_cache_path(id_c.as_ptr(),base.as_mut_ptr().cast(),base.len())}!=0{
@@ -88,12 +148,14 @@ pub(super) fn register_source_at(id:&str,file:&str,source:&[u8])->Result<(),Stri
  let shared=if unsafe{art3m1s_gxm_external_shared_cache_path(id_c.as_ptr(),shared_base.as_mut_ptr().cast(),shared_base.len())}!=0{
   Some(String::from_utf8_lossy(&shared_base[..shared_base.iter().position(|b|*b==0).unwrap_or(shared_base.len())]).to_string())
  }else{None};
- unsafe{art3m1s_gxm_shader_stage(4)}; // conversion cache or supported source preparation
- let converted=prepare_conversion_shared(source,cache.as_deref(),shared.as_deref(),unsafe{art3m1s_gxm_external_conversion_enabled()!=0})?;
+ unsafe{art3m1s_gxm_shader_stage(5)};
+ let converted=prepare_conversion_shared(source,cache.as_deref(),shared.as_deref(),allow_generate)?;
  let key=CString::new(format!("{}-{}",hash(source),hash(converted.cg.as_bytes()))).unwrap();
  let source_c=CString::new(converted.cg).map_err(|_|"Cg contains NUL")?;
- let handle=unsafe{art3m1s_gxm_external_compile(id_c.as_ptr(),key.as_ptr(),source_c.as_ptr())};
- if handle==0{return Err("libshacccg compile/cache/program validation failed; see host.log".into());}
+ // The host separately enforces the compile setting and checks GXP cache first.
+ let handle=unsafe{if allow_generate{art3m1s_gxm_external_compile(id_c.as_ptr(),key.as_ptr(),source_c.as_ptr())}
+  else{art3m1s_gxm_external_load_cached(id_c.as_ptr(),key.as_ptr(),source_c.as_ptr())}};
+ if handle==0{return Err("GXP cache missing, stale or rejected; see host.log".into());}
  let uniforms=converted.uniforms;
  for u in &uniforms{let name=CString::new(u.name.as_str()).unwrap();
   if unsafe{art3m1s_gxm_external_uniform(handle,name.as_ptr(),u.offset as u32,u.count as u32)}==0{
@@ -131,6 +193,7 @@ fn prepare_conversion_shared(source:&[u8],base:Option<&str>,shared:Option<&str>,
  }
  }
  if !allow{return Err("automatic shader conversion disabled; no matching Cg cache".into());}
+ unsafe{art3m1s_gxm_shader_stage(4)};
  let(cg,layout)=crate::render_pipeline::hlsl::translate_cg_effect(source)?;
  let c=Converted{abi:2,source_hash:hash(source),cg_hash:hash(cg.as_bytes()),cg,uniforms:layout.into_iter().map(|u|Uniform{name:u.name,offset:u.offset,count:u.count}).collect()};
  if let Some(base)=base{
@@ -171,14 +234,92 @@ pub(super) fn encode(effect:Option<&ShaderEffect>,alpha:f32,color:[f32;3])->Cust
   d.program=p.handle;d.user_texture=e.user_texture.map_or(0,|t|t.0);
   for u in &p.uniforms{
    let dst=&mut d.values[u.offset..u.offset+u.count];
-   if u.name=="alpha"{dst[0]=alpha;}else if u.name=="colorMultiply"{for(a,b)in dst.iter_mut().zip(color){*a=b;}}
-   if let Some(values)=e.uniforms.get(&u.name){for(a,b)in dst.iter_mut().zip(values){if b.is_finite(){*a=*b;}}}
+   u.bind(dst,e,alpha,color);
   }
  }});d
 }
 #[cfg(test)]
 mod tests{
  use super::*;
+ #[test]fn different_source_generates_cache_only_when_enabled_then_reuses_it(){
+  let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(0.2,0.4,0.6,alpha);}";
+  let root=std::env::temp_dir().join(format!("art3-generate-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+  std::fs::create_dir(&root).unwrap();let base=root.join("effect").to_str().unwrap().to_owned();
+  TEST_CACHE.with(|v|*v.borrow_mut()=Some(base.clone()));COMPILE_CALLS.with(|v|v.set(0));
+  assert!(super::super::bundled_effects::equivalent(&hash(src)).is_none());
+  assert!(register_source_at("generate","custom/effect.hlsl",src).is_err());
+  ALLOW_GENERATE.with(|v|v.set(true));
+  register_source_at("generate","custom/effect.hlsl",src).unwrap();
+  assert!(std::path::Path::new(&format!("{base}.conversion.json")).exists());
+  assert!(!PROGRAMS.with(|p|p.borrow()["generate"].builtin_gray));
+  assert_eq!(COMPILE_CALLS.with(|v|v.get()),1);
+  ALLOW_GENERATE.with(|v|v.set(false));
+  register_source_at("generate","custom/effect.hlsl",src).unwrap();
+  assert_eq!(COMPILE_CALLS.with(|v|v.get()),1);
+  let changed:Vec<u8>=src.iter().map(|b|if *b==b'2'{b'3'}else{*b}).collect();
+  assert!(register_source_at("generate","custom/effect.hlsl",&changed).is_err());
+  ALLOW_GENERATE.with(|v|v.set(true));FAIL_COMPILE.with(|v|v.set(true));
+  assert!(register_source_at("generate","custom/effect.hlsl",&changed).is_err());
+  assert!(registered("generate"));
+  FAIL_COMPILE.with(|v|v.set(false));ALLOW_GENERATE.with(|v|v.set(false));TEST_CACHE.with(|v|*v.borrow_mut()=None);
+  clear();std::fs::remove_dir_all(root).unwrap();
+ }
+ #[test]fn unified_parameter_descriptions_match_packages_and_binding(){
+  let schema:serde_json::Value=serde_json::from_str(include_str!("bundled/parameters.json")).unwrap();
+  let manifest:serde_json::Value=serde_json::from_str(include_str!("bundled/manifest.json")).unwrap();
+  for effect in schema["effects"].as_array().unwrap(){
+   let entry=manifest.as_array().unwrap().iter().find(|e|e["implementation"]==effect["implementation"]).unwrap();
+   let(_,hash,package)=super::super::bundled_effects::lookup(entry["source_hash"].as_str().unwrap()).unwrap();
+   let(meta,_)=parse_hashed(hash,package).unwrap();
+   assert_eq!(meta.uniforms.len(),effect["parameters"].as_array().unwrap().len());
+   for(u,desc)in meta.uniforms.iter().zip(effect["parameters"].as_array().unwrap()){
+    assert_eq!(u.name,desc["name"].as_str().unwrap());assert_eq!(u.offset,desc["offset"].as_u64().unwrap()as usize);assert_eq!(u.count,desc["count"].as_u64().unwrap()as usize);
+    let mut values=vec![0.;u.count];
+    let e=ShaderEffect{name:"probe".into(),uniforms:Default::default(),mask_texture:None,user_texture:None};
+    u.bind(&mut values,&e,1.,[1.;3]);
+    assert_eq!(values,desc["default"].as_array().unwrap().iter().map(|v|v.as_f64().unwrap()as f32).collect::<Vec<_>>());
+   }
+  }
+ }
+ #[test]fn fallback_is_platform_aware_and_never_guesses_custom_or_aa_effects(){
+  let fallback=super::super::bundled_effects::fallback;
+  assert_eq!(fallback("system/shader/pc/gray.hlsl").unwrap().0,"gray");
+  assert_eq!(fallback("SYSTEM\\SHADER\\MB\\GRAY.GLSL").unwrap().0,"gray");
+  assert_eq!(fallback("system/shader/sw/sepia.glsl").unwrap().0,"sepia");
+  assert_eq!(fallback("system/shader/ps/blur_h_p.sb").unwrap().0,"blur_h");
+  for path in ["custom/gray.hlsl","system/shader/pc/custom/gray.hlsl","system/shader/pc/../gray.hlsl","system/shader/pc/blur_h_aa.hlsl","system/shader/ps/blur_h_v.sb"]{assert!(fallback(path).is_none(),"{path}");}
+ }
+ #[test]fn valid_cache_precedes_fallback_and_invalid_cache_does_not_block_it(){
+  let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
+  let root=std::env::temp_dir().join(format!("art3-fallback-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+  std::fs::create_dir(&root).unwrap();let base=root.join("gray").to_str().unwrap().to_string();
+  TEST_CACHE.with(|p|*p.borrow_mut()=Some(base.clone()));
+  // Cache miss selects the mapped PSV implementation without creating a conversion.
+  register_source_at("fallback_probe","system/shader/pc/gray.hlsl",src).unwrap();
+  assert!(PROGRAMS.with(|p|p.borrow()["fallback_probe"].builtin_gray));
+  assert!(!root.join("gray.conversion.json").exists());
+  prepare_conversion(src,Some(&base),true).unwrap();
+  register_source_at("fallback_probe","system/shader/pc/gray.hlsl",src).unwrap();
+  assert!(!PROGRAMS.with(|p|p.borrow()["fallback_probe"].builtin_gray));
+  FAIL_COMPILE.with(|f|f.set(true));
+  register_source_at("fallback_probe","system/shader/pc/gray.hlsl",src).unwrap();
+  assert!(PROGRAMS.with(|p|p.borrow()["fallback_probe"].builtin_gray));
+  FAIL_COMPILE.with(|f|f.set(false));
+  register_source_at("fallback_probe","system/shader/pc/gray.hlsl",b"changed").unwrap();
+  assert!(PROGRAMS.with(|p|p.borrow()["fallback_probe"].builtin_gray));
+  assert!(register_source_at("fallback_probe","custom/unknown.hlsl",b"changed").is_err());
+  assert!(PROGRAMS.with(|p|p.borrow()["fallback_probe"].builtin_gray));
+  register_source_at("mobile_probe","system/shader/mb/gray.glsl",&[]).unwrap();
+  assert!(PROGRAMS.with(|p|p.borrow()["mobile_probe"].builtin_gray));
+  TEST_CACHE.with(|p|*p.borrow_mut()=None);clear();std::fs::remove_dir_all(root).unwrap();
+ }
+ #[test]fn portable_contracts_do_not_reuse_pc_additive_color_proofs(){
+  assert_eq!(builtin_contract("glsl_mb_blur_h"),"blur_h");
+  assert_eq!(builtin_contract("glsl_sw_blur_v"),"blur_v");
+  assert_eq!(builtin_contract("glsl_mb_cmul"),"cmul");
+  assert_ne!(builtin_contract("glsl_mb_gray"),"gray");
+  assert_ne!(builtin_contract("glsl_sw_sepia"),"sepia");
+ }
  #[test]fn shared_cg_cache_fallback_priority_and_mismatch(){
   let source=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
   let root=std::env::temp_dir().join(format!("art3-shared-cg-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -213,22 +354,33 @@ mod tests{
   assert!(prepare_conversion(source,Some(base),false).is_ok());
   std::fs::remove_file(format!("{base}.cg")).unwrap();std::fs::remove_file(format!("{base}.conversion.json")).unwrap();
  }
- #[test]fn bundled_programs_cover_34_unique_sources_and_reject_changed_source(){
+ #[test]fn bundled_programs_cover_portable_sources_and_reject_changed_source(){
   let hash="not a known source";assert!(super::super::bundled_effects::lookup(hash).is_none());
   let manifest:serde_json::Value=serde_json::from_str(include_str!("bundled/manifest.json")).unwrap();
-  assert_eq!(manifest.as_array().unwrap().len(),34);
-  for e in manifest.as_array().unwrap(){let(_,package)=super::super::bundled_effects::lookup(e["source_hash"].as_str().unwrap()).unwrap();
-   assert!(parse_hashed(e["source_hash"].as_str().unwrap(),package).is_ok(),"{}",e["name"]);
+  assert_eq!(manifest.as_array().unwrap().len(),39);
+  let hashes:std::collections::HashSet<_>=manifest.as_array().unwrap().iter().map(|e|e["source_hash"].as_str().unwrap()).collect();
+  assert_eq!(hashes.len(),39);
+  let packages:std::collections::HashSet<_>=manifest.as_array().unwrap().iter().map(|e|e["package"].as_str().unwrap()).collect();
+  assert!(packages.len()<hashes.len(),"equivalent sources must share packages");
+  for e in manifest.as_array().unwrap(){let(_,canonical_hash,package)=super::super::bundled_effects::lookup(e["source_hash"].as_str().unwrap()).unwrap();
+   assert!(parse_hashed(canonical_hash,package).is_ok(),"{}",e["name"]);
+   assert!(parse_hashed("changed source fingerprint",package).is_err());
    assert_eq!(&package[..4],b"AGX1");let m=u32::from_le_bytes(package[4..8].try_into().unwrap())as usize;
-   let meta:Metadata=serde_json::from_slice(&package[12..12+m]).unwrap();assert_eq!(meta.source_hash,e["source_hash"].as_str().unwrap());
+   let meta:Metadata=serde_json::from_slice(&package[12..12+m]).unwrap();assert_eq!(meta.source_hash,canonical_hash);assert_eq!(canonical_hash,e["canonical_hash"].as_str().unwrap());
    let b=u32::from_le_bytes(package[8..12].try_into().unwrap())as usize;assert_eq!(12+m+b,package.len());
    assert!(unsafe{art3m1s_gxm_external_register(package[12+m..].as_ptr(),b)}!=0);
   }
  }
- #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_conversion_enabled()->i32{1}
- #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_cache_path(_:*const std::ffi::c_char,_:*mut std::ffi::c_char,_:usize)->i32{0}
+ #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_conversion_enabled()->i32{ALLOW_GENERATE.with(|v|i32::from(v.get()))}
+ thread_local!{static ALLOW_GENERATE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};static COMPILE_CALLS:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};}
+ thread_local!{static TEST_CACHE:RefCell<Option<String>>=const{RefCell::new(None)};static FAIL_COMPILE:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};}
+ #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_cache_path(_:*const std::ffi::c_char,out:*mut std::ffi::c_char,size:usize)->i32{
+  TEST_CACHE.with(|p|{let p=p.borrow();let Some(p)=p.as_ref()else{return 0;};if p.len()+1>size{return 0;}
+   unsafe{std::ptr::copy_nonoverlapping(p.as_ptr(),out.cast(),p.len());*out.add(p.len())=0;}1})
+ }
  #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_shared_cache_path(_:*const std::ffi::c_char,_:*mut std::ffi::c_char,_:usize)->i32{0}
- #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_compile(_:*const std::ffi::c_char,_:*const std::ffi::c_char,_:*const std::ffi::c_char)->u32{7}
+ #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_load_cached(_:*const std::ffi::c_char,_:*const std::ffi::c_char,_:*const std::ffi::c_char)->u32{FAIL_COMPILE.with(|f|if f.get(){0}else{7})}
+ #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_compile(_:*const std::ffi::c_char,_:*const std::ffi::c_char,_:*const std::ffi::c_char)->u32{COMPILE_CALLS.with(|v|v.set(v.get()+1));FAIL_COMPILE.with(|f|if f.get(){0}else{7})}
  #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_shader_stage(_:i32){}
  #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_compiler_end(){}
  #[unsafe(no_mangle)]extern "C" fn art3m1s_gxm_external_register(_:*const u8,_:usize)->u32{7}

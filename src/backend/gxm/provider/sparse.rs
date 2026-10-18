@@ -44,6 +44,19 @@ impl GxmTextureProvider{
         let cropped_proof=crop.and_then(|r|proof.as_ref()?.cropped_sprite_proof(r));
         let crop=crop.filter(|_|cropped_proof.is_some());
         let info=crop.map_or(original,|[_,_,width,height]|TextureInfo{width,height});
+        if crop.is_none()&&unsafe{art3m1s_gxm_large_image_allowed(w,h)}>0{
+            let size=(w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+            let mut data=Vec::new();data.try_reserve_exact(size).ok()?;data.resize(size,0);
+            let mut cursor=crate::cpu_image_compression::Restore::new();
+            loop{let done=cursor.step(&bytes,&mut|offset,source,len|{
+                let Some(end)=offset.checked_add(len).filter(|end|*end<=data.len())else{return false;};
+                if let Some(source)=source{data[offset..end].copy_from_slice(&source[..len]);}else{data[offset..end].fill(0);}true
+            })?;if done{break;}}
+            let result=self.upload_prepared(name,w,h,PixelStorage::Owned(Tracked::bytes(data,Owner::Temporary)),false,true,proof.as_ref());
+            self.keep_encoded(name,bytes,proof);
+            if result.is_some(){self.entries.get_mut(name).unwrap().cacheable=true;}
+            return result;
+        }
         let key=crop.map_or_else(||name.to_owned(),|_|sprite_key(name));
         let cells=cropped_proof.as_ref().or(proof.as_ref())?.certificate_for_size(info.width,info.height)?;
         let id=TextureId(self.next_id);

@@ -114,6 +114,12 @@ impl GxmTextureProvider {
                 .and_then(TileProof::sprite_crop).map(|r|(info,r))}else{None};
             let info=sprite_crop.map_or(info,|(_, [_,_,width,height])|TextureInfo{width,height});
             self.warm.job = Some(WarmUpload { name, info, sprite_crop, pixels, sparse,restore:crate::cpu_image_compression::Restore::new(),proof, source, surface:None, row:0,steps:0,work_us:0,max_us:0 });
+            // Low user thresholds can also cover the bounded warm-upload range.
+            // Keep decoded bytes for the normal compression/scope decision;
+            // never publish an RGBA surface that bypasses that decision.
+            if sprite_crop.is_none() && unsafe{art3m1s_gxm_large_image_allowed(info.width,info.height)}>0 {
+                self.cancel_warm_upload();return;
+            }
             self.update_warm_account();
             return; // acquiring READY and allocating GPU memory use separate frames
         }

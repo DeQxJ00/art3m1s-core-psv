@@ -278,12 +278,12 @@ fn opaque_cover(c: &DrawCommand, width: u32, height: u32) -> bool {
     let (u0,v0)=uv(0.,0.);let (u1,v1)=uv(width as f32,height as f32);
     unsafe {art3m1s_gxm_texture_region_is_opaque(c.texture.0,u0,v0,u1,v1)!=0}
 }
-// These names currently encode as the identity sprite program, not a Kawase
+// Unregistered blur passes encode as the identity sprite program, not a blur
 // filter. Elide only that existing fallback's redundant isolation; this is NOT
 // blur support. Once encode() gains a real implementation, kind()!=0 disables
 // this route. Masks and non-full clips stay on the conservative original path.
 fn identity_blur_fallback(g:&ShaderGroup,width:u32,height:u32)->bool {
-    matches!(g.effect.name.as_str(),"blur_k"|"blur_kx"|"blur_ky")
+    matches!(g.effect.name.as_str(),"blur_h"|"blur_v"|"blur_k"|"blur_kx"|"blur_ky")
         && kind(Some(&g.effect))==0 && !super::external_effects::registered(&g.effect.name) && g.mask_range.is_none()
         && g.effect.mask_texture.is_none() && g.effect.user_texture.is_none()
         && full_stage_clip(g.clip_bounds,width,height)
@@ -788,6 +788,23 @@ fn overlay_span(frame:&DrawList,width:u32,height:u32,previous:Option<&RetainedGr
     Some(ShaderGroup{key:None,start,end,effect:ShaderEffect{name:GROUP_COMPOSITE_SHADER.into(),uniforms:Default::default(),mask_texture:None,user_texture:None},clip_bounds:Some(bounds),mask_range:None})
 }
 pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&mut RetainedGroups) {
+    // Bounded diagnostics: expose why a moving stack cannot reuse a filtered result.
+    thread_local! {static PAN_REPORT:std::cell::Cell<Option<std::time::Instant>>=const{std::cell::Cell::new(None)};}
+    PAN_REPORT.with(|last|{
+        let now=std::time::Instant::now();
+        if !frame.shader_groups.is_empty() && last.get().is_none_or(|t|now.duration_since(t).as_secs()>=5){
+            last.set(Some(now));
+            for (i,g) in frame.shader_groups.iter().enumerate().take(12){
+                crate::core_info!("[effect-reuse-route] group={} range={}..{} neutral={} fused={} translation={} effect={:?}",
+                    i,g.start,g.end,passthrough_group_inner(frame,i,width,height,true),fused_group(frame,i,width,height).is_some(),
+                    super::external_effects::translation_kind(&g.effect),g.effect);
+            }
+            for (i,c) in frame.commands.iter().enumerate().take(16){
+                crate::core_info!("[effect-reuse-source] command={} texture={:?} transform={:?} opacity={} blend={:?} clip={:?} shader={:?} opaque_cover={}",
+                    i,c.texture,c.transform,c.opacity,c.blend,c.clip_bounds,c.shader,opaque_cover(c,width,height));
+            }
+        }
+    });
     // Prepare foreign packets, then cache only independent ordinary groups.
     // Packet commands and their containing groups remain live and indivisible.
     if frame.commands.iter().chain(&frame.mask_commands).any(|c|c.recovered_packet.is_some()) {
@@ -815,7 +832,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
     let mut stats=[0,0];
     if !caches.identity_blur_reported && frame.shader_groups.iter().any(|g|identity_blur_fallback(g,width,height)) {
         caches.identity_blur_reported=true;
-        crate::core_warn!("GXM blur_k fallback is identity, not Kawase; eliding neutral offscreen copies only");
+        crate::core_warn!("GXM unregistered blur fallback is identity, not blur; eliding neutral offscreen copies only");
     }
     let enabled=unsafe {art3m1s_gxm_group_passthrough_enabled()!=0};
     caches.nodes.begin();caches.nodes.protect_inputs(frame,(width,height));
@@ -1066,7 +1083,7 @@ mod tests {
     fn mosaic_frame()->DrawList {
         use super::super::external_effects as ex;
         let src=b"float size; float ratio; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(size,ratio,0,1);}";
-        ex::register_source("verified-mosaic-test",src).unwrap();
+        ex::register_test_source("verified-mosaic-test",src).unwrap();
         ex::mark_test_builtin_mosaic("verified-mosaic-test");
         let mut f=neutral_frame();let mut outer=f.shader_groups[0].clone();
         outer.effect.name="verified-mosaic-test".into();
@@ -1116,7 +1133,7 @@ mod tests {
         use super::super::external_effects as ex;
         let mut frame=mosaic_frame();let mosaic=frame.shader_groups[1].clone();
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
-        for name in ["test-blur-h","test-blur-v"] {ex::register_source(name,src).unwrap();ex::mark_test_builtin_blur(name);}
+        for name in ["test-blur-h","test-blur-v"] {ex::register_test_source(name,src).unwrap();ex::mark_test_builtin_blur(name);}
         frame.commands=frame.commands.iter().cloned().cycle().take(6).collect();frame.shader_groups.clear();
         for i in 0..3 {
             for name in ["test-blur-h","test-blur-v",GROUP_COMPOSITE_SHADER] {
@@ -1307,7 +1324,7 @@ mod tests {
         e=f.shader_groups[1].effect.clone();e.mask_texture=Some(TextureId(42));assert!(!ex::cacheable_mosaic(&e));
         e.mask_texture=None;e.user_texture=Some(TextureId(42));assert!(!ex::cacheable_mosaic(&e));
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
-        ex::register_source("verified-mosaic-test",src).unwrap();
+        ex::register_test_source("verified-mosaic-test",src).unwrap();
         assert!(!ex::cacheable_mosaic(&f.shader_groups[1].effect));
     }
     #[test]
@@ -1718,7 +1735,7 @@ mod tests {
         let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
         let mut f=neutral_frame();f.shader_groups.clear();
         for (id,step) in [("packet_blur_h","width"),("packet_blur_v","height")] {
-            effects::register_source(id,src).unwrap();effects::mark_test_translation(id,if step=="width"{1}else{2});
+            effects::register_test_source(id,src).unwrap();effects::mark_test_translation(id,if step=="width"{1}else{2});
             let mut g=test_group(id,0,1);
             g.effect.uniforms.insert("weights".into(),vec![0.2,0.16,0.12,0.07,0.03,0.015,0.004,0.001]);
             g.effect.uniforms.insert(step.into(),vec![1./960.]);
@@ -1787,7 +1804,7 @@ mod tests {
     fn neutral_wrappers_around_verified_cmul_preserve_color_pass(){
         let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
         let id="cmul_wrapper_test";
-        super::super::external_effects::register_source(id,src).unwrap();
+        super::super::external_effects::register_test_source(id,src).unwrap();
         let mut f=neutral_frame();
         f.shader_groups.insert(0,test_group(id,0,2));
         for (key,value) in [("red",1.),("green",0.94509804),("blue",0.8901961)]{
@@ -1819,7 +1836,7 @@ mod tests {
         f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
         assert!(!passthrough_group_inner(&f,2,960,544,true));
         f.shader_groups[0].effect.uniforms.remove("alpha");
-        super::super::external_effects::register_source(id,src).unwrap();
+        super::super::external_effects::register_test_source(id,src).unwrap();
         assert!(!passthrough_group_inner(&f,2,960,544,true));
         super::super::external_effects::clear();
     }
@@ -1827,7 +1844,7 @@ mod tests {
     fn neutral_wrappers_around_verified_sepia_preserve_color_pass(){
         let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
         let id="sepia_wrapper_test";
-        super::super::external_effects::register_source(id,src).unwrap();
+        super::super::external_effects::register_test_source(id,src).unwrap();
         let mut f=neutral_frame();
         f.shader_groups.insert(0,test_group(id,0,2));
         for (key,value) in [("red",1.),("green",0.94509804),("blue",0.8901961)]{
@@ -1860,14 +1877,14 @@ mod tests {
         f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
         assert!(!passthrough_group_inner(&f,2,960,544,true));
         f.shader_groups[0].effect.uniforms.remove("alpha");
-        super::super::external_effects::register_source(id,src).unwrap();
+        super::super::external_effects::register_test_source(id,src).unwrap();
         assert!(!passthrough_group_inner(&f,2,960,544,true));
         super::super::external_effects::clear();
     }
     #[test]
     fn rebuilding_neutral_external_wrapper_keeps_filter_and_retained_boundary(){
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
-        super::super::external_effects::register_source("test_gray_wrapper",src).unwrap();
+        super::super::external_effects::register_test_source("test_gray_wrapper",src).unwrap();
         let mut f=neutral_frame();
         f.shader_groups.insert(0,test_group("test_gray_wrapper",0,2));
         assert!(!passthrough_group_inner(&f,1,960,544,true));
@@ -1896,7 +1913,7 @@ mod tests {
         assert!(!passthrough_group_inner(&f,1,960,544,true));
         f.shader_groups[0].effect.mask_texture=None;
         // Replacing the same ID with an arbitrary shader must drop the proof.
-        super::super::external_effects::register_source("test_gray_wrapper",src).unwrap();
+        super::super::external_effects::register_test_source("test_gray_wrapper",src).unwrap();
         assert!(!passthrough_group_inner(&f,1,960,544,true));
         super::super::external_effects::clear();
         assert!(!passthrough_group_inner(&f,1,960,544,true));
@@ -1904,7 +1921,7 @@ mod tests {
     #[test]
     fn registered_external_chain_executes_every_pass_and_never_uses_identity_fallback(){
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
-        super::super::external_effects::register_source("blur_k",src).unwrap();
+        super::super::external_effects::register_test_source("blur_k",src).unwrap();
         let mut f=neutral_frame();f.shader_groups.clear();
         for _ in 0..5{f.shader_groups.push(test_group("blur_k",0,2));}
         assert!(!identity_blur_fallback(&f.shader_groups[4],960,544));
@@ -1916,7 +1933,7 @@ mod tests {
     fn moving_kawase_chain_crosses_only_neutral_intermediates(){
         let id="verified_kawase_chain";
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
-        super::super::external_effects::register_source(id,src).unwrap();
+        super::super::external_effects::register_test_source(id,src).unwrap();
         super::super::external_effects::mark_test_builtin_kawase(id);
         let mut f=neutral_frame();f.shader_groups.clear();
         for _ in 0..5 {
@@ -1966,7 +1983,7 @@ mod tests {
         render_range(&f,0,2,10,960,544,&mut [0,0],true,&mut nodes,false);
         EVENTS.with(|v|assert!(v.borrow().iter().filter(|e|*e=="begin-group").count()>=3));
         // Replacing the source under the same ID revokes the proof.
-        super::super::external_effects::register_source(id,src).unwrap();
+        super::super::external_effects::register_test_source(id,src).unwrap();
         assert!(!passthrough_group_inner(&f,9,960,544,true));
         super::super::external_effects::clear();
     }
@@ -1977,7 +1994,7 @@ mod tests {
         for (id,mark) in [("color_gray",effects::mark_test_builtin_gray as fn(&str)),
             ("color_multiply",effects::mark_test_builtin_cmul as fn(&str)),
             ("color_sepia",effects::mark_test_builtin_sepia as fn(&str))] {
-            effects::register_source(id,src).unwrap();
+            effects::register_test_source(id,src).unwrap();
             let mut f=neutral_frame();f.shader_groups=vec![test_group(id,0,1)];
             for key in ["red","green","blue"]{f.shader_groups[0].effect.uniforms.insert(key.into(),vec![0.8]);}
             assert!(translated_chain(&f,&[0],0,960,544).is_none());
@@ -1991,7 +2008,7 @@ mod tests {
             f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
             assert!(translated_chain(&f,&[0],0,960,544).is_none());
             f.shader_groups[0].effect.uniforms.remove("alpha");
-            effects::register_source(id,src).unwrap();
+            effects::register_test_source(id,src).unwrap();
             assert!(translated_chain(&f,&[0],0,960,544).is_none());
         }
         effects::clear();
@@ -2000,7 +2017,7 @@ mod tests {
     fn translated_filters_require_verified_coordinates_and_independent_sources(){
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
         for (id,kind) in [("pan_h",1),("pan_v",2),("pan_gray",6)] {
-            super::super::external_effects::register_source(id,src).unwrap();
+            super::super::external_effects::register_test_source(id,src).unwrap();
             super::super::external_effects::mark_test_translation(id,kind);
         }
         let mut f=neutral_frame();f.shader_groups.clear();
@@ -2024,7 +2041,7 @@ mod tests {
         f.shader_groups[1].effect.uniforms.insert("alpha".into(),vec![0.5]);
         assert!(translated_chain(&f,&[1,0],0,960,544).is_none());
         // A program ID reused for an arbitrary implementation revokes metadata.
-        super::super::external_effects::register_source("pan_h",src).unwrap();
+        super::super::external_effects::register_test_source("pan_h",src).unwrap();
         assert_eq!(super::super::external_effects::translation_kind(&f.shader_groups[0].effect),0);
         f.shader_groups=vec![test_group("pan_gray",0,2)];
         assert_eq!(translated_chain(&f,&[0],0,960,544),Some(vec![6]));
@@ -2036,7 +2053,7 @@ mod tests {
     fn coordinate_dependent_outer_keeps_moving_inner_translation_cache_reachable(){
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
         for (id,kind) in [("inner_h",1),("inner_v",2),("screen_outer",0)] {
-            super::super::external_effects::register_source(id,src).unwrap();
+            super::super::external_effects::register_test_source(id,src).unwrap();
             super::super::external_effects::mark_test_translation(id,kind);
         }
         let mut f=neutral_frame();f.shader_groups.clear();
@@ -2083,6 +2100,27 @@ mod tests {
         f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![1.]);
         f.shader_groups[0].effect.uniforms.insert("grayscale".into(),vec![1.]);
         assert!(!passthrough_group(&f,6,960,544));
+    }
+    #[test]
+    fn unregistered_gaussian_pan_elides_copies_but_registered_filter_survives(){
+        use super::super::external_effects as effects;
+        effects::clear();
+        let mut f=neutral_frame();
+        f.shader_groups=vec![test_group("blur_h",0,2),test_group("blur_v",0,2),
+            test_group(GROUP_COMPOSITE_SHADER,0,2)];
+        let mut caches=RetainedGroups::default();
+        for x in [0.,-10.,-20.] {
+            f.commands[0].transform.translation.x=x;
+            EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut caches);
+            EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","draw:42","draw:43","end-frame"]));
+        }
+        // Registration under the same script ID must immediately revoke elision.
+        let src=b"float alpha; void vs(){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(){result=float4(alpha,0,0,1);}";
+        effects::register_test_source("blur_h",src).unwrap();
+        assert!(!identity_blur_fallback(&f.shader_groups[0],960,544));
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut caches);
+        EVENTS.with(|v|assert!(v.borrow().iter().any(|e|e=="begin-group")));
+        effects::clear();
     }
     #[test]
     fn identity_blur_fallback_keeps_mask_clip_and_unknown_shader_boundaries(){
@@ -2257,7 +2295,7 @@ mod tests {
     fn layered_external_gray_frame()->DrawList {
         let mut f=layered_gray_frame();
         let src=b"float alpha; void vs(float4 position:POSITION){resultPosition=position;resultTexCoord0=texCoord0;resultTexCoord1=texCoord1;} void ps(float2 texCoord0:TEXCOORD0,float2 texCoord1:TEXCOORD1,out float4 result:COLOR0){result=float4(alpha,0,0,1);}";
-        super::super::external_effects::register_source("test_multi_gray",src).unwrap();
+        super::super::external_effects::register_test_source("test_multi_gray",src).unwrap();
         super::super::external_effects::mark_test_builtin_gray("test_multi_gray");
         for g in &mut f.shader_groups[..4] {g.effect.name="test_multi_gray".into();g.effect.uniforms.clear();}
         f.shader_groups[4].effect.uniforms.clear();f

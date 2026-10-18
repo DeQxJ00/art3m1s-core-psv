@@ -12,6 +12,8 @@ use crate::compositor::scene::Scene;
 pub mod draw;
 pub mod recovered;
 pub mod hlsl;
+pub mod glsl;
+pub mod dx11;
 pub mod shader;
 pub mod transition;
 

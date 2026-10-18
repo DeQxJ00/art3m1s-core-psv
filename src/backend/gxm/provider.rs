@@ -90,6 +90,10 @@ impl Entry {
 }
 
 unsafe extern "C" {
+    fn art3m1s_gxm_reserve_image(w:u32,h:u32)->i32;
+    fn art3m1s_gxm_reserve_large_image(name:*const std::ffi::c_char,w:u32,h:u32)->i32;
+    fn art3m1s_gxm_large_image_allowed(w:u32,h:u32)->i32;
+    fn art3m1s_gxm_upload_large_image(id:u64,name:*const std::ffi::c_char,w:u32,h:u32,p:*const u8,n:usize,proof:*const u8,proof_n:usize)->i32;
     fn art3m1s_gxm_upload_compressed(id:u64,w:u32,h:u32,format:u32,flags:u32,p:*const u8,len:usize)->i32;
     fn art3m1s_gxm_read_texture_region(id:u64,x:u32,y:u32,w:u32,h:u32,p:*mut u8,len:usize)->i32;
     fn art3m1s_gxm_upload_bc3(id:u64,w:u32,h:u32,p:*const u8,len:usize)->i32;
@@ -135,6 +139,7 @@ impl Drop for PrivateSurface{fn drop(&mut self){if self.handle!=0{unsafe{art3m1s
 
 pub struct GxmTextureProvider {
     source: Option<Source>,
+    image_path_resolver: Option<Box<dyn Fn(&str)->String>>,
     prefetch: Option<PrefetchSource>,
     entries: HashMap<String, Entry>,
     decoded: HashMap<String, DecodedEntry>,
@@ -162,11 +167,54 @@ pub struct GxmTextureProvider {
     upload_retry_pending: bool,
     dxt5_upload_deferred: bool,
     upload_reclaim_bytes: usize,
+    preflight_names: Option<HashSet<String>>,
     transient_save_directory: Option<String>,
     warm: warm::WarmState,
 }
 
 impl GxmTextureProvider {
+    /// Run before BeginScene. Pin all incoming/retained sources before resolving
+    /// any file, so allocation admission cannot evict a later draw's texture.
+    pub fn prepare_image_files(&mut self,names:&HashSet<String>,previous:&HashSet<TextureId>){
+        let mut pinned=names.clone();
+        for id in previous {if let Some(name)=self.ids.get(id){pinned.insert(sparse::source_name(name).into());}}
+        for (name,e) in &mut self.entries {
+            e.reclaimable=e.cacheable&&!pinned.contains(sparse::source_name(name));
+        }
+        self.preflight_names=Some(pinned);
+        let mut files:Vec<_>=names.iter().filter(|name|{
+            let lower=name.to_ascii_lowercase();
+            lower.ends_with(".png")||lower.ends_with(".jpg")||lower.ends_with(".jpeg")
+        }).cloned().collect();
+        files.sort_unstable();
+        for name in files {self.resolve(&name);}
+        self.preflight_names=None;
+    }
+    fn admit_large_image(&mut self,name:&str,w:u32,h:u32){
+        let Some(pinned)=self.preflight_names.as_ref() else{return;};
+        let Some(bytes)=(w as usize).checked_mul(h as usize).and_then(|n|n.checked_mul(4)) else{return;};
+        if bytes<8*1024*1024||w>4096||h>4096{return;}
+        // Retire cold CPU copies before allocating the full decoder output.
+        // Never discard another source required by this frame or transition.
+        let mut cold:Vec<_>=self.decoded.iter().filter(|(n,_)|!pinned.contains(sparse::source_name(n)))
+            .map(|(n,e)|(e.last_used,n.clone())).collect();cold.sort_unstable();
+        let mut freed=0;
+        for (_,n) in cold {if freed>=bytes{break;}freed+=self.decoded.remove(&n).unwrap().rgba.capacity();}
+        if let Some(b)=&self.cache_budget{b.lock().unwrap().set_idle(self.idle_parts().total());}
+        let resolved=self.image_path_resolver.as_ref().map(|resolve|resolve(name));
+        let path=std::ffi::CString::new(resolved.as_deref().unwrap_or(name)).ok();
+        let reserve=||{
+            let compressed=path.as_ref().map_or(-1,|p|unsafe{art3m1s_gxm_reserve_large_image(p.as_ptr(),w,h)});
+            if compressed<0{unsafe{art3m1s_gxm_reserve_image(w,h)}}else{compressed}
+        };
+        let mut ready=reserve();
+        for _ in 0..8 {
+            if ready!=0{break;}
+            if self.reclaim_effect_gpu_cache(4*1024*1024)==0{break;}
+            ready=reserve();
+        }
+        crate::core_info!("[image-admission] size={}x{} cpu_bytes={} cpu_released={} gpu_reserved={}",w,h,bytes,freed,ready);
+    }
     // Configure before loading a project. Changing policy on a live cache would
     // mix original and forced-alpha entries; the launcher applies it next boot.
     pub fn set_ignore_background_alpha(&mut self, enabled: bool) -> bool {
@@ -285,6 +333,7 @@ impl GxmTextureProvider {
     pub fn new() -> Self {
         Self {
             source: None,
+            image_path_resolver: None,
             prefetch: None,
             entries: HashMap::new(),
             decoded: HashMap::new(), decoded_hits: 0, gpu_demotions: 0,
@@ -309,11 +358,15 @@ impl GxmTextureProvider {
             upload_retry_pending:false,
             dxt5_upload_deferred:false,
             upload_reclaim_bytes:0,
+            preflight_names:None,
             transient_save_directory:None,
             warm:Default::default(),
         }
     }
 
+    pub fn with_image_path_resolver(mut self,resolve:impl Fn(&str)->String+'static)->Self{
+        self.image_path_resolver=Some(Box::new(resolve));self
+    }
     pub fn with_source<F>(mut self, source: F) -> Self
     where
         F: Fn(&str) -> Option<Vec<u8>> + 'static,
@@ -425,8 +478,14 @@ impl GxmTextureProvider {
             id
         });
         let started = Instant::now();
+        let compressed=if !video&&retain_pixels&&unsafe{art3m1s_gxm_large_image_allowed(width,height)}>0 {
+            let resolved=self.image_path_resolver.as_ref().map(|resolve|resolve(name));
+            let certificate=proof.and_then(|p|p.certificate_for_size(width,height)).unwrap_or(&[]);
+            std::ffi::CString::new(resolved.as_deref().unwrap_or(name)).ok().map_or(-1,|n|unsafe{art3m1s_gxm_upload_large_image(id.0,n.as_ptr(),width,height,rgba.as_ptr(),rgba.len(),certificate.as_ptr(),certificate.len())})
+        }else{-1};
         let uploaded = unsafe {
-            if video { art3m1s_gxm_upload_video_texture(id.0, width, height, rgba.as_ptr(), rgba.len()) }
+            if compressed>=0 {compressed}
+            else if video { art3m1s_gxm_upload_video_texture(id.0, width, height, rgba.as_ptr(), rgba.len()) }
             else if let Some(cells)=proof.and_then(|p|p.certificate_for_size(width,height)){art3m1s_gxm_upload_texture_proof(id.0,width,height,rgba.as_ptr(),rgba.len(),cells.as_ptr(),cells.len())}
             else { art3m1s_gxm_upload_texture(id.0, width, height, rgba.as_ptr(), rgba.len()) }
         };
@@ -481,6 +540,7 @@ impl GxmTextureProvider {
             self.entries.insert(name.to_owned(), Entry { sprite_crop:None, native_bytes:0,bc3:false, alpha_only:false, gray:false, id, info, rgba: if retain_pixels { match pixels {PixelStorage::Owned(mut p)=>{p.transfer(Owner::Provider);p},PixelStorage::Borrowed(p)=>Tracked::bytes(p.to_vec(),Owner::Provider)} } else { Tracked::bytes(Vec::new(),Owner::Provider) }, opaque, revision: self.revision, last_used: self.cache_clock, cacheable: false,reclaimable:false,shared:false });
         }
         self.ids.insert(id, name.to_owned());
+        if compressed>0 {let e=self.entries.get_mut(name).unwrap();e.bc3=true;e.native_bytes=compressed as usize;}
         let total_us = elapsed_us(started);
         self.timing.upload_us += total_us;
         self.timing.upload_max_us = self.timing.upload_max_us.max(total_us);
@@ -826,6 +886,7 @@ impl TextureProvider for GxmTextureProvider {
         }
         if crate::video::is_video_layer_texture_name(name) { return None; }
         if let Some(entry)=self.decoded.remove(name){
+            if !entry.gray{self.admit_large_image(name,entry.info.width,entry.info.height);}
             let source=self.encoded.remove(name);
             let started=Instant::now();let info=entry.info;
             let result=if entry.gray{self.upload_gray(name,info.width,info.height,entry.rgba)}else{
@@ -859,6 +920,7 @@ impl TextureProvider for GxmTextureProvider {
             Some(Ok(image)) => {
                 let (w,h) = image.dimensions();
                 let gray=image.is_gray();
+                if !gray{self.admit_large_image(name,w,h);}
                 let result = if gray{self.upload_gray(name,w,h,image.into_raw())}else{
                     self.upload_prepared(name,w,h,PixelStorage::Owned(image.into_raw()),false,true,proof.as_ref())};
                 if source.is_some()||proof.is_some(){self.keep_encoded(name,source.unwrap_or_else(||Tracked::bytes(Vec::new(),Owner::Provider)),proof);}
@@ -916,6 +978,7 @@ impl TextureProvider for GxmTextureProvider {
         }};
         let (width,height)=decoder.dimensions();
         let color=decoder.color_type();
+        if color!=image::ColorType::L8{self.admit_large_image(name,width,height);}
         if color==image::ColorType::L8{
             let pixels=crate::resource_ledger::decode_luma(decoder,512*1024*1024)?;
             self.timing.decoded+=1;self.timing.decode_us+=elapsed_us(started);
@@ -927,7 +990,7 @@ impl TextureProvider for GxmTextureProvider {
         // PNG filtering reads previously decoded rows. Transparent sprites use
         // cached CPU memory, then one sequential GPU copy; decoding them into
         // uncached GPU memory also made alpha bounds preparation very costly.
-        if self.shared_surfaces&&color==image::ColorType::Rgb8&&logical>=256*256*4&&logical<=16*1024*1024&&decoder.total_bytes()<=logical{
+        if self.shared_surfaces&&unsafe{art3m1s_gxm_large_image_allowed(width,height)}<=0&&color==image::ColorType::Rgb8&&logical>=256*256*4&&logical<=16*1024*1024&&decoder.total_bytes()<=logical{
             if let Some(mut surface)=PrivateSurface::new(width,height){
                 if let Err(error)=crate::image_decode::rgba_into(decoder,surface.bytes(),16*1024*1024){
                     self.timing.decode_errors+=1;crate::core_warn!("GXM shared-surface decode failure: {name}: {error}");return None;
@@ -2167,6 +2230,63 @@ mod tests {
         assert_eq!(p.pixel_alpha(id,0,0),Some(123));
         assert_eq!(reads.get(),1);assert_eq!(p.timing.decoded,1);
         assert!(p.decoded.is_empty());
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_reserve_large_image(_:*const std::ffi::c_char,_:u32,_:u32)->i32 {LARGE_IMAGE_RESULT.with(|v|if v.get()>=0{1}else{-1})}
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_reserve_image(_:u32,_:u32)->i32 {1}
+    std::thread_local! { static LARGE_IMAGE_RESULT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) }; static LARGE_IMAGE_PATH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_large_image_allowed(_:u32,_:u32)->i32 {LARGE_IMAGE_RESULT.with(|v|i32::from(v.get()>=0))}
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_upload_large_image(_:u64,name:*const std::ffi::c_char,_:u32,_:u32,_:*const u8,_:usize,_:*const u8,_:usize)->i32 {LARGE_IMAGE_PATH.with(|p|*p.borrow_mut()=unsafe{std::ffi::CStr::from_ptr(name)}.to_string_lossy().into_owned());LARGE_IMAGE_RESULT.with(|v|v.get())}
+
+    #[test]
+    fn compressed_static_upload_charges_native_storage_and_never_falls_back_on_pressure(){
+        let _guard=LOCK.lock().unwrap();
+        let mut p=GxmTextureProvider::new();
+        p=p.with_image_path_resolver(|name|format!("image/bg/{name}.png"));
+        LARGE_IMAGE_RESULT.with(|v|v.set(16));
+        let pixels=[255;64];
+        p.upload_rgba("background",4,4,&pixels).unwrap();
+        LARGE_IMAGE_PATH.with(|path|assert_eq!(*path.borrow(),"image/bg/background.png"));
+        assert!(p.entries["background"].bc3);
+        assert_eq!(p.entries["background"].gpu_bytes(),16);
+        assert_eq!(p.entries["background"].rgba.as_slice(),&pixels);
+        p.upload_rgba_render_only("atlas",4,4,&pixels).unwrap();
+        assert!(!p.entries["atlas"].bc3);
+        LARGE_IMAGE_RESULT.with(|v|v.set(0));
+        assert!(p.upload_rgba("deferred",4,4,&pixels).is_none());
+        assert!(!p.entries.contains_key("deferred"));
+        LARGE_IMAGE_RESULT.with(|v|v.set(-1));
+    }
+
+    #[test]
+    fn image_admission_pins_incoming_and_previous_textures_before_reclaim(){
+        let _guard=LOCK.lock().unwrap();
+        let (mut p,_)=provider();
+        let (previous,_)=p.resolve("previous").unwrap();
+        p.resolve("current.png").unwrap();p.resolve("cold").unwrap();
+        p.retain(&HashSet::new());
+        p.prepare_image_files(&HashSet::from(["current.png".into()]),&HashSet::from([previous]));
+        assert!(!p.entries["previous"].reclaimable);
+        assert!(!p.entries["current.png"].reclaimable);
+        assert!(p.entries["cold"].reclaimable);
+        assert!(p.preflight_names.is_none());
+    }
+
+    #[test]
+    fn large_image_admission_reclaims_only_cold_decoded_copies(){
+        let _guard=LOCK.lock().unwrap();
+        let mut p=GxmTextureProvider::new();
+        for name in ["needed","old"] {
+            p.decoded.insert(name.into(),DecodedEntry{gray:false,info:TextureInfo{width:16,height:16},
+                rgba:vec![0;1024].into(),last_used:0});
+        }
+        p.preflight_names=Some(HashSet::from(["needed".into()]));
+        p.admit_large_image("needed",2100,2541);
+        assert!(p.decoded.contains_key("needed"));assert!(!p.decoded.contains_key("old"));
     }
 
     #[test]

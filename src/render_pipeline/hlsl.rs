@@ -12,6 +12,12 @@ const SAMPLERS: [(&str, &str); 4] = [
 ];
 
 pub fn translate_effect(source: &[u8]) -> Result<String, String> {
+    if !strip_comments(&String::from_utf8_lossy(source)).contains("void ps") && String::from_utf8_lossy(source).contains("SV_TARGET") {
+        return translate_effect(super::dx11::to_hlsl(source)?.as_bytes());
+    }
+    if !strip_comments(&String::from_utf8_lossy(source)).contains("void ps") && String::from_utf8_lossy(source).contains("void main") {
+        return translate_effect(super::glsl::to_hlsl(source)?.as_bytes());
+    }
     let decoded = String::from_utf8_lossy(source).replace('\r', "");
     let source = strip_comments(&decoded);
     let ps_start = source
@@ -119,7 +125,7 @@ fn convert_loop_index_multiplication(source: &str) -> String {
     out
 }
 
-fn replace_identifier(source: &str, from: &str, to: &str) -> String {
+pub(super) fn replace_identifier(source: &str, from: &str, to: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let bytes = source.as_bytes();
     let mut index = 0;
@@ -145,7 +151,7 @@ fn is_ident(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn matching_brace(source: &str, open: usize) -> Option<usize> {
+pub(super) fn matching_brace(source: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (offset, ch) in source[open..].char_indices() {
         match ch {
@@ -162,7 +168,7 @@ fn matching_brace(source: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn strip_comments(source: &str) -> String {
+pub(super) fn strip_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut chars = source.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -238,6 +244,12 @@ technique technique0 { }
 #[derive(Clone,Debug)]
 pub struct CgUniform {pub name:String,pub offset:usize,pub count:usize}
 pub fn translate_cg_effect(data:&[u8])->Result<(String,Vec<CgUniform>),String>{
+    if !strip_comments(&String::from_utf8_lossy(data)).contains("void ps") {
+        let normalized=if String::from_utf8_lossy(data).contains("SV_TARGET"){
+            super::dx11::to_hlsl(data)?
+        }else{super::glsl::to_hlsl(data)?};
+        return translate_cg_effect(normalized.as_bytes());
+    }
     let s=strip_comments(&String::from_utf8_lossy(data)).replace('\r',"");
     let extract=|name:&str|->Result<(usize,String),String>{
         let at=s.find(&format!("void {name}")).ok_or_else(||format!("missing DX9 {name} wrapper"))?;

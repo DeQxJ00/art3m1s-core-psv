@@ -55,9 +55,20 @@ impl CoreRuntime {
             // Existing bindings own all jobs; generated/unknown names are ignored.
             let mut files=self.compositor.scene().collect_files();
             files.extend(RenderPipeline::new(&self.compositor).retained_files());
-            let mut paths:Vec<_>=files.into_iter().map(|file|super::magic_path::resolve_path(&self.magic_paths,&file)).collect();
+            let mut paths:Vec<_>=files.iter().map(|file|super::magic_path::resolve_path(&self.magic_paths,file)).collect();
             paths.sort_unstable();
             super::surface_loader::prioritize_scene(&paths);
+            let mut previous=std::collections::HashSet::new();
+            if (RenderPipeline::new(&self.compositor).needs_trans_capture()
+                || RenderPipeline::new(&self.compositor).is_transition_in_progress())
+                && let Some(frame)=&self.last_submitted_frame {
+                for command in frame.commands.iter().chain(&frame.mask_commands){
+                    previous.insert(command.texture);
+                    if let Some(shader)=&command.shader{previous.extend(shader.mask_texture);previous.extend(shader.user_texture);}
+                }
+                for group in &frame.shader_groups{previous.extend(group.effect.mask_texture);previous.extend(group.effect.user_texture);}
+            }
+            self.texture_provider.prepare_image_files(&files,&previous);
         }
         let can_warm = matches!(self.wait_reason, Some(WaitReason::Generic | WaitReason::Generic0))
             && self.is_text_reveal_complete() && !self.frame_visual_dirty

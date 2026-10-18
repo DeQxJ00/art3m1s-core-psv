@@ -813,6 +813,28 @@ pub unsafe extern "C" fn art3m1s_launcher_decode_icon(
     })).unwrap_or(0)
 }
 
+/// Startup-only image preparation. Pixels remain owned by Rust during the callback.
+/// Returns 2 for a size-filtered image, 0 for an error, or the callback result.
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_prepare_large_image(
+    data: *const u8, len: usize, minimum: u64, context: *mut std::ffi::c_void,
+    consume: Option<unsafe extern "C" fn(*mut std::ffi::c_void,u32,u32,*const u8,usize)->c_int>,
+) -> c_int {
+    if data.is_null() || len == 0 || len > 64*1024*1024 { return 0; }
+    let Some(consume)=consume else { return 0; };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        use image::ImageDecoder;
+        let bytes=unsafe { std::slice::from_raw_parts(data,len) };
+        let Ok(reader)=image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() else {return 0;};
+        let Ok(decoder)=reader.into_decoder() else {return 0;};
+        let (w,h)=decoder.dimensions();
+        if w==0 || h==0 || w>4096 || h>4096 || u64::from(w)*u64::from(h)*4<minimum {return 2;}
+        let Ok(rgba)=crate::resource_ledger::decode_rgba(decoder,64*1024*1024) else {return 0;};
+        unsafe {consume(context,w,h,rgba.as_ptr(),rgba.as_raw().len())}
+    })).unwrap_or(0)
+}
+
 /// Extract a PE RT_GROUP_ICON/RT_ICON into a fixed 48x48 RGBA tile.
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 #[unsafe(no_mangle)]
