@@ -139,12 +139,21 @@ fn compare_id_part(a: &str, b: &str) -> Ordering {
     }
 }
 
+// Cache belongs to one scene, never to its cloned transition/save projection.
+#[derive(Debug, Default)]
+struct FileCache(std::sync::Mutex<Option<(u64, std::collections::HashSet<String>)>>);
+impl Clone for FileCache {
+    fn clone(&self) -> Self { Self::default() }
+}
+
 /// 整棵场景树。
 ///
 /// 节点存在扁平的 `HashMap` 里（键为完整 ID），父子关系通过 ID 推导，子节点顺序
 /// 单独记录。根节点集合是没有父级的顶层 ID，按插入顺序排列。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scene {
+    #[serde(skip)]
+    file_cache: FileCache,
     #[serde(skip)]
     query_serial: u64,
     nodes: HashMap<String, Layer>,
@@ -166,6 +175,7 @@ impl Scene {
     /// copying their script parameter maps at every rendered frame.
     pub fn render_snapshot(&self) -> Self {
         Self {
+            file_cache: FileCache::default(),
             query_serial: self.query_serial,
             roots: self.roots.clone(),
             root_props: self.root_props.clone(),
@@ -205,6 +215,7 @@ impl Scene {
     /// handler maps. Accepted serials are separate from the projection itself:
     /// synchronous Lua callbacks can already have mutated that projection.
     pub(crate) fn sync_query_changes_from(&mut self, source: &Self, accepted: &mut HashMap<String, (u64, u64)>) -> usize {
+        *self.file_cache.0.get_mut().unwrap()=None;
         let mut copied=0;
         self.nodes.retain(|id, _| source.nodes.contains_key(id));
         accepted.retain(|id, _| source.nodes.contains_key(id));
@@ -370,6 +381,10 @@ impl Scene {
     /// - 单色图层的 1x1 纯色纹理缓存名。
     /// - 中间渲染遮罩与 shader 附加纹理等仅由属性引用的资源。
     pub fn collect_files(&self) -> std::collections::HashSet<String> {
+        let mut cache=self.file_cache.0.lock().unwrap();
+        if let Some((revision,files))=cache.as_ref() {
+            if *revision==self.query_serial { return files.clone(); }
+        }
         let mut files = std::collections::HashSet::new();
         for layer in self.nodes.values() {
             if let Some(file) = &layer.file {
@@ -409,6 +424,7 @@ impl Scene {
                 }
             }
         }
+        *cache=Some((self.query_serial,files.clone()));
         files
     }
 
@@ -497,6 +513,7 @@ impl Scene {
             Some(node) => node.children,
             None => return 0,
         };
+        self.query_serial=self.query_serial.wrapping_add(1).max(1);
         let mut removed = 1;
         for child in children {
             removed += self.remove_subtree(&child);
@@ -640,6 +657,21 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn file_cache_tracks_edits_deletion_clones_and_query_projection() {
+        let mut scene=Scene::new();scene.create("1",Some("old.png".into()));
+        assert!(scene.collect_files().contains("old.png"));
+        let mut snapshot=scene.render_snapshot();let mut clone=scene.clone();
+        scene.get_mut("1").unwrap().file=Some("new.png".into());
+        assert!(!scene.collect_files().contains("old.png"));
+        assert!(snapshot.collect_files().contains("old.png"));
+        clone.set_mask("1",Some("mask.png".into()));assert!(clone.collect_files().contains("mask.png"));
+        snapshot.sync_query_changes_from(&scene,&mut HashMap::new());
+        assert!(snapshot.collect_files().contains("new.png"));
+        scene.delete("1");assert!(scene.collect_files().is_empty());
+        scene.replace_with(snapshot);assert!(scene.collect_files().contains("new.png"));
     }
 
     #[test]
