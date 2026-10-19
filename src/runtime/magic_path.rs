@@ -14,12 +14,16 @@ pub type MagicPathTable = Mutex<HashMap<String, String>>;
 /// Names without a `:` prefix are returned unchanged. If a prefix is not
 /// registered, Artemis image assets conventionally fall back to `image/rest`.
 pub fn resolve_path(table: &MagicPathTable, name: &str) -> String {
+    if !name.starts_with(':') { return name.to_owned(); }
+    resolve_with_map(&table.lock().unwrap(), name)
+}
+
+fn resolve_with_map(map: &HashMap<String, String>, name: &str) -> String {
     if let Some(rest) = name.strip_prefix(':') {
         // Artemis accepts either separator after the magic word. Keep plain
         // paths untouched; only normalize the expanded virtual path here.
         let rest = rest.replace('\\', "/");
         let (ns, tail) = rest.split_once('/').unwrap_or((&rest, ""));
-        let map = table.lock().unwrap();
         if let Some(prefix) = map.get(ns) {
             let prefix = prefix.replace('\\', "/");
             if tail.is_empty() {
@@ -32,9 +36,44 @@ pub fn resolve_path(table: &MagicPathTable, name: &str) -> String {
     name.to_string()
 }
 
+/// Exact dependency cache: animated transforms do not change resource paths.
+/// Compare the whole prefix table as scripts may replace language/platform roots.
+#[derive(Default)]
+pub(super) struct ScenePaths {
+    files: std::collections::HashSet<String>,
+    prefixes: HashMap<String, String>,
+    resolved: Vec<String>,
+}
+impl ScenePaths {
+    pub fn resolve<'a>(&'a mut self, table: &MagicPathTable, files: &std::collections::HashSet<String>) -> &'a [String] {
+        let map=table.lock().unwrap();
+        if self.files != *files || self.prefixes != *map {
+            self.resolved=files.iter().map(|name|resolve_with_map(&map,name)).collect();
+            self.resolved.sort_unstable();
+            self.files.clone_from(files);self.prefixes.clone_from(&map);
+        }
+        &self.resolved
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_paths_reuse_and_invalidate_exact_dependencies() {
+        let table=MagicPathTable::new(HashMap::from([("ui".into(),"pc/a".into())]));
+        let mut cache=ScenePaths::default();
+        let mut files=std::collections::HashSet::from([":ui/face.png".into(),"plain.png".into()]);
+        assert_eq!(cache.resolve(&table,&files), &["pc/a/face.png", "plain.png"]);
+        let pointer=cache.resolved.as_ptr();cache.resolve(&table,&files);
+        assert_eq!(pointer,cache.resolved.as_ptr());
+        table.lock().unwrap().insert("ui".into(),"pc/b".into());
+        assert_eq!(cache.resolve(&table,&files), &["pc/b/face.png", "plain.png"]);
+        files.remove("plain.png");files.insert(":ui/new.png".into());
+        assert_eq!(cache.resolve(&table,&files), &["pc/b/face.png", "pc/b/new.png"]);
+        files.clear();assert!(cache.resolve(&table,&files).is_empty());
+    }
 
     #[test]
     fn resolves_registered_prefix() {

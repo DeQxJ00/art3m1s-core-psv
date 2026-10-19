@@ -59,9 +59,8 @@ impl CoreRuntime {
             // Existing bindings own all jobs; generated/unknown names are ignored.
             let mut files=self.compositor.scene().collect_files();
             files.extend(RenderPipeline::new(&self.compositor).retained_files());
-            let mut paths:Vec<_>=files.iter().map(|file|super::magic_path::resolve_path(&self.magic_paths,file)).collect();
-            paths.sort_unstable();
-            super::surface_loader::prioritize_scene(&paths);
+            let paths=self.scene_paths.resolve(&self.magic_paths,&files);
+            super::surface_loader::prioritize_scene(paths);
             let mut previous=std::collections::HashSet::new();
             if (RenderPipeline::new(&self.compositor).needs_trans_capture()
                 || RenderPipeline::new(&self.compositor).is_transition_in_progress())

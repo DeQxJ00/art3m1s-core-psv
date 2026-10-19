@@ -441,12 +441,18 @@ impl Loader {
         if state.stop{return 0;}
         let mut seen=std::collections::HashSet::new();
         for path in paths{
-            let Some(key)=[path.clone(),format!("{path}.png"),format!("{path}.jpg"),format!("{path}.jpeg"),format!("{path}.dds"),format!("{path}.pvr")]
-                .into_iter().find(|p|state.entries.contains_key(p)) else{continue;};
-            let entry=&state.entries[&key];
-            if !entry.pending||!seen.insert(key.clone()){continue;}
+            // Most scene references already have an extension. Probe the
+            // borrowed exact key first; generate fallback names only on misses.
+            let fallback;
+            let key=if state.entries.contains_key(path.as_str()){path.as_str()}else{
+                fallback=[".png",".jpg",".jpeg",".dds",".pvr"].into_iter()
+                    .map(|suffix|format!("{path}{suffix}")).find(|p|state.entries.contains_key(p));
+                let Some(key)=fallback.as_deref() else{continue;};key
+            };
+            let entry=&state.entries[key];
+            if !entry.pending||!seen.insert(key.to_owned()){continue;}
             let ticket=entry.ticket;
-            state.scene_priority.push_back((key,ticket));
+            state.scene_priority.push_back((key.to_owned(),ticket));
         }
         let count=state.scene_priority.len();
         if count>0{self.shared.wake.notify_one();}

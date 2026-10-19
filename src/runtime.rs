@@ -115,6 +115,8 @@ pub struct CoreRuntime {
     reusable_gxm_frame: crate::render_pipeline::draw::DrawList,
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     scene_build_cache: crate::compositor::build_cache::SceneBuildCache,
+    #[cfg(all(target_os="vita",feature="gxm-backend"))]
+    scene_paths: magic_path::ScenePaths,
     text_renderer: Option<Box<dyn TextRenderer>>,
     /// core 内部文本注入链。宿主 FFI 注入在该链之前执行。
     text_inject: crate::text::InjectionChain,
@@ -302,6 +304,8 @@ impl CoreRuntime {
             reusable_gxm_frame: Default::default(),
             #[cfg(all(target_os="vita",feature="gxm-backend"))]
             scene_build_cache: Default::default(),
+            #[cfg(all(target_os="vita",feature="gxm-backend"))]
+            scene_paths: Default::default(),
             text_renderer: None,
             text_inject: crate::text::InjectionChain::new(),
             pending_text_translations: HashMap::new(),
