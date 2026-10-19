@@ -26,6 +26,7 @@ impl CoreRuntime {
         self.texture_provider.reclaim_video_gpu_cache(bytes)
     }
     pub fn prepare_gxm_textures(&mut self) {
+        let prepare_started = crate::profile_clock::Instant::now();
         if let Some(paths)=self.interpreter.query_ogv_timeline(&mut self.ogv_timeline_cursor){
             let paths:Vec<_>=paths.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect();
             super::ogv_cache::plan(&paths,self.png_comments.clone());
@@ -49,6 +50,9 @@ impl CoreRuntime {
             super::surface_loader::update_story_plan(&future,&current);
             crate::core_info!("[surface-timeline] paths={} scan_us={} total_us={}",future.len(),scan_us,timeline_started.elapsed().as_micros());
         }
+        let timeline_us = prepare_started.elapsed().as_micros() as u64;
+        let mut paths_us = 0;
+        let mut images_us = 0;
         if self.frame_visual_dirty || self.last_submitted_frame.is_none() || self.texture_provider.needs_upload_retry() {
             // Publish the whole scene before the first blocking resolve(). A
             // body and its face must not be separated by speculative BG reads.
@@ -68,7 +72,9 @@ impl CoreRuntime {
                 }
                 for group in &frame.shader_groups{previous.extend(group.effect.mask_texture);previous.extend(group.effect.user_texture);}
             }
+            paths_us = prepare_started.elapsed().as_micros() as u64 - timeline_us;
             self.texture_provider.prepare_image_files(&files,&previous);
+            images_us = prepare_started.elapsed().as_micros() as u64 - timeline_us - paths_us;
         }
         let can_warm = matches!(self.wait_reason, Some(WaitReason::Generic | WaitReason::Generic0))
             && self.is_text_reveal_complete() && !self.frame_visual_dirty
@@ -84,11 +90,25 @@ impl CoreRuntime {
                 self.last_submitted_texture_revision = self.texture_provider.content_revision();
             }
         }
+        let warm_done_us = prepare_started.elapsed().as_micros() as u64;
         if let Some(renderer) = self.text_renderer.as_mut() {
             renderer.prepare_textures(&mut self.texture_provider);
         }
+        let text_done_us = prepare_started.elapsed().as_micros() as u64;
         #[cfg(feature="emote-recovery")]
         self.prepare_recovered_scene();
+        let total_us = prepare_started.elapsed().as_micros() as u64;
+        thread_local! {static PREPARE:std::cell::RefCell<(Option<crate::profile_clock::Instant>,[u64;8])>=const{std::cell::RefCell::new((None,[0;8]))};}
+        PREPARE.with(|sample| {
+            let mut sample=sample.borrow_mut();
+            let values=[1,total_us,timeline_us,paths_us,images_us,warm_done_us.saturating_sub(timeline_us+paths_us+images_us),text_done_us-warm_done_us,total_us-text_done_us];
+            for (sum,value) in sample.1.iter_mut().zip(values){*sum+=value;}
+            if sample.0.is_some_and(|start|start.elapsed().as_secs()>=5) {
+                let n=sample.1[0];
+                crate::core_info!("[prepare-parts] frames={} total_us={} timeline_us={} paths_us={} images_us={} warm_us={} text_us={} snapshot_us={}; averages",n,sample.1[1]/n,sample.1[2]/n,sample.1[3]/n,sample.1[4]/n,sample.1[5]/n,sample.1[6]/n,sample.1[7]/n);
+                sample.1=[0;8];sample.0=Some(crate::profile_clock::Instant::now());
+            } else if sample.0.is_none() {sample.0=Some(crate::profile_clock::Instant::now());}
+        });
     }
     #[cfg(feature="emote-recovery")]
     fn prepare_recovered_scene(&mut self) {

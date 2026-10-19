@@ -151,6 +151,7 @@ pub struct GxmTextureProvider {
     next_id: u64,
     revision: u64,
     reported_failures: HashSet<String>,
+    decode_failures: HashMap<String, Instant>,
     cache_clock: u64,
     cache_hits: u64,
     cache_misses: u64,
@@ -330,6 +331,24 @@ impl GxmTextureProvider {
         self.ids.insert(id, name.to_owned());
         Some((id, info))
     }
+    // Invalid assets must not repeat archive I/O and decode on every frame.
+    // Retry periodically so externally repaired resources can still recover;
+    // missing files and GPU pressure never enter this bounded negative cache.
+    fn record_decode_failure(&mut self, name: &str) {
+        if self.decode_failures.len() >= 256 {
+            if let Some(oldest) = self.decode_failures.iter().min_by_key(|(_,t)| **t).map(|(n,_)|n.clone()) {
+                self.decode_failures.remove(&oldest);
+            }
+        }
+        self.decode_failures.insert(name.to_owned(), Instant::now());
+    }
+    fn decode_retry_blocked(&mut self, name: &str) -> bool {
+        if let Some(failed) = self.decode_failures.get(name) {
+            if failed.elapsed() < std::time::Duration::from_secs(2) { return true; }
+            self.decode_failures.remove(name);
+        }
+        false
+    }
     pub fn new() -> Self {
         Self {
             source: None,
@@ -342,6 +361,7 @@ impl GxmTextureProvider {
             next_id: 1,
             revision: 0,
             reported_failures: HashSet::new(),
+            decode_failures: HashMap::new(),
             cache_clock: 0,
             cache_hits: 0,
             cache_misses: 0,
@@ -371,6 +391,7 @@ impl GxmTextureProvider {
     where
         F: Fn(&str) -> Option<Vec<u8>> + 'static,
     {
+        self.decode_failures.clear();
         self.source = Some(Box::new(source));
         self
     }
@@ -414,6 +435,7 @@ impl GxmTextureProvider {
     }
 
     pub fn evict_prefix(&mut self, prefix: &str) -> usize {
+        self.decode_failures.retain(|name,_| !sparse::source_name(name).starts_with(prefix));
         if self.warm.job.as_ref().is_some_and(|j|j.name.starts_with(prefix)){self.cancel_warm_upload();}
         let names=self.entries.keys().chain(self.decoded.keys()).chain(self.encoded.keys())
             .filter(|name|sparse::source_name(name).starts_with(prefix)).cloned().collect::<HashSet<_>>();
@@ -904,6 +926,7 @@ impl TextureProvider for GxmTextureProvider {
             // GPU allocation failure into another archive read and PNG decode.
             return None;
         }
+        if self.decode_retry_blocked(name) { return None; }
         self.cache_misses += 1;
         // Keep the loader's existing delivery/wait protocol and prefer prepared
         // pixels over decoding a retained source again.
@@ -965,6 +988,7 @@ impl TextureProvider for GxmTextureProvider {
         let reader = match ImageReader::new(Cursor::new(bytes.as_slice())).with_guessed_format() {
             Ok(reader) => reader,
             Err(error) => {
+                self.record_decode_failure(name);
                 self.timing.decode_errors += 1;
                 self.timing.decode_us += elapsed_us(started);
                 if self.reported_failures.insert(name.to_owned()) {
@@ -974,13 +998,18 @@ impl TextureProvider for GxmTextureProvider {
             }
         };
         let decoder=match reader.into_decoder(){Ok(d)=>d,Err(error)=>{
+            self.record_decode_failure(name);self.timing.decode_us+=elapsed_us(started);
             self.timing.decode_errors+=1;crate::core_warn!("GXM texture decoder failure: {name}: {error}");return None;
         }};
         let (width,height)=decoder.dimensions();
         let color=decoder.color_type();
         if color!=image::ColorType::L8{self.admit_large_image(name,width,height);}
         if color==image::ColorType::L8{
-            let pixels=crate::resource_ledger::decode_luma(decoder,512*1024*1024)?;
+            let pixels=match crate::resource_ledger::decode_luma(decoder,512*1024*1024) {
+                Some(pixels)=>pixels,
+                None=>{self.record_decode_failure(name);self.timing.decode_errors+=1;
+                    self.timing.decode_us+=elapsed_us(started);return None;}
+            };
             self.timing.decoded+=1;self.timing.decode_us+=elapsed_us(started);
             let result=self.upload_gray(name,width,height,pixels);
             if result.is_some(){self.keep_encoded(name,bytes,None);}
@@ -993,6 +1022,7 @@ impl TextureProvider for GxmTextureProvider {
         if self.shared_surfaces&&unsafe{art3m1s_gxm_large_image_allowed(width,height)}<=0&&color==image::ColorType::Rgb8&&logical>=256*256*4&&logical<=16*1024*1024&&decoder.total_bytes()<=logical{
             if let Some(mut surface)=PrivateSurface::new(width,height){
                 if let Err(error)=crate::image_decode::rgba_into(decoder,surface.bytes(),16*1024*1024){
+                    self.record_decode_failure(name);self.timing.decode_us+=elapsed_us(started);
                     self.timing.decode_errors+=1;crate::core_warn!("GXM shared-surface decode failure: {name}: {error}");return None;
                 }
                 let decode_us=elapsed_us(started);self.timing.decoded+=1;self.timing.decode_us+=decode_us;
@@ -1019,6 +1049,7 @@ impl TextureProvider for GxmTextureProvider {
         let image = match crate::resource_ledger::decode_rgba(decoder,512*1024*1024) {
             Ok(image) => image,
             Err(error) => {
+                self.record_decode_failure(name);
                 self.timing.decode_errors += 1;
                 self.timing.decode_us += elapsed_us(started);
                 if self.reported_failures.insert(name.to_owned()) {
@@ -1579,6 +1610,36 @@ mod tests {
         let mut p=GxmTextureProvider::new();let result=p.upload_alpha_render_only_region("atlas",2,1,&[0,139],[0,0,2,1]);
         ALPHA_UNSUPPORTED.store(0,Ordering::Relaxed);assert!(result.is_some());
         assert!(!p.entries["atlas"].alpha_only);assert_eq!(p.profile_memory(),(1,0,32));
+    }
+    #[test] fn invalid_image_retry_is_bounded_and_recovers_after_expiry() {
+        let _guard=LOCK.lock().unwrap();
+        let calls=Rc::new(Cell::new(0));let count=calls.clone();
+        let fixed=Rc::new(Cell::new(false));let repaired=fixed.clone();
+        let mut png=Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2,2,image::Rgba([1,2,3,255]))
+            .write_to(&mut png,image::ImageFormat::Png).unwrap();
+        let valid=png.into_inner();
+        // Retain PNG headers so the decoder opens, but truncate image data.
+        let broken=valid[..45].to_vec();
+        let mut p=GxmTextureProvider::new().with_source(move |_| {
+            count.set(count.get()+1);Some(if repaired.get(){valid.clone()}else{broken.clone()})
+        });
+        for _ in 0..120 {assert!(p.resolve("ui/broken.png").is_none());}
+        assert_eq!(calls.get(),1);assert_eq!(p.timing.decode_errors,1);
+        fixed.set(true);
+        p.decode_failures.insert("ui/broken.png".into(),Instant::now()-std::time::Duration::from_secs(3));
+        assert!(p.resolve("ui/broken.png").is_some());assert_eq!(calls.get(),2);
+        assert!(p.decode_failures.is_empty());
+    }
+    #[test] fn invalid_image_retry_cache_is_bounded_and_invalidated_by_source_change() {
+        let mut p=GxmTextureProvider::new().with_source(|_|Some(vec![1,2,3]));
+        for i in 0..300 {assert!(p.resolve(&format!("ui/{i}.png")).is_none());}
+        assert_eq!(p.decode_failures.len(),256);
+        p.evict_prefix("ui/");assert!(p.decode_failures.is_empty());
+        p.resolve("bad");assert_eq!(p.decode_failures.len(),1);
+        p=p.with_source(|_|None);assert!(p.decode_failures.is_empty());
+        p.resolve("missing");p.resolve("missing");
+        assert_eq!(p.timing.missing,2);assert!(p.decode_failures.is_empty());
     }
     #[test] fn gray8_decode_keeps_compact_pixels_through_gpu_reclaim_and_rgba_replacement(){
         let _guard=LOCK.lock().unwrap();
