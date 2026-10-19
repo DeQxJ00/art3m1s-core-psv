@@ -59,14 +59,16 @@ impl SceneBuildCache {
         for values in self.shader_values.values_mut() { values.seen=false; }
         if self.frames % 120 == 0 { self.profile_frames += 1; }
         self.candidates.clear();
-        self.dynamic.clear();
-        self.dynamic.extend(dynamic);
-        self.dynamic_ancestors.clear();
-        for id in &self.dynamic {
-            let mut parent = id.as_str();
-            while let Some((prefix, _)) = parent.rsplit_once('.') {
-                if !self.dynamic_ancestors.insert(prefix.to_owned()) { break; }
-                parent = prefix;
+        let next_dynamic:HashSet<_>=dynamic.collect();
+        if self.dynamic != next_dynamic {
+            self.dynamic=next_dynamic;
+            self.dynamic_ancestors.clear();
+            for id in &self.dynamic {
+                let mut parent = id.as_str();
+                while let Some((prefix, _)) = parent.rsplit_once('.') {
+                    if !self.dynamic_ancestors.insert(prefix.to_owned()) { break; }
+                    parent = prefix;
+                }
             }
         }
         for entry in self.entries.values_mut() {
@@ -168,7 +170,7 @@ impl SceneBuildCache {
     }
     pub(super) fn candidate(&mut self, scene: &Scene, id: &str) -> bool {
         // Reject known live dependency paths before walking static siblings.
-        // Rebuilt each frame, so disappearing/renamed content can become static.
+        // Refreshed on exact membership changes; removed/renamed content becomes static.
         if self.is_dynamic_path(id) { return false; }
         let Some(layer) = scene.get(id) else {
             return false;
@@ -264,6 +266,18 @@ mod tests {
     use crate::compositor::{build::build_frame_reusing_cached, mock::MockProvider};
     use crate::render_pipeline::draw::{TextureId, TextureInfo, TextureProvider};
 
+    #[test]
+    fn dynamic_ancestors_follow_removal_and_reparenting() {
+        let mut cache=SceneBuildCache::default();
+        cache.begin(1,false,["1.2.face".into()].into_iter());
+        assert!(cache.is_dynamic_path("1.2"));assert!(!cache.is_dynamic_path("2"));
+        let address=cache.dynamic_ancestors.get("1.2").unwrap().as_ptr();
+        cache.begin(1,false,["1.2.face".into()].into_iter());
+        assert_eq!(address,cache.dynamic_ancestors.get("1.2").unwrap().as_ptr());
+        cache.begin(1,false,["2.face".into()].into_iter());
+        assert!(!cache.is_dynamic_path("1"));assert!(cache.is_dynamic_path("2"));
+        cache.begin(1,false,std::iter::empty());assert!(!cache.is_dynamic_path("2"));
+    }
     #[derive(Default)]
     struct Provider {
         inner: MockProvider,
