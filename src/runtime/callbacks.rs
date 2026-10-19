@@ -763,6 +763,16 @@ impl EngineCallbacks for FfiCallbacks {
             .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
     }
 
+    fn set_emote_auto_progress(&self, id: &str, next: bool, enabled: bool) -> asb_interpreter::Result<()> {
+        self.emote.lock().unwrap().set_auto_progress(id, next, enabled)
+            .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
+    }
+
+    fn progress_emote_layer(&self, id: &str, next: bool, frames: f32) -> asb_interpreter::Result<()> {
+        self.emote.lock().unwrap().progress(id, next, frames)
+            .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
+    }
+
     fn command_emote_layer(
         &self,
         id: &str,

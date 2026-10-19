@@ -72,6 +72,7 @@ pub(super) struct EmoteState {
     backend: EmoteBackend,
     profiling_enabled: bool,
     default_mesh_ratio: f32,
+    script_visual_dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,6 +101,7 @@ impl Default for EmoteState {
             backend: EmoteBackend::Builtin,
             profiling_enabled: false,
             default_mesh_ratio: 1.0,
+            script_visual_dirty: false,
         }
     }
 }
@@ -109,6 +111,8 @@ struct LayerSlots {
     active: Option<EmoteInstanceSlot>,
     pending: Option<EmoteInstanceSlot>,
     attach_to_scene: bool,
+    active_manual: bool,
+    pending_manual: bool,
 }
 
 enum EmoteInstanceSlot {
@@ -296,9 +300,11 @@ impl EmoteState {
         slots.attach_to_scene = true;
         if slots.active.is_none() {
             slots.active = Some(instance);
+            slots.active_manual = false;
             Ok(false)
         } else {
             slots.pending = Some(instance);
+            slots.pending_manual = false;
             Ok(true)
         }
     }
@@ -307,6 +313,7 @@ impl EmoteState {
         let slots = self.layers.get_mut(id)?;
         if next && slots.pending.is_some() {
             slots.active = slots.pending.take();
+            slots.active_manual = std::mem::take(&mut slots.pending_manual);
         }
         if slots.active.is_some() {
             Some(false)
@@ -339,7 +346,9 @@ impl EmoteState {
             )
         })?;
 
-        instance.command(command)
+        instance.command(command)?;
+        self.script_visual_dirty = true;
+        Ok(())
     }
 
     #[cfg(feature = "emote-recovery")]
@@ -393,15 +402,33 @@ impl EmoteState {
         })
     }
 
+    pub fn set_auto_progress(&mut self, id: &str, next: bool, enabled: bool) -> Result<(), String> {
+        let slots = self.layers.get_mut(id).ok_or_else(|| format!("unknown E-Mote layer {id}"))?;
+        let (instance, manual) = if next { (&slots.pending, &mut slots.pending_manual) }
+            else { (&slots.active, &mut slots.active_manual) };
+        if instance.is_none() { return Err(format!("E-Mote layer {id} has no requested instance")); }
+        *manual = !enabled;
+        Ok(())
+    }
+
+    pub fn progress(&mut self, id: &str, next: bool, frames: f32) -> Result<(), String> {
+        if !frames.is_finite() || frames < 0.0 { return Err("invalid E-Mote progress frames".into()); }
+        let slots = self.layers.get_mut(id).ok_or_else(|| format!("unknown E-Mote layer {id}"))?;
+        let instance = (if next { slots.pending.as_mut() } else { slots.active.as_mut() })
+            .ok_or_else(|| format!("E-Mote layer {id} has no requested instance"))?;
+        // Zero is meaningful: flush a newly configured pose without advancing time.
+        self.script_visual_dirty |= instance.advance((frames as f64 * 1000.0 / 60.0).round() as u64, frames);
+        Ok(())
+    }
+
     pub fn advance(&mut self, delta_ms: u64) -> bool {
         let frames = delta_ms as f32 * 60.0 / 1000.0;
-        let mut changed = false;
+        let mut changed = std::mem::take(&mut self.script_visual_dirty);
         for slots in self.layers.values_mut() {
-            for instance in [&mut slots.active, &mut slots.pending]
-                .into_iter()
-                .flatten()
-            {
-                changed |= instance.advance(delta_ms, frames);
+            for (instance, manual) in [(&mut slots.active, slots.active_manual), (&mut slots.pending, slots.pending_manual)] {
+                if !manual {
+                    if let Some(instance) = instance { changed |= instance.advance(delta_ms, frames); }
+                }
             }
         }
         changed
@@ -423,6 +450,7 @@ impl EmoteState {
     pub fn clear(&mut self) -> usize {
         let count = self.layers.len();
         self.layers.clear();
+        self.script_visual_dirty = false;
         count
     }
 
@@ -439,7 +467,7 @@ impl EmoteState {
         #[cfg(feature = "emote-recovery")]
         let mut recovered = {
             let ids: Vec<_> = self.layers.values().filter_map(|slots| match slots.pending.as_ref().or(slots.active.as_ref()) {
-                Some(EmoteInstanceSlot::Recovered(instance)) => Some(instance.id()), _ => None,
+                Some(EmoteInstanceSlot::Recovered(instance)) if instance.has_canvas() => Some(instance.id()), _ => None,
             }).collect();
             let handles = recovery::capture_batch(&ids,_deferred);
             ids.into_iter().zip(handles).collect::<HashMap<_,_>>()
@@ -448,6 +476,9 @@ impl EmoteState {
             let Some(instance) = slots.pending.as_mut().or(slots.active.as_mut()) else {
                 continue;
             };
+            // Cache-warmup layers have no render surface. Do not capture them,
+            // upload textures, or include them in the visible-model worker batch.
+            if !instance.has_canvas() { continue; }
             #[cfg(feature = "emote-recovery")]
             let result = match instance {
                 EmoteInstanceSlot::Recovered(instance) => instance.build_captured_commands(recovered.remove(&instance.id()).unwrap_or(0)),
@@ -470,6 +501,16 @@ impl EmoteState {
 }
 
 impl EmoteInstanceSlot {
+    fn has_canvas(&self) -> bool {
+        match self {
+            Self::Builtin(instance) => instance.width != 0 && instance.height != 0,
+            #[cfg(feature = "emote-recovery")]
+            Self::Recovered(instance) => instance.has_canvas(),
+            #[cfg(feature = "experimental-eluna")]
+            Self::Eluna(instance) => instance.has_canvas(),
+        }
+    }
+
     fn set_profile_enabled(&mut self, enabled: bool) {
         match self {
             Self::Builtin(_) => {}
@@ -1234,7 +1275,7 @@ impl CoreRuntime {
             self.compositor.scene(),
             self.compositor.clock_ms(),
             state.layers.iter().filter_map(|(id, slots)| {
-                (slots.active.is_some() || slots.pending.is_some()).then_some(id.as_str())
+                slots.pending.as_ref().or(slots.active.as_ref()).is_some_and(EmoteInstanceSlot::has_canvas).then_some(id.as_str())
             }),
         )
     }
@@ -1314,6 +1355,59 @@ mod tests {
     use super::{EmoteEyeBlink, EmoteLayerCommand, EmoteState, draw_mesh};
     use crate::compositor::mock::MockProvider;
     use crate::render_pipeline::draw::DrawList;
+
+    #[test]
+    #[ignore = "requires EMOTE_CACHE_TEST_MODEL external fixture"]
+    fn zero_canvas_warmup_never_uploads_or_builds_render_commands() {
+        let path = std::env::var("EMOTE_CACHE_TEST_MODEL").unwrap();
+        let mut state = EmoteState::default();
+        state.create_layer("warm", vec![(path.clone(), std::fs::read(path).unwrap())], 0, 0).unwrap();
+        assert!(!state.layers["warm"].active.as_ref().unwrap().has_canvas());
+        let mut provider = MockProvider::new();
+        for _ in 0..3 {
+            state.advance(16);
+            let (draws, retained) = state.build_commands(&mut provider);
+            assert!(draws.is_empty() && retained.is_empty());
+        }
+        assert!(state.builtin("warm", false).unwrap().textures.values().all(|t| t.gpu.is_none() && t.source.is_some()));
+    }
+
+    #[test]
+    #[ignore = "requires EMOTE_CACHE_TEST_MODEL external fixture"]
+    fn manual_progress_isolated_from_host_clock_and_pending_promotion() {
+        let path = std::env::var("EMOTE_CACHE_TEST_MODEL").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut state = EmoteState::default();
+        assert!(!state.create_layer("actor", vec![(path.clone(), bytes.clone())], 960, 540).unwrap());
+        let set = |state: &mut EmoteState, next, value, frames| {
+            state.command("actor", next, EmoteLayerCommand::SetVariable { label: "test-progress".into(), value, frames, easing: 0 }).unwrap();
+        };
+        set(&mut state, false, 0., 0.);
+        set(&mut state, false, 10., 10.);
+        state.set_auto_progress("actor", false, false).unwrap();
+        assert!(state.advance(100)); // Command changes still invalidate the frame.
+        assert_eq!(state.variable("actor", false, "test-progress").unwrap(), 0.);
+        state.progress("actor", false, 0.).unwrap();
+        assert_eq!(state.variable("actor", false, "test-progress").unwrap(), 0.);
+        state.progress("actor", false, 2.5).unwrap();
+        assert!(state.advance(100));
+        assert!((state.variable("actor", false, "test-progress").unwrap() - 2.5).abs() < 0.0001);
+        assert!(state.progress("actor", false, -1.).is_err());
+        assert!(state.progress("actor", false, f32::NAN).is_err());
+        assert!(state.create_layer("actor", vec![(path, bytes)], 960, 540).unwrap());
+        set(&mut state, true, 0., 0.);
+        set(&mut state, true, 10., 10.);
+        state.advance(50); // New pending instance defaults to automatic, independently.
+        assert!((state.variable("actor", true, "test-progress").unwrap() - 3.).abs() < 0.0001);
+        state.set_auto_progress("actor", true, false).unwrap();
+        state.progress("actor", true, 1.).unwrap();
+        assert_eq!(state.get_layer("actor", true), Some(false));
+        state.advance(100);
+        assert!((state.variable("actor", false, "test-progress").unwrap() - 4.).abs() < 0.0001);
+        state.set_auto_progress("actor", false, true).unwrap();
+        state.advance(100);
+        assert_eq!(state.variable("actor", false, "test-progress").unwrap(), 10.);
+    }
 
     fn nekomiko_model_path() -> std::path::PathBuf {
         let root = std::env::var_os("ART3M1S_FIXTURE_NEKOMIKO_DIR")

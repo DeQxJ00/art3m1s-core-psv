@@ -27,6 +27,7 @@ impl RecoveryInstance {
   Ok(Self{id,owner:std::thread::current().id(),bytes:source.bytes.len() as u64,width,height})
  }
  fn owner(&self)->Result<(),String>{if self.owner==std::thread::current().id(){Ok(())}else{Err("recovered E-Mote operation requires its render owner thread".into())}}
+ pub(super) fn has_canvas(&self)->bool{self.width!=0 && self.height!=0}
  pub(super) fn source_bytes(&self)->u64{self.bytes}
  pub(super) fn command(&mut self,command:EmoteLayerCommand)->Result<(),String>{
   self.owner()?;

@@ -307,6 +307,16 @@ pub trait EngineCallbacks: Send + Sync {
         Err(unsupported_emote())
     }
 
+    /// Controls whether the host clock advances this model automatically.
+    fn set_emote_auto_progress(&self, _id: &str, _next: bool, _enabled: bool) -> crate::Result<()> {
+        Err(unsupported_emote())
+    }
+
+    /// Advances one model by a script-supplied number of animation frames.
+    fn progress_emote_layer(&self, _id: &str, _next: bool, _frames: f32) -> crate::Result<()> {
+        Err(unsupported_emote())
+    }
+
     /// Applies one operation to the current or pending E-Mote layer.
     fn command_emote_layer(
         &self,
@@ -561,6 +571,14 @@ impl UserData for EmoteLayerApi {
         );
         methods.add_method("stopTimeline", |_lua, this, label: String| {
             this.command(EmoteLayerCommand::StopTimeline { label })
+        });
+        methods.add_method("progress", |_lua, this, frames: Option<f32>| {
+            let frames = frames.unwrap_or(1.0);
+            if !frames.is_finite() || frames < 0.0 {
+                return Err(mlua::Error::external("progress frames must be finite and nonnegative"));
+            }
+            this.ctx.lock().unwrap().callbacks.progress_emote_layer(&this.id, this.next, frames)
+                .map_err(mlua::Error::external)
         });
         methods.add_method("pass", |_lua, this, _: ()| {
             this.command(EmoteLayerCommand::Pass)
@@ -1441,15 +1459,21 @@ impl UserData for EngineApi {
             let id: String = t.get("id")?;
             let width: u32 = t.get("width")?;
             let height: u32 = t.get("height")?;
+            let progress: Option<bool> = t.get("progress")?;
             let files_table: mlua::Table = t.get("files")?;
             let files = files_table
                 .sequence_values::<String>()
                 .collect::<LuaResult<Vec<_>>>()?;
             let next = {
                 let ctx = this.ctx.lock().unwrap();
-                ctx.callbacks
+                let next = ctx.callbacks
                     .create_emote_layer(&id, &files, width, height)
-                    .map_err(mlua::Error::external)?
+                    .map_err(mlua::Error::external)?;
+                if let Some(enabled) = progress {
+                    ctx.callbacks.set_emote_auto_progress(&id, next, enabled)
+                        .map_err(mlua::Error::external)?;
+                }
+                next
             };
             Ok(EmoteLayerApi {
                 ctx: Arc::clone(&this.ctx),
@@ -1831,6 +1855,8 @@ mod tests {
         logs: Arc<Mutex<Vec<String>>>,
         created: Arc<Mutex<Vec<(String, Vec<String>, u32, u32)>>>,
         commands: Arc<Mutex<Vec<(String, bool, EmoteLayerCommand)>>>,
+        auto_progress: Arc<Mutex<Vec<(String, bool, bool)>>>,
+        progress_frames: Arc<Mutex<Vec<(String, bool, f32)>>>,
     }
 
     impl EngineCallbacks for EmoteProbe {
@@ -1913,6 +1939,15 @@ mod tests {
         fn emote_timeline_playing(&self, id: &str, next: bool, label: &str) -> crate::Result<bool> {
             assert_eq!((id, next), ("1.0", false));
             Ok(label.is_empty() || label == "active")
+        }
+
+        fn set_emote_auto_progress(&self, id: &str, next: bool, enabled: bool) -> crate::Result<()> {
+            self.auto_progress.lock().unwrap().push((id.into(), next, enabled));
+            Ok(())
+        }
+        fn progress_emote_layer(&self, id: &str, next: bool, frames: f32) -> crate::Result<()> {
+            self.progress_frames.lock().unwrap().push((id.into(), next, frames));
+            Ok(())
         }
 
         fn command_emote_layer(
@@ -2222,6 +2257,28 @@ mod tests {
             .unwrap();
 
         assert_eq!((first, last), (0.1, 1.0));
+    }
+
+    #[test]
+    fn emote_manual_progress_forwards_zero_and_fractional_frames() {
+        let probe = EmoteProbe::default();
+        let observed = probe.clone();
+        let lua = Lua::new();
+        let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(probe))));
+        init_lua_engine_api(&lua, ctx).unwrap();
+        lua.load(r#"
+            local auto = __engine:createEmoteLayer{id="auto", files={"model.psb"}, width=960, height=540}
+            local manual = __engine:createEmoteLayer{id="manual", files={"model.psb"}, width=960, height=540, progress=false}
+            manual:progress(0)
+            manual:progress(1.5)
+            manual:progress()
+            for _, v in ipairs({-1, 0/0, math.huge}) do
+                assert(not pcall(function() manual:progress(v) end))
+            end
+            __engine:createEmoteLayer{id="explicit", files={"model.psb"}, width=0, height=0, progress=true}
+        "#).exec().unwrap();
+        assert_eq!(*observed.auto_progress.lock().unwrap(), vec![("manual".into(), false, false), ("explicit".into(), false, true)]);
+        assert_eq!(*observed.progress_frames.lock().unwrap(), vec![("manual".into(), false, 0.), ("manual".into(), false, 1.5), ("manual".into(), false, 1.)]);
     }
 
     #[test]

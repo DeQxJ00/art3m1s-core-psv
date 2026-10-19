@@ -110,6 +110,7 @@ enum ElunaWorkerMessage {
 }
 
 impl ElunaEmoteInstance {
+    pub(super) fn has_canvas(&self) -> bool { self.width != 0 && self.height != 0 }
     pub(super) fn new(
         generation: u64,
         path: &str,
