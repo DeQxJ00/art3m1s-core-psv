@@ -74,7 +74,7 @@ extern "C" fn release_model(lease:*mut std::ffi::c_void){
 // Returned handles must all be adopted by RecoveredPacket in this owner call.
 pub(super) fn capture_batch(ids:&[u64],deferred:bool)->Vec<u64>{
  let mut out=vec![0;ids.len()];
- if deferred && (1..=3).contains(&ids.len()) && unsafe{art3m1s_recovery_capture_begin(ids.as_ptr(),out.as_mut_ptr(),ids.len() as u32)}==1{return out;}
+ if deferred && (1..=4).contains(&ids.len()) && unsafe{art3m1s_recovery_capture_begin(ids.as_ptr(),out.as_mut_ptr(),ids.len() as u32)}==1{return out;}
  for (input,output) in ids.chunks(64).zip(out.chunks_mut(64)){unsafe{art3m1s_recovery_capture_batch(input.as_ptr(),output.as_mut_ptr(),input.len() as u32)}}
  out
 }
