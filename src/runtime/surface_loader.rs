@@ -838,11 +838,29 @@ fn decoder_allowance_with_budget(width:u32,height:u32,source_capacity:usize,pixe
     budget.checked_sub(source_capacity)?.checked_sub(output)?.checked_sub(DECODE_READ_BUFFER)
         .filter(|remaining|*remaining>0)
 }
+#[cfg(all(target_os="vita",feature="gxm-backend"))]
+fn prefetch_disk_texture(path:&str,budget:usize,cancelled:&dyn Fn()->bool)->Option<Tracked<Vec<u8>>>{
+    unsafe extern "C" {fn art3m1s_gxm_read_prepared_cache(name:*const std::ffi::c_char,bytes:*mut u8,capacity:usize)->i32;}
+    let name=std::ffi::CString::new(path).ok()?;let started=std::time::Instant::now();
+    let size=unsafe{art3m1s_gxm_read_prepared_cache(name.as_ptr(),std::ptr::null_mut(),0)};
+    if size<40||size as usize>budget||cancelled(){return None;}
+    let mut charge=Charge::reserve(Owner::Source,size as usize);
+    let mut bytes=Vec::new();bytes.try_reserve_exact(size as usize).ok()?;bytes.resize(size as usize,0);charge.commit(bytes.capacity());
+    let result=unsafe{art3m1s_gxm_read_prepared_cache(name.as_ptr(),bytes.as_mut_ptr(),bytes.len())};
+    if result!=size||cancelled(){return None;}
+    crate::core_info!("[texture-cache-prefetch] path={} bytes={} read_verify_us={}",path,size,started.elapsed().as_micros());
+    Some(Tracked{data:bytes,charge})
+}
+
 fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize,comments:&super::png_comments::SharedComments)->LoadStep{
     super::ogv_cache::reclaim(budget);
     super::emote_source_cache::reclaim(budget);
     let policy=crate::cpu_image_compression::policy_for(path);
     if let Some(bytes)=resume{return decode_source_policy(bytes,cancelled,should_yield,budget,policy.as_ref());}
+    #[cfg(all(target_os="vita",feature="gxm-backend"))]
+    if let Some(bytes)=prefetch_disk_texture(path,budget,cancelled){
+        return decode_source_policy(bytes,cancelled,should_yield,budget,policy.as_ref());
+    }
     let bytes=(||{
     for candidate in crate::native_texture::candidates(path) {
         if cancelled(){return None;}
@@ -872,6 +890,11 @@ fn decode_source(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&
     decode_source_policy(bytes,cancelled,should_yield,budget,None)
 }
 fn decode_source_policy(bytes:Tracked<Vec<u8>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize,policy:Option<&crate::cpu_image_compression::Policy>)->LoadStep{
+        if bytes.starts_with(b"BCI1") {
+            if cancelled(){return LoadStep::Complete(None);}
+            if should_yield(bytes.capacity()){return LoadStep::Paused(bytes);}
+            return LoadStep::Complete(Some(Payload::Encoded(bytes,None)));
+        }
         if crate::native_texture::recognized(&bytes){
             if cancelled(){return LoadStep::Complete(None);}
             if should_yield(bytes.capacity()){return LoadStep::Paused(bytes);}
