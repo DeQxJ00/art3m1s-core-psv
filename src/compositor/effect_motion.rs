@@ -34,6 +34,12 @@ fn visible(layer: &Layer, now: u64) -> bool {
 
 pub(crate) fn has_effect_pan(scene: &Scene, now: u64) -> bool {
     if !scene.root_props().is_visible() || scene.root_props().alpha == Some(0) { return false; }
+    // Most held dialogue scenes have no translation tween at all. Avoid
+    // repeatedly walking every image's ancestor chain in that common case.
+    // Keep the exact time/loop predicate so a delayed tween activates on time.
+    if !scene.all_layers().any(|layer| layer.tweens.iter().any(|t| moving(t, now))) {
+        return false;
+    }
     // Start at actual images and walk their ancestors. This covers both a
     // moving child under a filter group and a filtered child under a moving
     // parent, without pairing an unrelated UI tween with a background filter.

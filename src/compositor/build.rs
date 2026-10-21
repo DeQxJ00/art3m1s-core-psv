@@ -145,21 +145,22 @@ fn visit(
     file_overrides: Option<&std::collections::HashMap<String, String>>,
     cache: &mut Option<&mut super::build_cache::SceneBuildCache>,
 ) {
+    let Some(layer) = scene.get(id) else { return; };
     // A shader anywhere on the ancestor path preserves the original UV domain,
     // even when a descendant explicitly clears inherited shader state.
-    let crop_allowed = parent_crop_allowed && scene.get(id).is_none_or(|l|
-        l.props.shader.as_deref().is_none_or(str::is_empty));
+    let crop_allowed = parent_crop_allowed && layer.props.shader.as_deref().is_none_or(str::is_empty);
     // Hidden, non-tweening subtrees cannot contribute commands or callbacks.
     // Reject them before recursively testing fragment-cache eligibility.
-    if let Some(layer) = scene.get(id) {
-        if layer.host_hidden || (layer.tweens.is_empty() && !layer.props.is_visible()) {
-            return;
-        }
+    if layer.host_hidden || (layer.tweens.is_empty() && !layer.props.is_visible()) {
+        return;
     }
     // Live nodes and their ancestors cannot replay a static fragment. Keep
     // the cache available to their static children, without cloning parent shader state.
-    if cache.as_deref().is_none_or(|c| c.is_dynamic_path(id)) {
-        visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
+    // A leaf has no subtree traversal to amortize fragment bookkeeping.
+    // Rebuild it directly; keep fragment reuse for multi-node static branches.
+    let leaf = layer.children.is_empty();
+    if leaf || cache.as_deref().is_none_or(|c| c.is_dynamic_path(id)) {
+        visit_uncached(scene,layer,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
             provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
         return;
     }
@@ -173,7 +174,7 @@ fn visit(
     let start=[frame.commands.len(),frame.mask_commands.len(),frame.shader_groups.len()];
     // A cached parent owns the complete fragment; avoid duplicating every child.
     let mut held=if remember {cache.take()} else {None};
-    visit_uncached(scene,id,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
+    visit_uncached(scene,layer,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
         provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
     if let Some(c)=held.as_deref_mut(){let mark=c.profile_mark();c.store(scene,id,parent,file_overrides,frame,start);c.profile_add(2,mark);}
     if remember {*cache=held;}
@@ -181,15 +182,13 @@ fn visit(
 
 #[allow(clippy::too_many_arguments)]
 fn visit_uncached(
-    scene:&Scene,id:&str,now_ms:u64,parent_transform:Affine2,parent_opacity:f32,
+    scene:&Scene,layer:&super::scene::Layer,now_ms:u64,parent_transform:Affine2,parent_opacity:f32,
     parent_clip:Option<[f32;4]>,inherited_shader:Option<ShaderEffect>,crop_allowed:bool,provider:&mut dyn TextureProvider,
     frame:&mut DrawList,record_command_keys:bool,content_for:&mut Option<&mut LayerDrawSource<'_>>,
     text_for:&mut Option<&mut LayerDrawSource<'_>>,file_overrides:Option<&std::collections::HashMap<String,String>>,
     cache:&mut Option<&mut super::build_cache::SceneBuildCache>,
 ) {
-    let Some(layer) = scene.get(id) else {
-        return;
-    };
+    let id=layer.id.as_str();
 
     // 把进行中的缓动应用到属性副本上（不改动场景里的原始属性）。
     let props = resolved_props(layer, now_ms);

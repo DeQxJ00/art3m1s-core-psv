@@ -431,7 +431,7 @@ mod tests {
             c.begin(1, false, std::iter::once("0".into()));
             frame(&s, &mut p, Some(&mut c), 88, None, keys);
             c.finish();
-            assert_eq!(p.resolves, 1, "only the live glyph source should resolve");
+            assert_eq!(p.resolves, 2, "live glyph and standalone leaf resolve; grouped images reuse their fragment");
         }
     }
     #[test]
