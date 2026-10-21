@@ -26,11 +26,44 @@ impl Format {
 #[derive(Clone,Copy,Debug)]
 pub(crate) struct Texture<'a>{pub format:Format,pub width:u32,pub height:u32,pub opaque:bool,pub swizzled:bool,pub data:&'a[u8]}
 pub(crate) fn recognized(b:&[u8])->bool{b.starts_with(b"DDS ")||b.starts_with(b"PVR\x03")}
+// Oversized native containers cannot go directly to GXM. Decode mip zero,
+// preserving source dimensions; the host fits only the physical texture.
+pub(crate) fn decode_oversized(t:Texture<'_>)->Result<Vec<u8>, &'static str>{
+    use Format::*;
+    let count=(t.width as usize).checked_mul(t.height as usize).ok_or("pixel overflow")?;
+    if t.format.pvrtc1() {
+        let mut pixels=Vec::new();pixels.try_reserve_exact(count).map_err(|_|"decode allocation failed")?;pixels.resize(count,0u32);
+        texture2ddecoder::decode_pvrtc(t.data,t.width as usize,t.height as usize,&mut pixels,matches!(t.format,PvrtcRgb2|PvrtcRgba2))?;
+        let mut out=Vec::new();out.try_reserve_exact(count*4).map_err(|_|"decode allocation failed")?;
+        for pixel in pixels {let [b,g,r,a]=pixel.to_le_bytes();out.extend_from_slice(&[r,g,b,if t.opaque{255}else{a}]);}
+        return Ok(out);
+    }
+    let mut out=Vec::new();out.try_reserve_exact(count.checked_mul(4).ok_or("byte overflow")?).map_err(|_|"decode allocation failed")?;out.resize(count*4,0);
+    let decode:fn(&[u8],&mut[u32])=match t.format{
+        Bc1=>texture2ddecoder::decode_bc1_block,Bc2=>texture2ddecoder::decode_bc2_block,
+        Bc3=>texture2ddecoder::decode_bc3_block,Bc4=>texture2ddecoder::decode_bc4_block,
+        Bc5=>texture2ddecoder::decode_bc5_block,Etc1=>texture2ddecoder::decode_etc1_block,
+        _=>return Err("oversized signed BC/PVRTC2 textures require an additional CPU decoder"),
+    };
+    let bw=t.width.div_ceil(4) as usize;let bh=t.height.div_ceil(4) as usize;
+    let block_bytes=t.format.block().2;
+    for by in 0..bh{for bx in 0..bw{
+        let index=if t.swizzled{art3m1s_emote::bc_layout::block_index(bx,by,bw.next_power_of_two(),bh.next_power_of_two())}else{by*bw+bx};
+        let block=t.data.get(index*block_bytes..(index+1)*block_bytes).ok_or("truncated block")?;
+        let mut pixels=[0u32;16];decode(block,&mut pixels);
+        for y in 0..4{for x in 0..4{let px=bx*4+x;let py=by*4+y;if px>=t.width as usize||py>=t.height as usize{continue;}
+            let [b,g,r,a]=pixels[y*4+x].to_le_bytes();let at=(py*t.width as usize+px)*4;
+            let color=if t.format==Bc4{[r,r,r,255]}else{[r,g,b,if t.opaque{255}else{a}]};
+            out[at..at+4].copy_from_slice(&color);
+        }}
+    }}
+    Ok(out)
+}
 fn u32_at(b:&[u8],p:usize)->Result<u32,&'static str>{
     Ok(u32::from_le_bytes(b.get(p..p+4).ok_or("truncated header")?.try_into().unwrap()))
 }
 fn finish(b:&[u8],format:Format,w:u32,h:u32,mips:u32,start:usize,opaque:bool,swizzled:bool)->Result<Texture<'_>,&'static str>{
-    if w==0||h==0||w>4096||h>4096{return Err("dimensions outside GXM limits");}
+    if w==0||h==0||w>16384||h>16384||u64::from(w)*u64::from(h)>64*1024*1024{return Err("dimensions outside image decode limits");}
     if mips==0||mips>32-w.max(h).leading_zeros(){return Err("invalid mip count");}
     if format.pvrtc1(){
         let (bw,bh,_)=format.block();
@@ -119,11 +152,24 @@ pub(crate) fn header_dimensions(b:&[u8])->Option<(u32,u32)>{
     }else if b.starts_with(b"PVR\x03")&&b.len()>=52{
         (u32_at(b,28).ok()?,u32_at(b,24).ok()?)
     }else{return None;};
-    (w>0&&h>0&&w<=4096&&h<=4096).then_some((w,h))
+    (w>0&&h>0&&w<=16384&&h<=16384).then_some((w,h))
 }
 
 #[cfg(test)] pub(crate) mod tests {
     use super::*;
+    #[test] fn oversized_bc_decode_preserves_color_alpha_and_layout() {
+        for format in [Format::Bc1,Format::Bc3] {for swizzled in [false,true] {
+            let (w,h)=(4101,5);let bytes=if swizzled{format.storage_bytes(w,h)}else{format.bytes(w,h)};
+            let mut data=vec![0;bytes];let n=format.block().2;
+            for block in data.chunks_exact_mut(n) {
+                let color=if format==Format::Bc3 {block[0]=128;block[1]=128;&mut block[8..]}else{block};
+                color[0]=0; color[1]=0xf8; color[2]=0; color[3]=0xf8;
+            }
+            let pixels=decode_oversized(Texture{format,width:w,height:h,opaque:format.opaque(),swizzled,data:&data}).unwrap();
+            assert_eq!(pixels.len(),w as usize*h as usize*4);
+            for p in pixels.chunks_exact(4){assert_eq!(p,&[255,0,0,if format==Format::Bc1{255}else{128}]);}
+        }}
+    }
     #[test] fn script_paths_and_header_queries(){
         assert_eq!(candidates(":bg/room").collect::<Vec<_>>(),[":bg/room.png",":bg/room",":bg/room.jpg",":bg/room.jpeg",":bg/room.dds",":bg/room.pvr"]);
         assert_eq!(candidates("image/fg/body.png").last().unwrap(),"image/fg/body.pvr");

@@ -16,6 +16,18 @@ impl GxmTextureProvider {
         let us=elapsed_us(started);self.timing.uploads+=1;self.timing.upload_us+=us;
         self.timing.upload_max_us=self.timing.upload_max_us.max(us);
         if ok<=0{
+        if t.width>4096||t.height>4096 {
+            self.admit_large_image(name,t.width,t.height);
+            let pixels=match crate::native_texture::decode_oversized(t){Ok(p)=>p,Err(e)=>{
+                self.record_decode_failure(name);
+                if self.reported_failures.insert(name.into()){crate::core_warn!("GXM oversized native decode failed: {name}: {e}");}
+                return None;
+            }};
+            let result=self.upload_storage(name,info.width,info.height,Cow::Owned(pixels),false,true);
+            self.keep_encoded(name,bytes,None);
+            if result.is_some(){self.entries.get_mut(name).unwrap().cacheable=true;}
+            return result;
+        }
             self.timing.upload_errors+=1;
             if ok==0{self.defer_upload(pixel_bytes.div_ceil(256*1024)*256*1024);self.keep_encoded(name,bytes,None);}
             else if self.reported_failures.insert(name.into()){

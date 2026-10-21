@@ -42,6 +42,7 @@ weezl = { version = "0.1.12", optional = true }
 png = { version = "0.18.1", optional = true }
 # 字体光栅化（字形渲染子系统）
 ab_glyph = "0.2"
+texture2ddecoder = "0.1.2"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 asb-interpreter = { path = "crates/asb-interpreter", default-features = false, features = ["backend-luau"] }

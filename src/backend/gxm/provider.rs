@@ -90,6 +90,7 @@ impl Entry {
 }
 
 unsafe extern "C" {
+    fn art3m1s_gxm_probe_large_image(id:u64,name:*const std::ffi::c_char,p:*const u8,n:usize,info:*mut u32)->i32;
     fn art3m1s_gxm_reserve_image(w:u32,h:u32)->i32;
     fn art3m1s_gxm_reserve_large_image(name:*const std::ffi::c_char,w:u32,h:u32)->i32;
     fn art3m1s_gxm_large_image_allowed(w:u32,h:u32)->i32;
@@ -194,7 +195,7 @@ impl GxmTextureProvider {
     fn admit_large_image(&mut self,name:&str,w:u32,h:u32){
         let Some(pinned)=self.preflight_names.as_ref() else{return;};
         let Some(bytes)=(w as usize).checked_mul(h as usize).and_then(|n|n.checked_mul(4)) else{return;};
-        if bytes<8*1024*1024||w>4096||h>4096{return;}
+        if bytes<8*1024*1024||w>16384||h>16384{return;}
         // Retire cold CPU copies before allocating the full decoder output.
         // Never discard another source required by this frame or transition.
         let mut cold:Vec<_>=self.decoded.iter().filter(|(n,_)|!pinned.contains(sparse::source_name(n)))
@@ -532,10 +533,13 @@ impl GxmTextureProvider {
                 self.cache_clock = self.cache_clock.saturating_add(1);
                 self.decoded.insert(name.to_owned(), DecodedEntry { gray:false, info: TextureInfo { width, height }, rgba: data, last_used: self.cache_clock,
                 });
-                crate::core_info!("GXM upload-deferred name={} decoded_bytes={}; retry pixels after frame retirement", name, expected);
+                if self.reported_failures.insert(format!("upload-deferred:{name}")) {
+                    crate::core_info!("GXM upload-deferred name={} decoded_bytes={}; retry pixels after frame retirement", name, expected);
+                }
             }
             return None;
         }
+        self.reported_failures.remove(&format!("upload-deferred:{name}"));
         self.revision = self.revision.wrapping_add(1).max(1);
         let info = TextureInfo { width, height };
         self.decoded.remove(name); // An explicit upload supersedes any demoted source.
@@ -637,7 +641,7 @@ impl GxmTextureProvider {
         if width==0||height==0||pixels.len()!=(width as usize).checked_mul(height as usize)?{return None;}
         let id=self.entries.get(name).map_or(TextureId(self.next_id),|e|e.id);
         let info=TextureInfo{width,height};let started=Instant::now();
-        let ok=unsafe{art3m1s_gxm_upload_luma(id.0,width,height,pixels.as_ptr(),pixels.len())};
+        let ok=if width>4096||height>4096{-1}else{unsafe{art3m1s_gxm_upload_luma(id.0,width,height,pixels.as_ptr(),pixels.len())}};
         if ok<0{
             // Unsupported/self-test failure: preserve grayscale RGB and opaque alpha.
             let mut rgba=Vec::new();rgba.try_reserve_exact(pixels.len().checked_mul(4)?).ok()?;
@@ -667,6 +671,14 @@ impl GxmTextureProvider {
     }
     fn entry_pixels(&self,e:&Entry)->Option<Vec<u8>>{
         if e.native_bytes!=0{
+            // Rendering can skip the CPU mirror. Explicit pixel consumers still
+            // require original logical pixels, not the fitted GPU dimensions.
+            if !e.rgba.is_empty(){return Some(e.rgba.data.clone());}
+            if let Some(source)=self.ids.get(&e.id).and_then(|name|self.encoded.get(name)) {
+                if !crate::native_texture::recognized(&source.bytes)&&!crate::cpu_image_compression::recognized(&source.bytes){
+                    return image::load_from_memory(&source.bytes).ok().map(|i|i.into_rgba8().into_raw());
+                }
+            }
             let n=(e.info.width as usize).checked_mul(e.info.height as usize)?.checked_mul(4)?;
             let mut out=Vec::new();out.try_reserve_exact(n).ok()?;out.resize(n,0);
             return (unsafe{art3m1s_gxm_read_texture_region(e.id.0,0,0,e.info.width,e.info.height,out.as_mut_ptr(),n)}>0).then_some(out);
@@ -928,6 +940,28 @@ impl TextureProvider for GxmTextureProvider {
         }
         if self.decode_retry_blocked(name) { return None; }
         self.cache_misses += 1;
+        // Probe by canonical resource path before constructing an image decoder.
+        // Internal CPU spill streams are not original source files.
+        {
+            let resolved=self.image_path_resolver.as_ref().map(|resolve|resolve(name));
+            if let Ok(path)=std::ffi::CString::new(resolved.as_deref().unwrap_or(name)) {
+                let id=TextureId(self.next_id);let mut metadata=[0u32;3];let started=Instant::now();
+                let result=unsafe{art3m1s_gxm_probe_large_image(id.0,path.as_ptr(),std::ptr::null(),0,metadata.as_mut_ptr())};
+                if result>=0 {
+                    let [width,height,opaque]=metadata;
+                    if result==0 {self.defer_upload(4*1024*1024);return None;}
+                    self.next_id+=1;self.revision=self.revision.wrapping_add(1).max(1);
+                    let info=TextureInfo{width,height};let us=elapsed_us(started);
+                    self.timing.uploads+=1;self.timing.upload_us+=us;self.timing.upload_max_us=self.timing.upload_max_us.max(us);
+                    self.entries.insert(name.into(),Entry{sprite_crop:None,native_bytes:result as usize,bc3:true,alpha_only:false,gray:false,id,info,
+                        rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque:opaque!=0,revision:self.revision,last_used:self.cache_clock,cacheable:true,reclaimable:false,shared:true});
+                    self.ids.insert(id,name.into());
+                    crate::core_info!("GXM path-cache-hit name={} size={}x{} upload_us={} decode_skipped=true",name,width,height,us);
+                    return Some((id,info));
+                }
+            }
+        }
+
         // Keep the loader's existing delivery/wait protocol and prefer prepared
         // pixels over decoding a retained source again.
         let ready = self.prefetch.as_ref().and_then(|f|f(name));
@@ -2293,6 +2327,25 @@ mod tests {
         assert!(p.decoded.is_empty());
     }
 
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_probe_large_image(_:u64,_:*const std::ffi::c_char,_:*const u8,_:usize,info:*mut u32)->i32 {
+        let result=PATH_CACHE_RESULT.with(|v|v.get());
+        if result>=0{unsafe{std::ptr::copy_nonoverlapping([4100u32,128,1].as_ptr(),info,3);}}result
+    }
+    std::thread_local! {static PATH_CACHE_RESULT:Cell<i32>=const{Cell::new(-1)};}
+    #[test] fn path_cache_hit_and_allocation_pressure_skip_decoder(){
+        let _guard=LOCK.lock().unwrap();
+        for result in [0,4096]{
+            let mut p=GxmTextureProvider::new().with_source(|_|panic!("path hit must not read source"));
+            PATH_CACHE_RESULT.with(|v|v.set(result));
+            let hit=p.resolve("image/bg/source.png");
+            PATH_CACHE_RESULT.with(|v|v.set(-1));
+            assert_eq!(p.timing.decoded,0);assert_eq!(p.timing.decode_errors,0);
+            assert_eq!(p.timing.reads,0);
+            if result>0{assert_eq!(hit.unwrap().1,TextureInfo{width:4100,height:128});assert_eq!(p.entries["image/bg/source.png"].gpu_bytes(),4096);}
+            else{assert!(hit.is_none());assert!(p.entries.is_empty());}
+        }
+    }
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_reserve_large_image(_:*const std::ffi::c_char,_:u32,_:u32)->i32 {LARGE_IMAGE_RESULT.with(|v|if v.get()>=0{1}else{-1})}
     #[unsafe(no_mangle)]
