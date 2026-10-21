@@ -813,12 +813,28 @@ pub unsafe extern "C" fn art3m1s_launcher_decode_icon(
     })).unwrap_or(0)
 }
 
+fn large_image_prebuild_eligible(w:u32,h:u32,minimum:u64,shrink_oversized:bool)->bool {
+    u64::from(w)*u64::from(h)*4>=minimum || (shrink_oversized && (w>4096 || h>4096))
+}
+
+#[cfg(test)]
+#[test]
+fn large_image_prebuild_dimension_or_memory() {
+    let minimum=30*1024*1024;
+    assert!(large_image_prebuild_eligible(8192,1,minimum,true));
+    assert!(large_image_prebuild_eligible(1,8192,minimum,true));
+    assert!(!large_image_prebuild_eligible(8192,1,minimum,false));
+    assert!(!large_image_prebuild_eligible(4096,1,minimum,true));
+    assert!(large_image_prebuild_eligible(3072,3072,minimum,false));
+    assert!(!large_image_prebuild_eligible(512,512,minimum,true));
+}
+
 /// Startup-only image preparation. Pixels remain owned by Rust during the callback.
 /// Returns 2 for a size-filtered image, 0 for an error, or the callback result.
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_prepare_large_image(
-    data: *const u8, len: usize, minimum: u64, context: *mut std::ffi::c_void,
+    data: *const u8, len: usize, minimum: u64, shrink_oversized: c_int, context: *mut std::ffi::c_void,
     consume: Option<unsafe extern "C" fn(*mut std::ffi::c_void,u32,u32,*const u8,usize)->c_int>,
 ) -> c_int {
     if data.is_null() || len == 0 || len > 64*1024*1024 { return 0; }
@@ -826,11 +842,19 @@ pub unsafe extern "C" fn art3m1s_prepare_large_image(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         use image::ImageDecoder;
         let bytes=unsafe { std::slice::from_raw_parts(data,len) };
+        if crate::native_texture::recognized(bytes) {
+            let Ok(texture)=crate::native_texture::parse(bytes) else {return 0;};
+            let (w,h)=(texture.width,texture.height);
+            // Already compressed and hardware-sized textures need no recompression.
+            if (w<=4096 && h<=4096) || !large_image_prebuild_eligible(w,h,minimum,shrink_oversized!=0) {return 2;}
+            let Ok(rgba)=crate::native_texture::decode_oversized(texture) else {return 0;};
+            return unsafe {consume(context,w,h,rgba.as_ptr(),rgba.len())};
+        }
         let Ok(reader)=image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() else {return 0;};
         let Ok(decoder)=reader.into_decoder() else {return 0;};
         let (w,h)=decoder.dimensions();
-        if w==0 || h==0 || w>4096 || h>4096 || u64::from(w)*u64::from(h)*4<minimum {return 2;}
-        let Ok(rgba)=crate::resource_ledger::decode_rgba(decoder,64*1024*1024) else {return 0;};
+        if w==0 || h==0 || w>16384 || h>16384 || u64::from(w)*u64::from(h)>64*1024*1024 || !large_image_prebuild_eligible(w,h,minimum,shrink_oversized!=0) {return 2;}
+        let Ok(rgba)=crate::resource_ledger::decode_rgba(decoder,256*1024*1024) else {return 0;};
         unsafe {consume(context,w,h,rgba.as_ptr(),rgba.as_raw().len())}
     })).unwrap_or(0)
 }
