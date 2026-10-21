@@ -17,6 +17,7 @@ impl GxmTextureProvider {
         self.timing.upload_max_us=self.timing.upload_max_us.max(us);
         if ok<=0{
         if t.width>4096||t.height>4096 {
+            let _image_progress=self.image_progress(name,t.width,t.height);
             self.admit_large_image(name,t.width,t.height);
             let pixels=match crate::native_texture::decode_oversized(t){Ok(p)=>p,Err(e)=>{
                 self.record_decode_failure(name);

@@ -90,6 +90,7 @@ impl Entry {
 }
 
 unsafe extern "C" {
+    fn art3m1s_gxm_image_progress(name:*const std::ffi::c_char,stage:i32);
     fn art3m1s_gxm_probe_large_image(id:u64,name:*const std::ffi::c_char,p:*const u8,n:usize,info:*mut u32)->i32;
     fn art3m1s_gxm_reserve_image(w:u32,h:u32)->i32;
     fn art3m1s_gxm_reserve_large_image(name:*const std::ffi::c_char,w:u32,h:u32)->i32;
@@ -698,6 +699,21 @@ impl GxmTextureProvider {
     }
 }
 
+struct ImageProgressGuard(bool);
+impl Drop for ImageProgressGuard {
+    fn drop(&mut self){if self.0{unsafe{art3m1s_gxm_image_progress(c"".as_ptr(),3);}}}
+}
+impl GxmTextureProvider {
+    fn image_progress(&self,name:&str,w:u32,h:u32)->ImageProgressGuard{
+        if unsafe{art3m1s_gxm_large_image_allowed(w,h)}<=0{return ImageProgressGuard(false);}
+        let resolved=self.image_path_resolver.as_ref().map(|f|f(name));
+        if let Ok(path)=std::ffi::CString::new(resolved.as_deref().unwrap_or(name)){
+            unsafe{art3m1s_gxm_image_progress(path.as_ptr(),4);}return ImageProgressGuard(true);
+        }
+        ImageProgressGuard(false)
+    }
+}
+
 impl Default for GxmTextureProvider {
     fn default() -> Self { Self::new() }
 }
@@ -1036,6 +1052,7 @@ impl TextureProvider for GxmTextureProvider {
             self.timing.decode_errors+=1;crate::core_warn!("GXM texture decoder failure: {name}: {error}");return None;
         }};
         let (width,height)=decoder.dimensions();
+        let _image_progress=self.image_progress(name,width,height);
         let color=decoder.color_type();
         if color!=image::ColorType::L8{self.admit_large_image(name,width,height);}
         if color==image::ColorType::L8{
@@ -2327,6 +2344,8 @@ mod tests {
         assert!(p.decoded.is_empty());
     }
 
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_image_progress(_:*const std::ffi::c_char,_:i32){}
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_probe_large_image(_:u64,_:*const std::ffi::c_char,_:*const u8,_:usize,info:*mut u32)->i32 {
         let result=PATH_CACHE_RESULT.with(|v|v.get());
