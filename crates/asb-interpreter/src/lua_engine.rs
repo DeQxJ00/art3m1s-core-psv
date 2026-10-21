@@ -862,7 +862,9 @@ impl UserData for EngineApi {
             // lua.load 接受 &[u8]，文本源码与 luac 字节码均可。
             let source = restored.as_deref().or(repaired.as_deref()).unwrap_or(&bytes[..]);
             let startup = crate::optional_startup::repair_source(&path, source);
-            lua.load(startup.as_deref().unwrap_or(source))
+            let source = startup.as_deref().unwrap_or(source);
+            let delay = crate::delay_alias::repair_source(&path, source);
+            lua.load(delay.as_deref().unwrap_or(source))
                 .set_name(path.as_str())
                 .exec()
                 .map_err(|e| mlua::Error::external(format!("include 执行 {path} 失败: {e}")))?;

@@ -62,6 +62,7 @@ pub use surface_timeline::SurfaceTimelineCursor;
 mod message_roles;
 mod emote_restore;
 mod optional_startup;
+mod delay_alias;
 mod toolbar_roles;
 pub use message_roles::MessageLayerIds;
 #[cfg(feature = "backend-luau")]
