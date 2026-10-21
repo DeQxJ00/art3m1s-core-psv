@@ -1406,9 +1406,19 @@ mod tests {
         let mut threshold_provider = AlphaProvider { alpha: 128 };
         assert_eq!(
             c.hit_test(50.0, 50.0, &mut threshold_provider),
-            None,
-            "alpha equal to clickablethreshold must not hit"
+            Some("dock".into()),
+            "native hit testing includes alpha equal to clickablethreshold"
         );
+        for (threshold, alpha, hit) in [(0, 0, true), (128, 64, false),
+                                       (255, 254, false), (255, 255, true)] {
+            c.apply_event(&Event::Layer(LayerEvent::SetProperties {
+                id: "dock".into(),
+                properties: HashMap::from([("clickablethreshold".into(), threshold.to_string())]),
+            }));
+            let mut provider = AlphaProvider { alpha };
+            assert_eq!(c.hit_test(50.0, 50.0, &mut provider).is_some(), hit,
+                       "threshold={threshold} alpha={alpha}");
+        }
     }
 
     #[test]
