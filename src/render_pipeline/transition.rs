@@ -32,6 +32,7 @@ pub(crate) struct TransitionState {
     vague: Option<i32>,
     /// 用户输入跳过策略：0=禁止，1（缺省）=允许，2=仅已处于跳过状态时允许。
     input: i32,
+    source_frame: Option<DrawList>,
 }
 
 pub(crate) fn start(
@@ -55,11 +56,52 @@ pub(crate) fn start(
         rule: request.rule.map(str::to_string),
         vague: request.vague,
         input: request.input,
+        source_frame: None,
     });
+    crate::core_info!("[transition] start type={} duration_ms={} input={}",
+        request.trans_type, request.time.unwrap_or(1000), request.input);
 }
 
 pub(crate) fn clear(slot: &RefCell<Option<TransitionState>>) {
     *slot.borrow_mut() = None;
+}
+
+pub(crate) fn set_source_frame(slot: &RefCell<Option<TransitionState>>, frame: &DrawList) {
+    if let Some(state) = slot.borrow_mut().as_mut() {
+        let mut source = frame.clone();
+        // The previous transition's final submitted frame can still contain
+        // its almost-transparent capture quad. It is not scene content.
+        if source.commands.last().is_some_and(|c| Some(c.texture) == state.captured_texture)
+            && source.shader_groups.iter().all(|g| g.end < source.commands.len()) {
+            source.commands.pop();
+            source.command_keys.pop();
+        }
+        state.source_frame = Some(source);
+    }
+}
+
+// When only an overlay was added, the outgoing scene is still the current
+// background. Replay that common prefix at its current transforms instead of
+// dissolving a frozen screenshot over a moving copy of the same background.
+fn live_source_prefix(source: &DrawList, current: &DrawList) -> Option<DrawList> {
+    let n = source.commands.len();
+    if n == 0 || current.commands.len() <= n || !source.mask_commands.is_empty()
+        || !current.mask_commands.is_empty() { return None; }
+    if !source.commands.iter().zip(&current.commands).any(|(old, new)| old.transform != new.transform) {
+        return None;
+    }
+    for (old, new) in source.commands.iter().zip(&current.commands) {
+        if old.mesh.is_some() || old.recovered_packet.is_some() || old.native_emote.is_some()
+            || old.stencil.is_some() { return None; }
+        let mut aligned = old.clone();
+        aligned.transform = new.transform;
+        if aligned != *new { return None; }
+    }
+    let groups: Vec<_> = current.shader_groups.iter().filter(|g| g.start < n).cloned().collect();
+    if groups.iter().any(|g| g.end > n || g.mask_range.is_some())
+        || groups != source.shader_groups { return None; }
+    Some(DrawList { commands: current.commands[..n].to_vec(),
+        command_keys: vec![None; n], mask_commands: Vec::new(), shader_groups: groups })
 }
 
 /// 用户输入请求跳过转场。
@@ -84,6 +126,7 @@ pub(crate) fn skip_by_input(slot: &RefCell<Option<TransitionState>>, in_skip_mod
         }
     };
     if allowed {
+        crate::core_info!("[transition] finish reason=input skip_mode={}", in_skip_mode);
         *slot.borrow_mut() = None;
     }
     allowed
@@ -97,6 +140,8 @@ pub(crate) fn clear_finished(slot: &RefCell<Option<TransitionState>>, clock_ms: 
     if !transition.needs_capture
         && clock_ms.saturating_sub(transition.start_ms) >= transition.duration_ms
     {
+        crate::core_info!("[transition] finish reason=elapsed elapsed_ms={} duration_ms={}",
+            clock_ms.saturating_sub(transition.start_ms), transition.duration_ms);
         *state = None;
     }
 }
@@ -241,6 +286,40 @@ pub(crate) fn overlay_old_frame(
         None
     };
 
+    if let Some(mut live) = transition.source_frame.as_ref()
+        .and_then(|source| live_source_prefix(source, frame)) {
+        if elapsed == 0 {
+            crate::core_info!("[transition] live_background commands={} groups={}",
+                live.commands.len(), live.shader_groups.len());
+            for (i,c) in live.commands.iter().enumerate() {
+                crate::core_info!("[transition-source] i={} alpha={} blend={:?} quad={:?} shader={} opaque={}",
+                    i,c.opacity,c.blend,c.clip.quad_size,c.shader.is_some(),provider.texture_is_opaque(c.texture));
+            }
+            for g in &live.shader_groups {
+                crate::core_info!("[transition-source-group] range={}..{} composite={} alpha={:?} opaque={:?}",
+                    g.start,g.end,g.effect.name==crate::render_pipeline::shader::GROUP_COMPOSITE_SHADER,
+                    g.effect.uniforms.get("alpha"),g.effect.uniforms.get("opaque"));
+            }
+        }
+        let start = frame.commands.len();
+        let end = start + live.commands.len();
+        let effect = rule_effect.clone().unwrap_or_else(|| ShaderEffect {
+            name: crate::render_pipeline::shader::GROUP_COMPOSITE_SHADER.into(),
+            uniforms: BTreeMap::from([("alpha".into(), vec![1.0-progress])]),
+            mask_texture: None, user_texture: None,
+        });
+        frame.commands.append(&mut live.commands);
+        frame.command_keys.extend((start..end).map(|_| None));
+        for mut group in live.shader_groups {
+            group.start += start; group.end += start;
+            frame.shader_groups.push(group);
+        }
+        frame.shader_groups.push(crate::render_pipeline::draw::ShaderGroup {
+            key: None, start, end, effect, clip_bounds: None, mask_range: None,
+        });
+        return;
+    }
+
     match (transition.trans_type, rule_effect) {
         // 规则图像转场：旧帧整屏叠加，逐像素 alpha 由 shader 按 rule 灰度决定。
         (2, Some(effect)) => {
@@ -286,6 +365,43 @@ pub(crate) fn overlay_old_frame(
 mod tests {
     use super::*;
     use crate::compositor::mock::MockProvider;
+
+    #[test]
+    fn overlay_transition_replays_common_background_at_current_position() {
+        let slot = RefCell::new(None);
+        let mut provider = MockProvider::new();
+        start_type2(&slot, 1);
+        capture(&slot, &mut provider);
+        let mut source = DrawList::new();
+        overlay_old_frame(&slot, 0, &mut source, &mut provider);
+        source.commands[0].shader = None;
+        source.commands[0].texture = TextureId(900);
+        let mut outgoing = source.clone();
+        let mut fading_capture = outgoing.commands[0].clone();
+        fading_capture.texture = slot.borrow().as_ref().unwrap().captured_texture.unwrap();
+        fading_capture.opacity = 0.008;
+        outgoing.push(fading_capture);
+        set_source_frame(&slot, &outgoing);
+        assert_eq!(slot.borrow().as_ref().unwrap().source_frame.as_ref().unwrap().commands.len(), 1);
+        let mut current = source.clone();
+        current.commands[0].transform.translation.x = -15.0;
+        let mut dialog = current.commands[0].clone();
+        dialog.texture = TextureId(901);
+        current.push(dialog);
+        overlay_old_frame(&slot, 500, &mut current, &mut provider);
+        assert_eq!(current.commands.len(), 3);
+        assert_eq!(current.commands[2].texture, TextureId(900));
+        assert_eq!(current.commands[2].transform.translation.x, -15.0);
+        let group = current.shader_groups.last().unwrap();
+        assert_eq!((group.start, group.end), (2, 3));
+        assert_eq!(group.effect.uniforms["progress"], vec![0.5]);
+
+        current.commands[0].texture = TextureId(902);
+        assert!(live_source_prefix(&source, &current).is_none());
+        current.commands[0].texture = TextureId(900);
+        current.commands[0].opacity = 0.5;
+        assert!(live_source_prefix(&source, &current).is_none());
+    }
 
     fn start_type2(slot: &RefCell<Option<TransitionState>>, input: i32) {
         start(

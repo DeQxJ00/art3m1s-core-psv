@@ -120,6 +120,10 @@ impl<'a> RenderPipeline<'a> {
         transition::needs_capture(&self.compositor.trans_state)
     }
 
+    pub(crate) fn set_trans_source_frame(&self, frame: &DrawList) {
+        transition::set_source_frame(&self.compositor.trans_state, frame);
+    }
+
     pub fn is_transition_in_progress(&self) -> bool {
         transition::is_in_progress(&self.compositor.trans_state, self.compositor.clock_ms)
     }

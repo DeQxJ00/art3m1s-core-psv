@@ -268,9 +268,14 @@ impl CoreRuntime {
         // 转场等待期间收到点击：按 [trans] 的 input 参数策略尝试提前结束转场
         // （input=0 禁止；input=2 仅在已处于跳过态时放行；缺省/1 允许）。
         // 跳过态（skip）同样视作输入意图，让 input=2 生效。
+        let raw_click = {
+            let input = self.input.lock().unwrap();
+            input.clicked || !input.keys_down_edge.is_empty()
+                || !input.mouse_buttons_down_edge.is_empty()
+        };
         if trans_input_skip_requested(
             is_trans_wait,
-            advance_requested,
+            transition_click_requested(tick, raw_click, stopped_automode_by_click),
             self.skip_active(),
             RenderPipeline::new(&self.compositor).is_transition_in_progress(),
         ) {
@@ -688,6 +693,13 @@ fn automode_stop_by_stop_wait(reason: &WaitReason) -> bool {
 /// 且存在输入意图（物理点击 `clicked` 或已处于跳过态 `skip_active`）时才尝试。
 /// 是否真正跳过再由 [`RenderPipeline::skip_transition_by_input`] 按 `[trans]`
 /// 的 input 参数（0/1/2）裁决。
+fn transition_click_requested(tick: InputTick, raw_click: bool, stopped_automode_by_click: bool) -> bool {
+    // Script-generated decide events release message waits, but are not a
+    // second user click on the transition that follows that message.
+    // Keep Lua remapping a fresh physical edge to a dummy decide working.
+    tick.advance && (tick.physical_click || raw_click) && !stopped_automode_by_click
+}
+
 fn trans_input_skip_requested(
     is_trans_wait: bool,
     clicked: bool,
@@ -1298,6 +1310,18 @@ mod tests {
         assert!(trans_input_skip_requested(true, true, false, true));
         // 转场进行中 + 跳过态（无物理点击）：尝试（让 input=2 生效）。
         assert!(trans_input_skip_requested(true, false, true, true));
+    }
+
+    #[test]
+    fn synthetic_message_advance_does_not_skip_transition() {
+        let synthetic = super::InputTick { advance: true, ..Default::default() };
+        assert!(!super::transition_click_requested(synthetic, false, false));
+        assert!(super::transition_click_requested(synthetic, true, false));
+        let physical = super::InputTick {
+            advance: true, physical_click: true, user_input: true,
+        };
+        assert!(super::transition_click_requested(physical, true, false));
+        assert!(!super::transition_click_requested(physical, true, true));
     }
 
     #[test]

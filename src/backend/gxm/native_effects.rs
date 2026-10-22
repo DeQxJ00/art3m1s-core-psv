@@ -168,6 +168,13 @@ fn encode(cmd: &DrawCommand, width: u32, height: u32) -> Option<EffectDraw> {
             }
         }
     }
+    // Offscreen sources already contain premultiplied RGB. A rule must fade
+    // RGB and alpha together before ONE / ONE_MINUS_SRC_ALPHA compositing.
+    if kind(cmd.shader.as_ref()) == 1
+        && matches!(cmd.blend, BlendMode::PremultipliedAlpha | BlendMode::PremultipliedAdd)
+    {
+        draw.effects.flags[0] = 6.0;
+    }
     if let Some(e) = &cmd.native_emote {
         draw.effects.flags[3] = 1.0;
         for (i, c) in e.corner_colors.iter().enumerate() {
@@ -220,6 +227,45 @@ fn group_command(group: &ShaderGroup, width: u32, height: u32) -> DrawCommand {
         stencil: None,
         recovered_packet: None, native_emote: None,
     }
+}
+// A single ordinary sprite needs no intermediate target for a rule fade.
+// Sample the rule in screen coordinates, independently of the sprite's zoom/UVs.
+fn direct_rule_group(frame: &DrawList, index: usize, width: u32, height: u32) -> Option<EffectDraw> {
+    let group = &frame.shader_groups[index];
+    if group.effect.name != RULE_TRANS_SHADER || group.start >= group.end || group.end > frame.commands.len()
+        || group.mask_range.is_some() || group.clip_bounds.is_some()
+        || group.effect.mask_texture.is_none() || group.effect.user_texture.is_some()
+        || group.effect.uniforms.keys().any(|k| k != "progress" && k != "vague") { return None; }
+    // Cross only individually proven neutral boundaries. Never distribute a
+    // rule over overlapping transparent sprites: their alpha equations differ.
+    for (i, nested) in frame.shader_groups[..index].iter().enumerate() {
+        if nested.start < group.end && nested.end > group.start
+            && (nested.start < group.start || nested.end > group.end
+                || !passthrough_group_inner(frame,i,width,height,true)) { return None; }
+    }
+    let mut visible=None;
+    for command in &frame.commands[group.start..group.end] {
+        if command.blend != BlendMode::Alpha || command.shader.is_some() || command.mesh.is_some()
+            || command.stencil.is_some() || command.native_emote.is_some() || command.recovered_packet.is_some()
+            || command.color != ColorFilter::default() { return None; }
+        if command.opacity==0. || unsafe{art3m1s_gxm_texture_is_empty(command.texture.0)!=0} {continue;}
+        // A certified opaque full-stage sprite replaces all preceding pixels.
+        if visible.is_some() && !opaque_cover(command,width,height) {return None;}
+        visible=Some(command);
+    }
+    let command=visible?;
+    let mut draw = encode(command, width, height)?;
+    draw.mask = group.effect.mask_texture?.0;
+    draw.effects.flags[0] = 7.0;
+    draw.effects.transition[0] = scalar(&group.effect, "progress", 0.0);
+    draw.effects.transition[1] = scalar(&group.effect, "vague", 1.0 / 255.0);
+    if group.end-group.start>1 {
+        thread_local! { static REPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        REPORTED.with(|reported|if !reported.replace(true) {
+            crate::core_info!("[transition-direct] collapsed_commands={} screen_rule=1",group.end-group.start);
+        });
+    }
+    Some(draw)
 }
 fn full_stage_clip(clip: Option<[f32; 4]>, width: u32, height: u32) -> bool {
     clip.is_none_or(|r| r.iter().all(|v| v.is_finite()) && r[0] <= 0.0 && r[1] <= 0.0
@@ -495,6 +541,9 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
                 stats[1]+=1;
                 render_range(frame,group.start,group.end,group_index,width,height,stats,allow_flatten,nodes,admit);
                 index=group.end;continue;
+            }
+            if allow_flatten && let Some(draw)=direct_rule_group(frame,group_index,width,height) {
+                stats[1]+=1;unsafe {art3m1s_gxm_draw_effect(&draw)};index=group.end;continue;
             }
             if allow_flatten && let Some(draws)=local_opaque_group(frame,group_index,width,height){
                 stats[1]+=1;for draw in &draws {unsafe {art3m1s_gxm_draw_effect(draw)}}
@@ -1598,6 +1647,23 @@ mod tests {
         assert_eq!(draw.effects.flags, [3.0, 1.0, 1.0, 0.0]);
         assert_eq!(draw.effects.transition[2], 1.0);
     }
+    #[test]
+    fn rule_groups_fade_premultiplied_rgb_but_capture_sprites_stay_straight() {
+        let mut group = test_group(RULE_TRANS_SHADER, 0, 1);
+        group.effect.mask_texture = Some(TextureId(42));
+        group.effect.uniforms.insert("progress".into(), vec![0.5]);
+        group.effect.uniforms.insert("vague".into(), vec![0.125]);
+        let mut command = group_command(&group, 960, 544);
+        let encoded = encode(&command, 960, 544).unwrap();
+        assert_eq!(encoded.effects.flags[0], 6.0);
+        assert_eq!(encoded.blend, 5);
+        assert_eq!(encoded.mask, 42);
+        assert_eq!(&encoded.effects.transition[..2], &[0.5, 0.125]);
+        command.blend = BlendMode::Alpha;
+        let encoded = encode(&command, 960, 544).unwrap();
+        assert_eq!(encoded.effects.flags[0], 1.0);
+        assert_eq!(encoded.blend, 0);
+    }
     fn test_group(kind: &str, start: usize, end: usize) -> ShaderGroup {
         ShaderGroup {
             key: None,
@@ -1728,6 +1794,52 @@ mod tests {
         for id in [42,43] {let mut c=group_command(&g,960,544);c.texture=TextureId(id);
             c.shader=None;c.blend=BlendMode::Alpha;f.push(c);}
         f.shader_groups.push(g);f
+    }
+    #[test]
+    fn direct_rule_keeps_source_geometry_and_rejects_nested_or_custom_passes() {
+        let mut f=neutral_frame();f.commands.truncate(1);f.command_keys.truncate(1);
+        let mut g=test_group(RULE_TRANS_SHADER,0,1);
+        g.effect.mask_texture=Some(TextureId(77));
+        g.effect.uniforms.insert("progress".into(),vec![0.4]);
+        f.shader_groups=vec![g.clone()];
+        f.commands[0].transform.translation=glam::vec2(-120.,15.);
+        f.commands[0].opacity=0.7;
+        let d=direct_rule_group(&f,0,960,544).unwrap();
+        assert_eq!(d.effects.flags[0],7.);assert_eq!(d.mask,77);
+        assert_eq!(&d.transform[4..],&[-120.,15.]);assert_eq!(d.tint[3],0.7);
+        assert_eq!(d.effects.transition[0],0.4);assert_eq!(d.blend,0);
+        f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
+        assert!(direct_rule_group(&f,0,960,544).is_none());
+        f.shader_groups=vec![test_group(GROUP_COMPOSITE_SHADER,0,1),g];
+        assert!(direct_rule_group(&f,1,960,544).is_some());
+        f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.5]);
+        assert!(direct_rule_group(&f,1,960,544).is_none());
+    }
+    #[test]
+    fn direct_rule_discards_empty_placeholders_but_not_visible_overlaps() {
+        let mut f=neutral_frame();
+        let mut g=test_group(RULE_TRANS_SHADER,0,3);g.effect.mask_texture=Some(TextureId(77));
+        let mut empty=f.commands[0].clone();empty.texture=TextureId(4041);
+        f.commands[1]=empty.clone();f.push(empty);
+        f.shader_groups=vec![test_group(GROUP_COMPOSITE_SHADER,0,3),g];
+        assert_eq!(direct_rule_group(&f,1,960,544).unwrap().texture,42);
+        f.commands[1].texture=TextureId(43);f.commands[1].opacity=0.5;
+        assert!(direct_rule_group(&f,1,960,544).is_none());
+        f.commands[1].opacity=0.;
+        assert!(direct_rule_group(&f,1,960,544).is_some());
+    }
+    #[test]
+    fn direct_rule_discards_underlying_content_only_with_full_opaque_cover() {
+        let mut f=neutral_frame();
+        f.commands[0].texture=TextureId(43);f.commands[0].opacity=0.5;
+        f.commands[1].texture=TextureId(42);
+        let mut g=test_group(RULE_TRANS_SHADER,0,2);g.effect.mask_texture=Some(TextureId(77));
+        f.shader_groups=vec![test_group(GROUP_COMPOSITE_SHADER,0,2),g];
+        assert_eq!(direct_rule_group(&f,1,960,544).unwrap().texture,42);
+        f.commands[1].transform.translation.x=1.;
+        assert!(direct_rule_group(&f,1,960,544).is_none());
+        f.commands[1].transform.translation.x=0.;f.commands[1].opacity=0.99;
+        assert!(direct_rule_group(&f,1,960,544).is_none());
     }
     #[test]
     fn packet_frame_caches_only_independent_background_blur(){

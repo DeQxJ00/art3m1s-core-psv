@@ -113,14 +113,16 @@ impl CoreRuntime {
     fn prepare_recovered_scene(&mut self) {
         // Build CPU snapshots while the previous GPU frame is still executing.
         // Never replace the last *submitted* scene before actual presentation;
-        // transitions and first-frame loading keep the existing conservative path.
+        // Pending captures and first-frame loading keep the conservative path.
+        // Once captured, transition geometry uses the same immutable clock and
+        // texture revision as any other prepared frame.
         if self.prepared_gxm_frame.is_some() || self.last_submitted_frame.is_none()
             || !self.emote.lock().unwrap().uses_recovered()
             || RenderPipeline::new(&self.compositor).needs_trans_capture()
-            || RenderPipeline::new(&self.compositor).is_transition_in_progress()
             || self.texture_provider.needs_upload_retry() { return; }
         self.frame_visual_dirty |= self.drive_click_wait_icon();
-        if !self.frame_visual_dirty && self.last_submitted_texture_revision == self.texture_provider.content_revision() { return; }
+        if !self.frame_visual_dirty && self.last_submitted_texture_revision == self.texture_provider.content_revision()
+            && !RenderPipeline::new(&self.compositor).is_transition_in_progress() { return; }
         self.texture_provider.begin_scene_build();
         let started=std::time::Instant::now();
         self.sync_backlog_snapshot();
@@ -173,6 +175,8 @@ impl CoreRuntime {
         &mut self,
         profile: &mut crate::profiler::FrameProfile,
     ) -> Option<RenderRegion> {
+        let transition_start=RenderPipeline::new(&self.compositor).is_transition_in_progress()
+            .then(std::time::Instant::now);
         if RenderPipeline::new(&self.compositor).needs_trans_capture() {
             #[cfg(feature = "gxm-builtin-effects")]
             {
@@ -180,6 +184,9 @@ impl CoreRuntime {
                     crate::render_pipeline::transition::CAPTURE_TEXTURE_NAME, self.stage_w, self.stage_h);
                 if let Some((texture, info)) = captured {
                     RenderPipeline::new(&self.compositor).capture_trans_external_texture(texture, info, false);
+                    if let Some(frame) = self.last_submitted_frame.as_ref() {
+                        RenderPipeline::new(&self.compositor).set_trans_source_frame(frame);
+                    }
                 } else {
                     self.renderer.render(self.last_submitted_frame.as_ref().unwrap_or(&DrawList::default()));
                     return Some(RenderRegion::Full);
@@ -204,6 +211,7 @@ impl CoreRuntime {
         } else {
             unsafe { art3m1s_gxm_cancel_capture() };
         }
+        let capture_us=transition_start.map_or(0,|t|t.elapsed().as_micros());
         let build_started = profile.mark();
         let mut used_prepared = false;
         #[cfg(feature="emote-recovery")]
@@ -211,7 +219,7 @@ impl CoreRuntime {
             if !self.frame_visual_dirty && prepared.clock==self.compositor.clock_ms()
                 && prepared.size==(self.stage_w,self.stage_h)
                 && prepared.texture_revision==self.texture_provider.content_revision()
-                && !RenderPipeline::new(&self.compositor).is_transition_in_progress() {
+                && !RenderPipeline::new(&self.compositor).needs_trans_capture() {
                 if let Some(mut retired)=self.last_submitted_frame.replace(prepared.frame){
                     // The previous submission remains available through transition
                     // capture and the host GPU fence. Release its contents here,
@@ -254,8 +262,16 @@ impl CoreRuntime {
         profile.frame_build_ns = crate::profiler::FrameProfile::elapsed(build_started);
 
         let frame = self.last_submitted_frame.as_ref()?;
+        let build_us=transition_start.map_or(0,|t|t.elapsed().as_micros().saturating_sub(capture_us));
         let gpu_started = profile.mark();
         self.renderer.render(frame);
+        if let Some(start)=transition_start {
+            let total_us=start.elapsed().as_micros();
+            if total_us>=18000 {
+                crate::core_info!("[transition-cost] total_us={} capture_us={} build_us={} submit_us={} prepared={}",
+                    total_us,capture_us,build_us,total_us.saturating_sub(capture_us+build_us),used_prepared);
+            }
+        }
         profile.gpu_submit_ns = crate::profiler::FrameProfile::elapsed(gpu_started);
         profile.rendered = true;
         profile.stage_pixels = self.stage_w as u64 * self.stage_h as u64;
