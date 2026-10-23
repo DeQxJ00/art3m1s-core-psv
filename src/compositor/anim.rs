@@ -626,14 +626,11 @@ pub(crate) fn gc_finished_tweens(
 ) {
     let mut settle: Vec<(String, String, f32)> = Vec::new();
     let mut completed: Vec<(String, Option<TweenHandler>, bool)> = Vec::new();
-    let ids: Vec<String> = scene.iter_ids();
-    for id in &ids {
-        if let Some(layer) = scene.get(id) {
-            for t in &layer.tweens {
-                if t.is_finished(now) {
-                    settle.push((id.clone(), t.param.clone(), t.final_value()));
-                    completed.push((id.clone(), t.handler.clone(), t.delete_on_finish));
-                }
+    for layer in scene.all_layers() {
+        for t in &layer.tweens {
+            if t.is_finished(now) {
+                settle.push((layer.id.clone(), t.param.clone(), t.final_value()));
+                completed.push((layer.id.clone(), t.handler.clone(), t.delete_on_finish));
             }
         }
     }

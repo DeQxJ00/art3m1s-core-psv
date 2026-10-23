@@ -320,6 +320,7 @@ impl CoreRuntime {
         // Avoid building fragments that cannot survive until the next frame.
         let cache_static_images = self.video.video_state().video_layers.is_empty();
         if !cache_static_images { self.scene_build_cache.clear(); }
+        self.scene_build_cache.profiling=profile.as_ref().is_some_and(|p|p.enabled);
         self.scene_build_cache.begin(self.texture_provider.content_revision(),self.texture_provider.needs_upload_retry(),
             text_map.keys().chain(emote_map.keys()).cloned());
         let scene_started = profile.as_ref().and_then(|p| p.mark());
@@ -364,7 +365,7 @@ impl CoreRuntime {
         frame.materialize_stencil_groups(crate::render_pipeline::shader::ALPHA_MASK_SHADER);
         let stencil_ns=crate::profiler::FrameProfile::elapsed(stencil_started);
         if let Some((samples,us))=self.scene_build_cache.profile_sample(){
-            crate::core_info!("[scene-cache-profile] sparse_frames={} replay_us={} candidate_us={} store_us={}; cumulative sampled averages",samples,us[0],us[1],us[2]);
+            crate::core_info!("[scene-cache-profile] sparse_frames={} replay_us={} candidate_us={} store_us={} props_us={} geometry_us={} visual_us={} text_group_us={}; cumulative sampled averages",samples,us[0],us[1],us[2],us[3],us[4],us[5],us[6]);
         }
         if profile.as_ref().is_some_and(|p|p.enabled){
             thread_local!{static PARTS:std::cell::RefCell<[u64;3]>=const{std::cell::RefCell::new([0;3])};}

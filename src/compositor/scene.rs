@@ -96,6 +96,28 @@ impl Layer {
     }
 }
 
+/// Borrow already ordered children, including the common empty/single-child
+/// cases. Only out-of-order siblings need a temporary sorting allocation.
+pub(crate) enum OrderedChildren<'a> {
+    Borrowed(std::slice::Iter<'a, String>),
+    Sorted(std::vec::IntoIter<&'a str>),
+}
+impl<'a> Iterator for OrderedChildren<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self { Self::Borrowed(i) => i.next().map(String::as_str), Self::Sorted(i) => i.next() }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self { Self::Borrowed(i) => i.size_hint(), Self::Sorted(i) => i.size_hint() }
+    }
+}
+impl DoubleEndedIterator for OrderedChildren<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self { Self::Borrowed(i) => i.next_back().map(String::as_str), Self::Sorted(i) => i.next_back() }
+    }
+}
+impl ExactSizeIterator for OrderedChildren<'_> {}
+
 /// Artemis 图层 ID 排序：按点号分割，数字部分按数值比较，字符串部分按字典序。
 /// 数字部分优先于字符串部分（数字在前）。
 fn compare_layer_id(a: &str, b: &str) -> Ordering {
@@ -106,6 +128,14 @@ fn compare_layer_id(a: &str, b: &str) -> Ordering {
         (true, false) => return Ordering::Greater,
         (false, true) => return Ordering::Less,
         _ => {}
+    }
+
+    // Siblings share the exact parent prefix. Do not repeatedly parse every
+    // ancestor number when ordering a deep particle group.
+    if let (Some((pa, ca)), Some((pb, cb))) = (a.rsplit_once('.'), b.rsplit_once('.'))
+        && pa == pb
+    {
+        return compare_id_part(ca, cb);
     }
 
     let mut parts_a = a.split('.');
@@ -152,6 +182,9 @@ impl Clone for FileCache {
 /// 单独记录。根节点集合是没有父级的顶层 ID，按插入顺序排列。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scene {
+    /// Clock paired with a save snapshot; absent in legacy saves and live scenes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) saved_clock_ms: Option<u64>,
     #[serde(skip)]
     file_cache: FileCache,
     #[serde(skip)]
@@ -175,6 +208,7 @@ impl Scene {
     /// copying their script parameter maps at every rendered frame.
     pub fn render_snapshot(&self) -> Self {
         Self {
+            saved_clock_ms: None,
             file_cache: FileCache::default(),
             query_serial: self.query_serial,
             roots: self.roots.clone(),
@@ -230,6 +264,19 @@ impl Scene {
         self.root_props.clone_from(&source.root_props);
         self.query_serial = source.query_serial;
         copied
+    }
+
+    pub(crate) fn sync_query_layer_from(&mut self, layer: &Layer, accepted: &mut HashMap<String, (u64, u64)>) -> bool {
+        self.query_serial = self.query_serial.max(layer.query_revision);
+        let id = &layer.id;
+        if self.get(id).is_some_and(|old| accepted.get(id) == Some(&(layer.query_revision, old.query_revision))) {
+            return false;
+        }
+        self.ensure(id);
+        self.nodes.insert(id.clone(), layer.clone());
+        accepted.insert(id.clone(), (layer.query_revision, layer.query_revision));
+        *self.file_cache.0.get_mut().unwrap() = None;
+        true
     }
 
     pub fn set_file(&mut self, id: &str, file: Option<String>) {
@@ -343,6 +390,17 @@ impl Scene {
                 sorted
             })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn ordered_children(&self, id: &str) -> OrderedChildren<'_> {
+        let children = self.get(id).map_or(&[][..], |layer| layer.children.as_slice());
+        if children.windows(2).all(|pair| compare_layer_id(&pair[0], &pair[1]) != Ordering::Greater) {
+            OrderedChildren::Borrowed(children.iter())
+        } else {
+            let mut sorted: Vec<_> = children.iter().map(String::as_str).collect();
+            sorted.sort_by(|a, b| compare_layer_id(a, b));
+            OrderedChildren::Sorted(sorted.into_iter())
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -625,6 +683,36 @@ fn parent_id(id: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_child_traversal_preserves_numeric_order_and_reverse() {
+        let mut scene = Scene::new();
+        for id in ["1.10", "1.2", "1.-1", "1.caption", "1.2.child"] { scene.ensure(id); }
+        for id in ["missing", "1", "1.2", "1.2.child"] {
+            assert_eq!(scene.ordered_children(id).collect::<Vec<_>>(), scene.children_borrowed(id));
+            assert_eq!(scene.ordered_children(id).rev().collect::<Vec<_>>(), scene.children_borrowed(id).into_iter().rev().collect::<Vec<_>>());
+        }
+        assert!(matches!(scene.ordered_children("1.2"), OrderedChildren::Borrowed(_)));
+        scene.get_mut("1").unwrap().children.sort_by(|a,b| compare_layer_id(a,b));
+        assert!(matches!(scene.ordered_children("1"), OrderedChildren::Borrowed(_)));
+    }
+
+    #[test]
+    fn clock_query_reuses_unchanged_layers_and_reconciles_local_writes() {
+        let mut source = Scene::new();
+        source.create("1", Some("particle".into()));
+        let mut query = Scene::new();
+        let mut accepted = HashMap::new();
+        assert!(query.sync_query_layer_from(source.get("1").unwrap(), &mut accepted));
+        assert!(!query.sync_query_layer_from(source.get("1").unwrap(), &mut accepted));
+        // A source revision may be far ahead of the query scene's serial.
+        for _ in 0..10 { source.get_mut("1").unwrap().props.left = Some(42.0); }
+        assert!(query.sync_query_layer_from(source.get("1").unwrap(), &mut accepted));
+        query.get_mut("1").unwrap().props.left = Some(99.0);
+        assert!(query.sync_query_layer_from(source.get("1").unwrap(), &mut accepted));
+        assert_eq!(query.get("1").unwrap().props.left, Some(42.0));
+        assert!(!query.sync_query_layer_from(source.get("1").unwrap(), &mut accepted));
+    }
 
     #[test]
     fn incremental_query_matches_full_scene_through_structural_and_direct_mutations() {

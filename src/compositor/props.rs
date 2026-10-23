@@ -124,6 +124,34 @@ impl LayerProps {
         }
     }
 
+    /// Apply tween results without formatting and parsing known numeric fields.
+    /// Unusual values and string-backed properties retain the legacy path.
+    pub(crate) fn set_tween_value(&mut self, key: &str, value: f32) {
+        match key {
+            "left" | "x" => self.left = Some(value),
+            "top" | "y" => self.top = Some(value),
+            "width" => self.width = Some(value),
+            "height" => self.height = Some(value),
+            "anchorx" => self.anchor_x = Some(value),
+            "anchory" => self.anchor_y = Some(value),
+            "xscale" => self.x_scale = Some(value),
+            "yscale" => self.y_scale = Some(value),
+            "zoom" => { self.x_scale = Some(value); self.y_scale = Some(value); }
+            "rotate" => self.rotate = Some(value),
+            "alpha" if value.is_finite() && (0.0..=255.0).contains(&value) => self.alpha = Some(value.round() as u8),
+            "visible" | "reversex" | "reversey" | "grayscale" | "negative" => {
+                let rounded = value.round() as i64;
+                let target = match key {
+                    "visible" => &mut self.visible, "reversex" => &mut self.reverse_x,
+                    "reversey" => &mut self.reverse_y, "grayscale" => &mut self.grayscale,
+                    _ => &mut self.negative,
+                };
+                if rounded == 0 || rounded == 1 { *target = Some(rounded == 1); }
+            }
+            _ => self.set_raw(key, &Self::format_value(key, value)),
+        }
+    }
+
     /// 把缓动求得的数值格式化回属性字符串，交给 [`Self::set_raw`] 解析。
     ///
     /// alpha/visible 等整数属性按整数格式化，避免 "128.0" 落入浮点回退路径。
@@ -175,11 +203,16 @@ impl LayerProps {
         let (ax, ay) = self.anchor();
         let rot = self.rotation_radians();
 
-        glam::Affine2::from_translation(glam::Vec2::new(left, top))
-            * glam::Affine2::from_translation(glam::Vec2::new(ax, ay))
-            * glam::Affine2::from_angle(rot)
-            * glam::Affine2::from_scale(glam::Vec2::new(sx, sy))
-            * glam::Affine2::from_translation(glam::Vec2::new(-ax, -ay))
+        // T(offset + anchor) * R * S * T(-anchor), without four
+        // general affine products. Unrotated particle/group nodes need no trig.
+        let mut transform = if rot == 0.0 {
+            glam::Affine2::from_scale(glam::Vec2::new(sx, sy))
+        } else {
+            glam::Affine2::from_scale_angle_translation(glam::Vec2::new(sx, sy), rot, glam::Vec2::ZERO)
+        };
+        transform.translation = glam::Vec2::new(left + ax, top + ay)
+            - transform.matrix2 * glam::Vec2::new(ax, ay);
+        transform
     }
 
     /// 精灵裁剪矩形 `[x, y, w, h]`（纹理像素），未设置时返回 `None`（画整张）。
@@ -282,7 +315,50 @@ fn parse_name_list(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_affine_matches_anchor_rotation_scale_chain() {
+        use glam::{Affine2, Vec2};
+        for rotation in [0.0, 30.0, -90.0, 180.0, 359.0] {
+            for (sx, sy) in [(100.0, 100.0), (50.0, 200.0), (-100.0, 75.0), (0.0, 0.0)] {
+                for (ax, ay) in [(0.0, 0.0), (96.0, -54.0), (2048.0, 1024.0)] {
+                    let props = super::LayerProps { left: Some(123.5), top: Some(-42.25),
+                        x_scale: Some(sx), y_scale: Some(sy), rotate: Some(rotation),
+                        anchor_x: Some(ax), anchor_y: Some(ay), ..Default::default() };
+                    let scale = props.scale();
+                    let reference = Affine2::from_translation(Vec2::new(123.5, -42.25))
+                        * Affine2::from_translation(Vec2::new(ax, ay))
+                        * Affine2::from_angle(props.rotation_radians())
+                        * Affine2::from_scale(Vec2::new(scale.0, scale.1))
+                        * Affine2::from_translation(Vec2::new(-ax, -ay));
+                    for point in [Vec2::ZERO, Vec2::new(ax, ay), Vec2::new(960.0, 544.0)] {
+                        assert!((props.local_transform().transform_point2(point) - reference.transform_point2(point)).abs().max_element() < 0.001);
+                    }
+                }
+            }
+        }
+    }
     use super::*;
+
+    #[test]
+    fn numeric_tweens_match_string_roundtrip() {
+        for key in ["left","x","top","y","width","height","anchorx","anchory",
+            "xscale","yscale","zoom","rotate","alpha","visible","reversex","reversey",
+            "grayscale","negative","intermediate_render","shader","custom_tween"] {
+            for value in [-10000.125,-1.5,-0.5,-0.0,0.0,0.49,0.5,1.0,1.5,127.5,254.5,255.0,256.0,100000.125] {
+                let mut expected=LayerProps::default();expected.set_raw(key,"1");
+                let mut actual=expected.clone();
+                expected.set_raw(key,&LayerProps::format_value(key,value));actual.set_tween_value(key,value);
+                assert_eq!(actual,expected,"{key}={value}");
+            }
+        }
+        for key in ["alpha","visible","reversex","reversey","grayscale","negative"] {
+            for value in [f32::NAN,f32::INFINITY,f32::NEG_INFINITY] {
+                let mut expected=LayerProps::default();let mut actual=expected.clone();
+                expected.set_raw(key,&LayerProps::format_value(key,value));actual.set_tween_value(key,value);
+                assert_eq!(actual,expected,"{key}={value}");
+            }
+        }
+    }
 
     #[test]
     fn deserializes_legacy_props_without_shader_fields() {

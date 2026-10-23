@@ -47,8 +47,9 @@ pub(crate) struct SceneBuildCache {
     pub hits: u64,
     pub builds: u64,
     frames: u64,
+    pub profiling: bool,
     profile_frames: u64,
-    profile_ns: [u64;3],
+    profile_ns: [u64;7],
 }
 impl SceneBuildCache {
     pub fn begin(&mut self, revision: u64, retry: bool, dynamic: impl Iterator<Item = String>) {
@@ -57,7 +58,7 @@ impl SceneBuildCache {
         }
         self.revision = Some(revision);
         for values in self.shader_values.values_mut() { values.seen=false; }
-        if self.frames % 120 == 0 { self.profile_frames += 1; }
+        if self.profiling && self.frames % 120 == 0 { self.profile_frames += 1; }
         self.candidates.clear();
         let next_dynamic:HashSet<_>=dynamic.collect();
         if self.dynamic != next_dynamic {
@@ -77,13 +78,13 @@ impl SceneBuildCache {
     }
     // Sparse CPU diagnostics; all frame construction still executes normally.
     pub(super) fn profile_mark(&self)->Option<std::time::Instant> {
-        (self.frames % 120 == 0).then(std::time::Instant::now)
+        (self.profiling && self.frames % 120 == 0).then(std::time::Instant::now)
     }
     pub(super) fn profile_add(&mut self,slot:usize,start:Option<std::time::Instant>) {
         if let Some(start)=start {self.profile_ns[slot]+=start.elapsed().as_nanos() as u64;}
     }
-    pub fn profile_sample(&self)->Option<(u64,[u64;3])> {
-        (self.frames % 300 == 0 && self.profile_frames>0).then(||(self.profile_frames,self.profile_ns.map(|ns|ns/self.profile_frames/1000)))
+    pub fn profile_sample(&self)->Option<(u64,[u64;7])> {
+        (self.profiling && self.frames % 300 == 0 && self.profile_frames>0).then(||(self.profile_frames,self.profile_ns.map(|ns|ns/self.profile_frames/1000)))
     }
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -167,6 +168,9 @@ impl SceneBuildCache {
     }
     pub(super) fn is_dynamic_path(&self, id: &str) -> bool {
         self.dynamic.contains(id) || self.dynamic_ancestors.contains(id)
+    }
+    pub(super) fn has_host_content(&self, id: &str) -> bool {
+        self.dynamic.contains(id)
     }
     pub(super) fn candidate(&mut self, scene: &Scene, id: &str) -> bool {
         // Reject known live dependency paths before walking static siblings.

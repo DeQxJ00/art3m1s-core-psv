@@ -51,6 +51,10 @@ mod text;
 mod toolbar;
 
 impl CoreRuntime {
+    pub fn particle_active(&self) -> bool {
+        !self.video.is_fullscreen_playing()
+            && crate::compositor::effect_motion::has_particle_motion(self.compositor.scene(), self.compositor.clock_ms())
+    }
     pub fn effect_pan_active(&self) -> bool {
         !self.video.is_fullscreen_playing()
             && crate::compositor::effect_motion::has_effect_pan(self.compositor.scene(), self.compositor.clock_ms())

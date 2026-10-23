@@ -443,8 +443,8 @@ impl EmoteState {
             .collect()
     }
 
-    pub fn retain_scene_layers(&mut self, scene_ids: &HashSet<String>) {
-        self.layers.retain(|id, _| scene_ids.contains(id));
+    pub fn retain_scene_layers(&mut self, scene: &crate::compositor::Scene) {
+        self.layers.retain(|id, _| scene.get(id).is_some());
     }
 
     pub fn clear(&mut self) -> usize {
@@ -1323,13 +1323,7 @@ impl CoreRuntime {
         for id in attachments {
             self.compositor.ensure_layer(&id);
         }
-        let scene_ids = self
-            .compositor
-            .scene()
-            .iter_ids()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        self.emote.lock().unwrap().retain_scene_layers(&scene_ids);
+        self.emote.lock().unwrap().retain_scene_layers(self.compositor.scene());
     }
 
     pub(super) fn build_emote_commands(

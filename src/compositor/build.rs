@@ -154,12 +154,39 @@ fn visit(
     if layer.host_hidden || (layer.tweens.is_empty() && !layer.props.is_visible()) {
         return;
     }
+    // Moving grouping chains cannot replay static fragments. They carry only
+    // transforms/opacity, so bypass texture, material and host callback setup.
+    // Keep the general path for masks, declared shaders, clips and host content.
+    let moving_chain = !layer.tweens.is_empty() || (layer.children.len() == 1
+        && scene.get(&layer.children[0]).is_some_and(|child| !child.tweens.is_empty()));
+    let plain_container = !layer.children.is_empty()
+        && layer.file.as_deref().is_none_or(str::is_empty)
+        && file_overrides.is_none_or(|overrides| !overrides.contains_key(id))
+        && layer.solid_color.is_none() && layer.mask.is_none()
+        && layer.props.intermediate_render.unwrap_or(0) == 0
+        && layer.props.shader.is_none() && layer.props.clip.is_none()
+        && layer.props.custom.is_empty()
+        && layer.tweens.iter().all(|t| matches!(t.param.as_str(),
+            "left"|"x"|"top"|"y"|"anchorx"|"anchory"|"xscale"|"yscale"|"zoom"|"rotate"|"alpha"|"visible"|"reversex"|"reversey"));
+    let no_host_content = cache.as_deref().is_some_and(|c| !c.has_host_content(id))
+        || (content_for.is_none() && text_for.is_none());
+    if moving_chain && plain_container && no_host_content {
+        let props = resolved_props(layer, now_ms);
+        if !props.is_visible() { return; }
+        let world = parent_transform * props.local_transform();
+        let opacity = parent_opacity * props.opacity();
+        for child in scene.ordered_children(id) {
+            visit(scene, child, now_ms, world, opacity, parent_clip, inherited_shader.clone(), crop_allowed,
+                provider, frame, record_command_keys, content_for, text_for, file_overrides, cache);
+        }
+        return;
+    }
     // Live nodes and their ancestors cannot replay a static fragment. Keep
     // the cache available to their static children, without cloning parent shader state.
     // A leaf has no subtree traversal to amortize fragment bookkeeping.
     // Rebuild it directly; keep fragment reuse for multi-node static branches.
     let leaf = layer.children.is_empty();
-    if leaf || cache.as_deref().is_none_or(|c| c.is_dynamic_path(id)) {
+    if leaf || !layer.tweens.is_empty() || cache.as_deref().is_none_or(|c| c.is_dynamic_path(id)) {
         visit_uncached(scene,layer,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
             provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
         return;
@@ -191,13 +218,16 @@ fn visit_uncached(
     let id=layer.id.as_str();
 
     // 把进行中的缓动应用到属性副本上（不改动场景里的原始属性）。
+    let mark = cache.as_deref().and_then(|c| c.profile_mark());
     let props = resolved_props(layer, now_ms);
+    if let Some(c) = cache.as_deref_mut() { c.profile_add(3, mark); }
 
     // 隐藏的图层连同整棵子树一起跳过。
     if layer.host_hidden || !props.is_visible() {
         return;
     }
 
+    let mark = cache.as_deref().and_then(|c| c.profile_mark());
     let local = local_transform(&props);
     let world = parent_transform * local;
     let intermediate_mode = props.intermediate_render.unwrap_or(0);
@@ -215,18 +245,20 @@ fn visit_uncached(
         parent_opacity * props.opacity()
     };
     let clip_bounds = subtree_clip_bounds(&props, world, parent_clip, provider);
-    let children = scene.children_borrowed(id);
+    let children = scene.ordered_children(id);
     let local_shader = declared_shader(scene, id, &props, provider, cache);
     let group_shader = local_shader
         .as_ref()
         .and_then(|shader| shader.clone())
-        .filter(|_| intermediate_render || !children.is_empty());
+        .filter(|_| intermediate_render || children.len() != 0);
     let command_shader = if group_shader.is_some() {
         inherited_shader.clone()
     } else {
         local_shader.unwrap_or(inherited_shader.clone())
     };
     let group_start = frame.len();
+    if let Some(c) = cache.as_deref_mut() { c.profile_add(4, mark); }
+    let mark = cache.as_deref().and_then(|c| c.profile_mark());
 
     // 只有绑定了非空文件名且能解析到资源的节点才产出绘制命令；纯分组节点只传
     // 递变换。空文件名（Create 事件 file=""）不是纹理引用——跳过，否则
@@ -334,6 +366,7 @@ fn visit_uncached(
         );
     }
 
+    if let Some(c) = cache.as_deref_mut() { c.profile_add(5, mark); }
     // Host-owned layer content is local to this scene node and therefore
     // belongs before its child layers.
     if let Some(content) = content_for.as_deref_mut() {
@@ -371,6 +404,7 @@ fn visit_uncached(
     }
 
     // 文本注入：文本命令为层内局部坐标，乘入世界变换与不透明度。
+    let mark = cache.as_deref().and_then(|c| c.profile_mark());
     if let Some(tf) = text_for.as_deref_mut() {
         for (ordinal, mut cmd) in tf(id).into_iter().enumerate() {
             cmd.transform = world * cmd.transform;
@@ -454,6 +488,7 @@ fn visit_uncached(
             });
         }
     }
+    if let Some(c) = cache.as_deref_mut() { c.profile_add(6, mark); }
 }
 
 fn group_blend_uniform(props: &LayerProps) -> f32 {
@@ -558,7 +593,7 @@ pub(crate) fn resolved_props(
         let value = tween.value_at(now_ms);
         props
             .to_mut()
-            .set_raw(&tween.param, &LayerProps::format_value(&tween.param, value));
+            .set_tween_value(&tween.param, value);
     }
     props
 }
@@ -643,6 +678,35 @@ mod tests {
     use crate::compositor::mock::{MockProvider, TEXTURE_SIZE};
     use crate::render_pipeline::draw::{TextureId, TextureInfo};
     use std::collections::HashMap;
+
+    #[test]
+    fn moving_empty_groups_match_general_traversal_with_inherited_effects() {
+        let mut scene = Scene::new();
+        scene.create("1.0.0.image", Some("particle".into()));
+        scene.set_props("1", &raw(&[("alpha", "128"), ("intermediate_render", "1"), ("clip", "0,0,960,540")]));
+        scene.set_props("1.0", &raw(&[("left", "480"), ("rotate", "-17"), ("anchorx", "11")]));
+        scene.get_mut("1.0.0").unwrap().tweens.push(Tween {
+            param: "left".into(), from: -500.0, to: 1200.0, start_ms: 0,
+            duration_ms: 1000, easing: Easing::Linear, infinite_loop: true,
+            loop_count: None, yoyo: false, yoyo_reverse: false, loop_delay_ms: 0,
+            handler: None, delete_on_finish: false, set_id: None,
+        });
+        let mut provider = MockProvider::new();
+        for now in [0, 500, 999, 1000, 1500] {
+            let optimized = build_frame(&scene, now, &mut provider, None);
+            // Unknown host callbacks force the original generic container path.
+            let mut no_text = |_: &str| Vec::new();
+            let reference = build_frame(&scene, now, &mut provider, Some(&mut no_text));
+            assert_eq!(optimized, reference);
+        }
+        // An edited container acquires visual content and must not be skipped.
+        let edits = HashMap::from([("1.0.0".into(), "edited".into())]);
+        let optimized = build_frame_with_content(&scene, 500, &mut provider, None, None, Some(&edits));
+        let mut no_text = |_: &str| Vec::new();
+        let reference = build_frame_with_content(&scene, 500, &mut provider, None, Some(&mut no_text), Some(&edits));
+        assert_eq!(optimized, reference);
+        assert_eq!(optimized.commands.len(), 2);
+    }
 
     fn raw(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

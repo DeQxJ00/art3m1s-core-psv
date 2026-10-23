@@ -62,11 +62,24 @@ impl Compositor {
         if !root_props.is_visible() {
             return hits;
         }
+        // Only interactive nodes and their ancestors need geometry evaluation.
+        // Rebuild from live handlers so enable/disable, rename and load apply
+        // immediately. Borrow IDs; a particle-only subtree allocates nothing.
+        let mut interactive_paths = HashSet::new();
+        for layer in self.scene.all_layers().filter(|l| l.event_handlers.values().any(|h| h.enabled)) {
+            let mut path = layer.id.as_str();
+            loop {
+                if !interactive_paths.insert(path) { break; }
+                let Some((parent, _)) = path.rsplit_once('.') else { break; };
+                path = parent;
+            }
+        }
+        if interactive_paths.is_empty() { return hits; }
         let root_transform = root_props.local_transform();
         let roots = self.scene.roots_borrowed();
         let scale = self.stage_scale;
         for root in roots.iter().rev() {
-            self.hit_test_subtree(root, root_transform, x, y, scale, provider, &mut hits);
+            self.hit_test_subtree(root, root_transform, x, y, scale, provider, &mut hits, &interactive_paths);
         }
         hits
     }
@@ -80,10 +93,19 @@ impl Compositor {
         scale: f32,
         provider: &mut dyn TextureProvider,
         hits: &mut Vec<String>,
+        interactive_paths: &HashSet<&str>,
     ) {
+        if !interactive_paths.contains(id) { return; }
         let Some(layer) = self.scene.get(id) else {
             return;
         };
+        let interactive = layer.event_handlers.values().any(|handler| handler.enabled);
+        // Decorative leaves cannot receive input. In particular, particle
+        // tweens need no property clones or matrices for pointer sampling.
+        // Containers must still pass their animated transform to children.
+        if layer.host_hidden || (layer.children.is_empty() && !interactive) {
+            return;
+        }
         // Match the render path: an in-flight `lytween` changes the geometry
         // visible on screen without mutating the base properties until it
         // finishes.  Hit testing the base props would leave the interactive
@@ -99,13 +121,12 @@ impl Compositor {
         // 先递归检测子层（高 z-order 优先，reverse 遍历）。
         // 注意按 Artemis 图层顺序排序（与绘制次序一致），不能用原始插入顺序，
         // 否则命中的 z-order 与画面不符。
-        let children = self.scene.children_borrowed(id);
-        for child_id in children.iter().rev() {
-            self.hit_test_subtree(child_id, world, mx, my, scale, provider, hits);
+        for child_id in self.scene.ordered_children(id).rev() {
+            self.hit_test_subtree(child_id, world, mx, my, scale, provider, hits, interactive_paths);
         }
 
         // 再检测本层：注册了任意事件处理器。
-        if layer.event_handlers.values().any(|handler| handler.enabled) {
+        if interactive {
             // 宽高优先级：
             // 1. props.width/height（显式设置的逻辑尺寸）
             // 2. clip 的宽高（精灵表裁剪区域，已经是逻辑坐标）

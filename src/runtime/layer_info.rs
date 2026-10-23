@@ -17,9 +17,9 @@ pub(super) struct LayerQueryState {
 
 impl LayerQueryState {
     pub fn sync_clock(&mut self, scene: &Compositor, mut cached: impl FnMut(&str) -> Option<TextureInfo>) {
-        let ids = self.scene.sync_query_clock_from(scene);
+        let ids = self.scene.sync_query_clock_from(scene, &mut self.accepted_revisions);
         for id in ids {
-            if let Some(file) = self.scene.scene().get(&id).and_then(|layer| layer.file.as_ref())
+            if let Some(file) = self.scene.scene().get(id).and_then(|layer| layer.file.as_ref())
                 && let Some(info) = cached(file)
             {
                 self.dimensions.insert(file.clone(), Some((info.width, info.height)));

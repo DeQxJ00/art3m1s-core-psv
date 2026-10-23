@@ -1448,6 +1448,13 @@ pub unsafe extern "C" fn art3m1s_runtime_effect_pan_active(rt: *const CoreRuntim
     unsafe { rt.as_ref() }.is_some_and(|rt| rt.effect_pan_active()) as i32
 }
 
+/// Read-only dense image motion for host clock policy; null is inactive.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_particle_active(rt: *const CoreRuntime) -> i32 {
+    unsafe { rt.as_ref() }.is_some_and(|rt| rt.particle_active()) as i32
+}
+
 /// Read-only E-mote scene presence for host clock policy; null is inactive.
 #[cfg(feature = "gl-backend")]
 #[unsafe(no_mangle)]

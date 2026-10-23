@@ -34,6 +34,11 @@ fn visible(layer: &Layer, now: u64) -> bool {
 
 pub(crate) fn has_effect_pan(scene: &Scene, now: u64) -> bool {
     if !scene.root_props().is_visible() || scene.root_props().alpha == Some(0) { return false; }
+    // Particle-only motion cannot activate a filter boost. Reject it before
+    // evaluating visibility tweens along every image's ancestor chain.
+    if !effect(scene.root_props()) && !scene.all_layers().any(|l| effect(&l.props) || l.mask.is_some()) {
+        return false;
+    }
     // Most held dialogue scenes have no translation tween at all. Avoid
     // repeatedly walking every image's ancestor chain in that common case.
     // Keep the exact time/loop predicate so a delayed tween activates on time.
@@ -59,6 +64,33 @@ pub(crate) fn has_effect_pan(scene: &Scene, now: u64) -> bool {
     })
 }
 
+/// Dense looping image motion (snow/rain/etc.), independent of model/video
+/// rendering. Count visible image branches, not tween parameters or redraws.
+pub(crate) fn has_particle_motion(scene: &Scene, now: u64) -> bool {
+    if !scene.root_props().is_visible() || scene.root_props().alpha == Some(0) { return false; }
+    if !scene.all_layers().any(|l| l.tweens.iter().any(|t| (t.infinite_loop || t.loop_count.is_some()) && moving(t, now))) {
+        return false;
+    }
+    let mut count = 0;
+    for leaf in scene.all_layers().filter(|l| l.file.as_deref().is_some_and(|f| !f.is_empty())) {
+        let mut looping = false;
+        let mut shown = true;
+        let mut id = Some(leaf.id.as_str());
+        while let Some(current) = id {
+            if let Some(layer) = scene.get(current) {
+                if layer.host_hidden || !visible(layer, now) { shown = false; break; }
+                looping |= layer.tweens.iter().any(|t| (t.infinite_loop || t.loop_count.is_some()) && moving(t, now));
+            }
+            id = current.rsplit_once('.').map(|(parent, _)| parent);
+        }
+        if shown && looping {
+            count += 1;
+            if count >= 32 { return true; }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +104,27 @@ mod tests {
         let mut s=Scene::new();s.set_file("1.0",Some("image.png".into()));
         s.get_mut("1").unwrap().props.shader=Some("blur".into());
         s.get_mut("1.0").unwrap().tweens.push(pan());s
+    }
+    #[test] fn dense_looping_images_clock_policy() {
+        let mut s=Scene::new();
+        for i in 0..31 { s.set_file(&format!("1.{i}"),Some("particle.png".into())); }
+        s.get_mut("1").unwrap().tweens.push(Tween{infinite_loop:true,loop_delay_ms:500,..pan()});
+        assert!(!has_particle_motion(&s,200));
+        s.set_file("1.31",Some("particle.png".into()));
+        assert!(!has_particle_motion(&s,99));
+        assert!(has_particle_motion(&s,200));
+        assert!(!has_particle_motion(&s,1200));
+        assert!(has_particle_motion(&s,1600));
+        s.get_mut("1").unwrap().host_hidden=true;assert!(!has_particle_motion(&s,200));
+        s.get_mut("1").unwrap().host_hidden=false;
+        s.get_mut("1").unwrap().props.alpha=Some(0);assert!(!has_particle_motion(&s,200));
+        s.get_mut("1").unwrap().props.alpha=None;
+        s.get_mut("1").unwrap().tweens[0].infinite_loop=false;
+        assert!(!has_particle_motion(&s,200));
+        s.get_mut("1").unwrap().tweens[0].loop_count=Some(2);
+        assert!(has_particle_motion(&s,200));
+        s.get_mut("1").unwrap().props.visible=Some(false);
+        assert!(!has_particle_motion(&s,200));
     }
     #[test] fn active_interval_and_visibility() {
         let mut s=scene();

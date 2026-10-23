@@ -163,7 +163,9 @@ impl Compositor {
     }
 
     pub fn scene_snapshot(&self) -> Scene {
-        self.scene.clone()
+        let mut snapshot = self.scene.clone();
+        snapshot.saved_clock_ms = Some(self.clock_ms);
+        snapshot
     }
 
     /// Refresh the CPU-only projection used by synchronous script queries.
@@ -197,28 +199,33 @@ impl Compositor {
     /// Clock ticks can only change animated layers. Script/structural changes
     /// still use the full synchronization path. Include previously animated
     /// layers so completed tweens and deleted subtrees are exported as well.
-    pub(crate) fn sync_query_clock_from(&mut self, other: &Self) -> HashSet<String> {
-        let ids: HashSet<String> = self.scene.all_layers()
-            .chain(other.scene.all_layers())
-            .filter(|layer| !layer.tweens.is_empty())
-            .map(|layer| layer.id.clone())
-            .chain(self.anime_states.keys().cloned())
-            .chain(other.anime_states.keys().cloned())
-            .collect();
-        self.clock_ms = other.clock_ms;
-        for id in &ids {
-            if let Some(layer) = other.scene.get(id) {
-                self.scene.ensure(id);
-                self.scene.get_mut(id).unwrap().clone_from(layer);
-            } else {
-                self.scene.delete(id);
+    pub(crate) fn sync_query_clock_from<'a>(&mut self, other: &'a Self, accepted: &mut HashMap<String, (u64, u64)>) -> Vec<&'a str> {
+        let is_animated = |layer: &super::scene::Layer| !layer.tweens.is_empty() || other.anime_states.contains_key(&layer.id);
+        let mut layers: Vec<_> = other.scene.all_layers().filter(|layer| is_animated(layer)).collect();
+        let mut deleted = Vec::new();
+        // Current and previous animation sets overlap almost completely. Borrow
+        // current nodes and append only completed ones, rather than allocating
+        // and hashing two copies of every long particle ID on every tick.
+        for old in self.scene.all_layers().filter(|layer| !layer.tweens.is_empty() || self.anime_states.contains_key(&layer.id)) {
+            match other.scene.get(&old.id) {
+                Some(layer) if !is_animated(layer) => layers.push(layer),
+                None => deleted.push(old.id.clone()),
+                _ => {}
             }
+        }
+        self.clock_ms = other.clock_ms;
+        for layer in &layers {
+            self.scene.sync_query_layer_from(layer, accepted);
+        }
+        for id in deleted {
+            self.scene.delete(&id);
+            accepted.remove(&id);
         }
         self.anime_states.retain(|id, _| other.anime_states.contains_key(id));
         for (id, state) in &other.anime_states {
             self.anime_states.entry(id.clone()).or_insert_with(|| state.clone());
         }
-        ids
+        layers.into_iter().map(|layer| layer.id.as_str()).collect()
     }
 
     pub fn ensure_layer(&mut self, id: &str) {
@@ -233,7 +240,19 @@ impl Compositor {
         self.scene.clear_file_if_matches(id, expected);
     }
 
-    pub fn restore_scene(&mut self, scene: Scene) {
+    pub fn restore_scene(&mut self, mut scene: Scene) {
+        if let Some(clock) = scene.saved_clock_ms.take() {
+            self.clock_ms = clock;
+        } else {
+            // Old saves omitted the clock. Exact phase cannot be recovered,
+            // but looping particles must not wait for a previous session's uptime.
+            // Leave non-looping/delayed timelines under their existing semantics.
+            if let Some(start) = scene.all_layers().flat_map(|l| &l.tweens)
+                .filter(|t| t.infinite_loop || t.loop_count.is_some())
+                .map(|t| t.start_ms).max() {
+                self.clock_ms = self.clock_ms.max(start);
+            }
+        }
         self.scene.replace_with(scene);
         self.pending_tween_events.clear();
     }
@@ -969,6 +988,34 @@ mod tests {
     use asb_interpreter::Event;
     use asb_interpreter::event::LayerEvent;
 
+    fn looping_particle() -> super::anim::Tween {
+        super::anim::Tween { param:"left".into(),from:1100.,to:-100.,easing:super::anim::Easing::Linear,
+            start_ms:350000,duration_ms:4000,infinite_loop:true,loop_count:None,
+            yoyo:false,yoyo_reverse:false,loop_delay_ms:0,delete_on_finish:false,handler:None,set_id:None }
+    }
+    #[test]
+    fn saved_scene_restores_particle_clock_after_restart() {
+        let mut original=Compositor::new();original.clock_ms=351234;
+        original.scene.ensure("1.0");original.scene.get_mut("1.0").unwrap().tweens.push(looping_particle());
+        let snapshot=original.scene_snapshot();
+        let bytes=serde_json::to_vec(&snapshot).unwrap();
+        for clock in [1000,900000] {
+            let mut loaded=Compositor::new();loaded.clock_ms=clock;
+            loaded.restore_scene(serde_json::from_slice(&bytes).unwrap());
+            assert_eq!(loaded.clock_ms,original.clock_ms);
+            let layer=loaded.scene.get("1.0").unwrap();
+            assert_eq!(layer.tweens[0].value_at(loaded.clock_ms),looping_particle().value_at(original.clock_ms));
+            loaded.advance(16);assert_eq!(loaded.clock_ms,351250);
+        }
+    }
+    #[test]
+    fn legacy_looping_scene_does_not_wait_for_old_session_uptime() {
+        let mut scene=Scene::new();scene.ensure("1");scene.get_mut("1").unwrap().tweens.push(looping_particle());
+        let mut loaded=Compositor::new();loaded.clock_ms=1000;loaded.restore_scene(scene);
+        loaded.advance(2000);
+        assert_eq!(loaded.scene.get("1").unwrap().tweens[0].value_at(loaded.clock_ms),500.);
+    }
+
     struct AlphaProvider {
         alpha: u8,
     }
@@ -1148,11 +1195,12 @@ mod tests {
         });
         let mut incremental = Compositor::new();
         incremental.sync_query_scene_from(&source);
+        let mut accepted = HashMap::new();
         // Waiting for the tween does not change its value or lose completion.
         assert!(!source.advance(50));
         for step in [100, 500, 600] {
             source.advance(step);
-            incremental.sync_query_clock_from(&source);
+            incremental.sync_query_clock_from(&source, &mut accepted);
             let mut full = Compositor::new();
             full.sync_query_scene_from(&source);
             assert_eq!(serde_json::to_value(incremental.scene()).unwrap(), serde_json::to_value(full.scene()).unwrap());
@@ -1558,6 +1606,25 @@ mod tests {
         let mut provider = MockProvider::new();
         let frame = crate::render_pipeline::RenderPipeline::new(&c).build(&mut provider);
         assert!((frame.commands[0].transform.translation.x - 50.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn decorative_animated_parent_still_transforms_interactive_child() {
+        let mut c = Compositor::new();
+        c.apply_event(&create("1.button", "button"));
+        c.apply_event(&create("1.snow", "particle"));
+        c.scene.get_mut("1.button").unwrap().props.width = Some(20.0);
+        c.scene.get_mut("1.button").unwrap().props.height = Some(20.0);
+        c.scene.get_mut("1.button").unwrap().event_handlers.insert("click".into(),
+            LayerEventHandler { enabled: true, ..Default::default() });
+        c.apply_event(&set_tween("1", "left", "0", "100", 1000));
+        c.apply_event(&set_tween("1.snow", "top", "0", "100", 1000));
+        c.advance(500);
+        let mut provider = MockProvider::new();
+        assert_eq!(c.hit_test_all(55.0, 5.0, &mut provider), vec!["1.button"]);
+        assert!(c.hit_test_all(5.0, 5.0, &mut provider).is_empty());
+        c.scene.get_mut("1.button").unwrap().event_handlers.get_mut("click").unwrap().enabled = false;
+        assert!(c.hit_test_all(55.0, 5.0, &mut provider).is_empty());
     }
 
     #[test]
