@@ -1,6 +1,6 @@
 //! CPU-only fragments for static image subtrees; text/content stay live.
 use super::scene::Scene;
-use crate::render_pipeline::draw::{DrawList, ShaderEffect};
+use crate::render_pipeline::draw::{DrawCommand, DrawList, ShaderEffect};
 use glam::Affine2;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use super::props::LayerProps;
@@ -27,6 +27,13 @@ struct ShaderValues {
     values: BTreeMap<String, Vec<f32>>,
     seen: bool,
 }
+struct SpriteEntry {
+    revision: u64,
+    file: String,
+    crop_allowed: bool,
+    command: DrawCommand,
+    seen: bool,
+}
 struct Entry {
     parent: ParentState,
     nodes: Vec<Stamp>,
@@ -36,6 +43,7 @@ struct Entry {
 #[derive(Default)]
 pub(crate) struct SceneBuildCache {
     entries: HashMap<String, Entry>,
+    sprites: HashMap<String, SpriteEntry>,
     shader_values: HashMap<String, ShaderValues>,
     dynamic: HashSet<String>,
     // A live descendant invalidates only its ancestors, not sibling fragments.
@@ -55,8 +63,10 @@ impl SceneBuildCache {
     pub fn begin(&mut self, revision: u64, retry: bool, dynamic: impl Iterator<Item = String>) {
         if retry || self.revision != Some(revision) {
             self.entries.clear();
+            self.sprites.clear();
         }
         self.revision = Some(revision);
+        for sprite in self.sprites.values_mut() { sprite.seen=false; }
         for values in self.shader_values.values_mut() { values.seen=false; }
         if self.profiling && self.frames % 120 == 0 { self.profile_frames += 1; }
         self.candidates.clear();
@@ -88,11 +98,13 @@ impl SceneBuildCache {
     }
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.sprites.clear();
         self.shader_values.clear();
         self.candidates.clear();
         self.revision = None;
     }
     pub fn finish(&mut self) {
+        self.sprites.retain(|_, sprite| sprite.seen);
         self.entries.retain(|_, entry| entry.seen);
         self.shader_values.retain(|_, values| values.seen);
         self.frames += 1;
@@ -168,6 +180,22 @@ impl SceneBuildCache {
     }
     pub(super) fn is_dynamic_path(&self, id: &str) -> bool {
         self.dynamic.contains(id) || self.dynamic_ancestors.contains(id)
+    }
+    // Local sprite geometry/material is independent of moving parents. Texture
+    // generations and retry clear these CPU templates; retain still pins the
+    // actual texture IDs emitted into the current frame.
+    pub(super) fn sprite(&mut self, layer: &super::scene::Layer, crop_allowed: bool) -> Option<DrawCommand> {
+        let entry=self.sprites.get_mut(&layer.id)?;
+        if entry.revision!=layer.query_revision || entry.crop_allowed!=crop_allowed
+            || Some(entry.file.as_str())!=layer.file.as_deref() { return None; }
+        entry.seen=true;
+        Some(entry.command.clone())
+    }
+    pub(super) fn store_sprite(&mut self, layer: &super::scene::Layer, crop_allowed: bool, command: DrawCommand) {
+        if self.sprites.len()>=512 && !self.sprites.contains_key(&layer.id) { return; }
+        let Some(file)=layer.file.as_ref() else { return; };
+        self.sprites.insert(layer.id.clone(),SpriteEntry{revision:layer.query_revision,file:file.clone(),
+            crop_allowed,command,seen:true});
     }
     pub(super) fn has_host_content(&self, id: &str) -> bool {
         self.dynamic.contains(id)
@@ -420,6 +448,51 @@ mod tests {
     }
 
     #[test]
+    fn sprite_templates_follow_moving_parents_and_invalidate_live_inputs() {
+        use crate::compositor::{Tween,Easing};
+        let mut s=Scene::new();s.create("1.move.sprite",Some("particle".into()));
+        s.get_mut("1").unwrap().props.intermediate_render=Some(1);
+        s.get_mut("1").unwrap().props.clip=Some([0.,0.,960.,540.]);
+        s.get_mut("1").unwrap().props.alpha=Some(128);
+        s.get_mut("1.move").unwrap().tweens.push(Tween{
+            param:"left".into(),from:-400.,to:1000.,start_ms:0,duration_ms:1000,
+            infinite_loop:true,easing:Easing::Linear,loop_count:None,yoyo:false,
+            yoyo_reverse:false,loop_delay_ms:0,delete_on_finish:false,handler:None,set_id:None});
+        let p=&mut s.get_mut("1.move.sprite").unwrap().props;
+        p.rotate=Some(30.);p.anchor_x=Some(12.);p.alpha=Some(160);
+        p.clip=Some([16.,32.,40.,50.]);p.layer_mode=Some("add".into());
+        p.color_multiply=Some([0.5,0.75,1.]);
+        let mut provider=Provider::default();let mut c=SceneBuildCache::default();
+        let mut check_sprite=|s:&Scene,c:&mut SceneBuildCache,now,revision,retry,edits:Option<&HashMap<String,String>>|{
+            c.begin(revision,retry,std::iter::empty());provider.resolves=0;
+            let got=build_frame_reusing_cached(s,now,&mut provider,None,None,edits,true,DrawList::new(),Some(c));
+            let resolves=provider.resolves;c.finish();
+            let expected=build_frame_reusing_cached(s,now,&mut provider,None,None,edits,true,DrawList::new(),None);
+            assert_eq!(got,expected);resolves
+        };
+        assert_eq!(check_sprite(&s,&mut c,0,1,false,None),1);
+        for now in [100,500,999,1000,1600] {assert_eq!(check_sprite(&s,&mut c,now,1,false,None),0);}
+        // Texture replacement/retry must reach the provider again.
+        assert_eq!(check_sprite(&s,&mut c,1700,2,false,None),1);
+        assert_eq!(check_sprite(&s,&mut c,1800,2,true,None),1);
+        s.get_mut("1.move.sprite").unwrap().props.reverse_x=Some(true);
+        assert_eq!(check_sprite(&s,&mut c,1900,2,false,None),1);
+        s.set_file("1.move.sprite",Some("replacement".into()));
+        assert_eq!(check_sprite(&s,&mut c,1950,2,false,None),1);
+        // A parent shader switches sparse versus full texture eligibility.
+        s.get_mut("1.move").unwrap().props.shader=Some("tone".into());
+        assert_eq!(check_sprite(&s,&mut c,2000,2,false,None),1);
+        assert_eq!(check_sprite(&s,&mut c,2100,2,false,None),0);
+        let edits=HashMap::from([("1.move.sprite".into(),"edited".into())]);
+        assert_eq!(check_sprite(&s,&mut c,2200,2,false,Some(&edits)),1);
+        s.get_mut("1.move.sprite").unwrap().mask=Some("mask".into());
+        check_sprite(&s,&mut c,2300,2,false,None);
+        s.get_mut("1.move.sprite").unwrap().host_hidden=true;
+        assert_eq!(check_sprite(&s,&mut c,2400,2,false,None),0);
+        assert!(c.sprites.is_empty());
+    }
+
+    #[test]
     fn cached_images_keep_live_text_and_relocate_group_masks() {
         let s = scene();
         let mut p = Provider::default();
@@ -435,7 +508,7 @@ mod tests {
             c.begin(1, false, std::iter::once("0".into()));
             frame(&s, &mut p, Some(&mut c), 88, None, keys);
             c.finish();
-            assert_eq!(p.resolves, 2, "live glyph and standalone leaf resolve; grouped images reuse their fragment");
+            assert_eq!(p.resolves, 1, "only live glyph resolves; static leaves and grouped images reuse CPU templates");
         }
     }
     #[test]

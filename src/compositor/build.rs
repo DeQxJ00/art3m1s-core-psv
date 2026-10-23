@@ -181,6 +181,35 @@ fn visit(
         }
         return;
     }
+    // Static image leaves under moving groups keep local sprite geometry.
+    // Apply parent transform, alpha, clip and shader afresh on every frame.
+    // Host-owned content and any local effect stay on the general path.
+    let static_sprite = layer.children.is_empty() && layer.tweens.is_empty()
+        && layer.file.as_deref().is_some_and(|file| !file.is_empty())
+        && file_overrides.is_none_or(|edits| !edits.contains_key(id))
+        && layer.mask.is_none() && layer.props.intermediate_render.unwrap_or(0)==0
+        && layer.props.shader.is_none() && layer.props.custom.is_empty()
+        && cache.as_deref().is_some_and(|c| !c.has_host_content(id));
+    if static_sprite {
+        let cached=cache.as_deref_mut().and_then(|c|c.sprite(layer,crop_allowed));
+        let command=cached.or_else(|| {
+            let mut local=DrawList::new();
+            visit_uncached(scene,layer,now_ms,Affine2::IDENTITY,1.0,None,None,crop_allowed,
+                provider,&mut local,false,&mut None,&mut None,None,&mut None);
+            if local.commands.len()!=1 { return None; }
+            let command=local.commands.pop()?;
+            if let Some(c)=cache.as_deref_mut(){c.store_sprite(layer,crop_allowed,command.clone());}
+            Some(command)
+        });
+        if let Some(mut command)=command {
+            command.transform=parent_transform*command.transform;
+            command.opacity*=parent_opacity;
+            command.clip_bounds=parent_clip;
+            command.shader=inherited_shader;
+            push_scene_command(frame,record_command_keys,id,LayerCommandKind::Visual,0,command);
+        }
+        return;
+    }
     // Live nodes and their ancestors cannot replay a static fragment. Keep
     // the cache available to their static children, without cloning parent shader state.
     // A leaf has no subtree traversal to amortize fragment bookkeeping.
