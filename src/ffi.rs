@@ -795,6 +795,21 @@ pub fn query_asset_size(path: &str) -> Option<u64> {
 
 // ── File operations ──────────────────────────────────────────────
 
+/// Fit a bounded PNG/JPEG into a transparent 288x162 launcher cover.
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_launcher_decode_cover(
+    bytes: *const u8, len: usize, output: *mut u8, output_len: usize,
+) -> c_int {
+    if bytes.is_null() || output.is_null() || len < 8 || len > 8*1024*1024
+        || output_len != 288*162*4 { return 0; }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        i32::from(crate::image_decode::launcher_cover(
+            unsafe { std::slice::from_raw_parts(bytes,len) },
+            unsafe { std::slice::from_raw_parts_mut(output,output_len) }))
+    })).unwrap_or(0)
+}
+
 /// Decode a bounded optional launcher PNG into a fixed 48x48 RGBA tile.
 /// The caller owns both buffers; zero means invalid input or decode failure.
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]

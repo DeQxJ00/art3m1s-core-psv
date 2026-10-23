@@ -4,6 +4,33 @@ use image::{ColorType, ImageDecoder, ImageError, ImageResult, RgbaImage};
 
 pub(crate) const LAUNCHER_ICON_SIDE: usize = 48;
 
+pub(crate) fn launcher_cover(bytes: &[u8], output: &mut [u8]) -> bool {
+    if bytes.len() > 8 * 1024 * 1024 || output.len() != 288 * 162 * 4 { return false; }
+    let source = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes))
+            .map_err(ImageError::from).and_then(|d| rgba(d, 32 * 1024 * 1024))
+    } else if bytes.starts_with(&[0xff, 0xd8]) {
+        image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes))
+            .map_err(ImageError::from).and_then(|d| rgba(d, 32 * 1024 * 1024))
+    } else { return false; };
+    let Ok(source) = source else { return false; };
+    let (sw,sh)=source.dimensions();
+    if sw==0 || sh==0 { return false; }
+    let scale=(288.0/sw as f64).min(162.0/sh as f64);
+    let w=(sw as f64*scale).round().clamp(1.0,288.0) as u32;
+    let h=(sh as f64*scale).round().clamp(1.0,162.0) as u32;
+    let thumb = image::imageops::resize(&source, w, h, image::imageops::FilterType::Triangle);
+    output.fill(0);
+    let (w,h) = thumb.dimensions();
+    let (x,y) = ((288-w)/2, (162-h)/2);
+    for row in 0..h as usize {
+        let dst = ((y as usize + row)*288+x as usize)*4;
+        let src = row*w as usize*4;
+        output[dst..dst+w as usize*4].copy_from_slice(&thumb.as_raw()[src..src+w as usize*4]);
+    }
+    true
+}
+
 pub(crate) fn launcher_icon(png: &[u8], output: &mut [u8]) -> bool {
     if output.len() != LAUNCHER_ICON_SIDE * LAUNCHER_ICON_SIDE * 4
         || png.len() > 2 * 1024 * 1024
@@ -114,6 +141,23 @@ pub(crate) fn rgba_into(decoder: impl ImageDecoder, data:&mut [u8], limit:usize)
 mod tests {
     use super::*;
     use image::ImageEncoder;
+    #[test]
+    fn cover_png_and_jpeg_fit_without_cropping() {
+        let source=vec![180u8;32*64*3];
+        let mut png=Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png).write_image(&source,32,64,ColorType::Rgb8.into()).unwrap();
+        let mut jpeg=Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg).write_image(&source,32,64,ColorType::Rgb8.into()).unwrap();
+        for data in [&png,&jpeg] {
+            let mut output=vec![99;288*162*4];
+            assert!(launcher_cover(data,&mut output));
+            assert_eq!(&output[..4], &[0,0,0,0]);
+            assert_eq!(output[(81*288+144)*4+3],255);
+            assert_eq!(output.chunks_exact(4).filter(|p|p[3]!=0).count(),81*162);
+            assert!(!launcher_cover(&data[..8],&mut output));
+            assert!(!launcher_cover(data,&mut output[..16]));
+        }
+    }
     #[test]
     fn launcher_icon_centers_png_and_preserves_alpha() {
         let mut png = Vec::new();
