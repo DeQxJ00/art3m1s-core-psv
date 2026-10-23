@@ -28,6 +28,7 @@ mod native_texture;
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 mod image_cache_budget;
 mod cache_hud;
+mod emote_astc;
 mod ui_image_lifetime;
 #[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
 mod resource_ledger;

@@ -8,6 +8,7 @@ edition = "2024"
 path = "src/lib.rs"
 
 [dependencies]
+texture2ddecoder = "0.1.2"
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }

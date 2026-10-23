@@ -51,6 +51,9 @@ dependencies = [
 [[package]]
 name = "art3m1s-emote"
 version = "0.1.0-alpha.1"
+dependencies = [
+ "texture2ddecoder",
+]
 
 [[package]]
 name = "asb-decrypt"

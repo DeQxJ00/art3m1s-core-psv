@@ -4,6 +4,7 @@ use crate::{EmoteError, PsbDocument, PsbResourceData, PsbValue, ResourceRef, Res
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextureFormat {
+    Astc4x4,
     Dxt5,
     Dxt5Swizzled,
     Dxt1,
@@ -125,6 +126,7 @@ impl EmoteAtlas {
             .ok_or_else(|| EmoteError::InvalidFormat(format!("unknown texture {id}")))?;
         let bytes = document.resource(texture.resource)?;
         match texture.format {
+            TextureFormat::Astc4x4 => crate::astc::decode_rgba8(bytes, texture.width, texture.height),
             TextureFormat::Dxt5 => decode_dxt5(bytes, texture.width, texture.height),
             TextureFormat::Dxt1 => decode_dxt1(bytes, texture.width, texture.height),
             TextureFormat::Dxt5Swizzled | TextureFormat::Dxt1Swizzled => {
@@ -145,6 +147,7 @@ impl EmoteAtlas {
             .texture(id)
             .ok_or_else(|| EmoteError::InvalidFormat(format!("unknown texture {id}")))?;
         match texture.format {
+            TextureFormat::Astc4x4 => crate::astc::decode_rgba8(bytes, texture.width, texture.height),
             TextureFormat::Dxt5 => decode_dxt5(bytes, texture.width, texture.height),
             TextureFormat::Dxt1 => decode_dxt1(bytes, texture.width, texture.height),
             TextureFormat::Dxt5Swizzled | TextureFormat::Dxt1Swizzled => {
@@ -174,6 +177,7 @@ fn parse_texture(id: &str, value: &PsbValue) -> Result<EmoteTexture> {
         } else if format.eq_ignore_ascii_case("DXT5_SWIZZLED") { TextureFormat::Dxt5Swizzled
         } else if format.eq_ignore_ascii_case("DXT1") || format.eq_ignore_ascii_case("DXT1_LINEAR") { TextureFormat::Dxt1
         } else if format.eq_ignore_ascii_case("DXT1_SWIZZLED") { TextureFormat::Dxt1Swizzled
+        } else if format.eq_ignore_ascii_case("ASTC_8BPP") { TextureFormat::Astc4x4
         } else if format.eq_ignore_ascii_case("RGBA8") {
             TextureFormat::Rgba8
         } else {
@@ -213,6 +217,7 @@ fn validate_texture_resource(document: &PsbDocument, texture: &EmoteTexture) -> 
     if texture.format == TextureFormat::Rgba8 {
         validate_rgba8(bytes, texture.width, texture.height)?;
     }
+    if texture.format == TextureFormat::Astc4x4 { crate::astc::validate(bytes,texture.width,texture.height)?; }
     if let Some((bc1,swizzled))=texture.format.s3tc_layout() {
         let expected=crate::bc_layout::payload_len(texture.width,texture.height,bc1,swizzled)
             .ok_or_else(||EmoteError::InvalidFormat("S3TC dimensions outside GXM limits".into()))?;
@@ -472,5 +477,24 @@ mod tests {
         }
         let rgba=decode_dxt1(&[0,0,0xff,0xff,0xff,0xff,0xff,0xff],4,4).unwrap();
         assert!(rgba.chunks_exact(4).all(|p|p==[0,0,0,0]));
+    }
+}
+
+#[cfg(test)]
+mod astc_tests {
+    use super::*;
+    #[test]
+    fn psb_marker_selects_astc_and_unknown_variants_stay_unsupported() {
+        let mut fields=BTreeMap::new();
+        for key in ["width","height","truncated_width","truncated_height"] {fields.insert(key.into(),PsbValue::Integer(4));}
+        fields.insert("pixel".into(),PsbValue::Resource(ResourceRef{index:0,extra:false}));
+        for marker in ["ASTC_8BPP","astc_8bpp"] {
+            fields.insert("type".into(),PsbValue::String(marker.into()));
+            let texture=parse_texture("atlas",&PsbValue::Object(fields.clone())).unwrap();
+            assert_eq!(texture.format,TextureFormat::Astc4x4);
+            assert_eq!(texture.format.s3tc_layout(),None);
+        }
+        fields.insert("type".into(),PsbValue::String("ASTC_6BPP".into()));
+        assert!(matches!(parse_texture("atlas",&PsbValue::Object(fields)).unwrap().format,TextureFormat::Other(_)));
     }
 }
