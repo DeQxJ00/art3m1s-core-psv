@@ -21,7 +21,7 @@ pub(super) struct WarmUpload {
     restore:crate::cpu_image_compression::Restore,
     proof: Option<TileProof>,
     source: Option<Tracked<Vec<u8>>>,
-    surface: Option<PrivateSurface>,
+    pub(super) surface: Option<PrivateSurface>,
     row: usize,
     steps: usize,
     work_us: u64,
@@ -86,6 +86,9 @@ impl GxmTextureProvider {
         if pressure { self.cancel_warm_upload(); }
     }
     pub fn warm_step(&mut self) {
+        // Demand uploads own capacity until their pressure episode is settled.
+        // This also stops an already allocated staging job from proceeding.
+        if unsafe{art3m1s_gxm_surface_warm_allowed(0)}<=0{self.cancel_warm_upload();return;}
         self.cancel_warm_under_pressure();
         if self.warm.job.is_none() {
             self.warm.tick = self.warm.tick.wrapping_add(1);

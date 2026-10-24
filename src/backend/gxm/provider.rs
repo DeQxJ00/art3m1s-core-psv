@@ -103,6 +103,7 @@ unsafe extern "C" {
     fn art3m1s_gxm_upload_alpha_region(id:u64,w:u32,h:u32,p:*const u8,len:usize,x:u32,y:u32,rw:u32,rh:u32)->i32;
     fn art3m1s_gxm_upload_luma(texture:u64,w:u32,h:u32,pixels:*const u8,length:usize)->i32;
     fn art3m1s_gxm_surface_prepare(w:u32,h:u32,pixels:*mut *mut u8,capacity:*mut usize)->usize;
+    fn art3m1s_gxm_surface_cdram_bytes(handle:usize)->usize;
     fn art3m1s_gxm_surface_abort(handle:usize);
     fn art3m1s_gxm_surface_publish(handle:usize,id:u64,proof:*const u8,count:usize)->i32;
     fn art3m1s_gxm_surface_view(id:u64,stride:*mut usize)->*const u8;
@@ -267,7 +268,12 @@ impl GxmTextureProvider {
     /// Between completed frames. Preserve active/transition textures and CPU
     /// backups; RAM-backed GPU surfaces cannot satisfy a CDRAM request.
     pub fn reclaim_effect_gpu_cache(&mut self,requested:usize)->usize {
-        self.reclaim_gpu_cache(requested,"effect-cache-reclaim",true)
+        if requested==0{return 0;}
+        let staging=self.warm.job.as_ref().and_then(|j|j.surface.as_ref())
+            .map_or(0,|s|unsafe{art3m1s_gxm_surface_cdram_bytes(s.handle)});
+        self.cancel_warm_upload(); // Unpublished GPU storage yields before cold textures.
+        if staging>0{crate::core_info!("[effect-cache-reclaim] staging_cdram={} unpublished=1",staging);}
+        staging+self.reclaim_gpu_cache(requested.saturating_sub(staging),"effect-cache-reclaim",true)
     }
     fn reclaim_gpu_cache(&mut self,requested:usize,reason:&str,cdram_only:bool)->usize {
         let requested=requested.min(16*1024*1024);
@@ -2035,7 +2041,12 @@ mod tests {
         }1
     }
     #[unsafe(no_mangle)]
-    extern "C" fn art3m1s_gxm_surface_warm_allowed(_:usize)->i32{1}
+    extern "C" fn art3m1s_gxm_surface_warm_allowed(_:usize)->i32{WARM_ALLOWED.load(Ordering::Relaxed) as i32}
+    static WARM_ALLOWED:AtomicUsize=AtomicUsize::new(1);
+    #[unsafe(no_mangle)]
+    extern "C" fn art3m1s_gxm_surface_cdram_bytes(p:usize)->usize{
+        let s=unsafe{&*(p as *const MockSurface)};(s.data.len()+0x3ffff)&!0x3ffff
+    }
     #[unsafe(no_mangle)]
     extern "C" fn art3m1s_gxm_surface_publish_strided(p:usize,id:u64,proof:*const u8,count:usize)->i32{
         if FAIL_SURFACE.load(Ordering::Relaxed)==2{return 0;}
@@ -2164,6 +2175,30 @@ mod tests {
                 let mut b=b.lock().unwrap();b.set_ready(0);let idle=b.idle+cost;b.set_idle(idle);Some(payload)
             });
         p.set_warm_plan(&[name.into()]);p
+    }
+    #[test] fn demand_reclaim_releases_unpublished_gpu_before_cold_entries(){
+        let _guard=LOCK.lock().unwrap();let mut p=warm_provider("future");
+        for _ in 0..6{p.warm_step();}
+        assert!(p.warm.job.as_ref().unwrap().surface.is_some());
+        let aborted=ABORTED.load(Ordering::Relaxed);
+        assert_eq!(p.reclaim_effect_gpu_cache(0),0);assert!(p.warm.job.is_some());
+        assert_eq!(p.reclaim_effect_gpu_cache(1),3*256*1024);
+        assert_eq!(ABORTED.load(Ordering::Relaxed),aborted+1);
+        assert!(p.warm.job.is_none()&&p.decoded.contains_key("future"));
+        assert_eq!(p.idle_parts().gpu,0);
+        assert_eq!(p.cache_budget.as_ref().unwrap().lock().unwrap().idle,p.idle_parts().total());
+        assert!(p.resolve("future").is_some()); // Retained CPU copy still usable.
+        assert_eq!(p.timing.reads,0);
+    }
+    #[test] fn demand_pressure_stops_inflight_and_new_speculative_uploads(){
+        let _guard=LOCK.lock().unwrap();let mut p=warm_provider("future");
+        for _ in 0..6{p.warm_step();}
+        assert!(p.warm.job.as_ref().unwrap().surface.is_some());
+        WARM_ALLOWED.store(0,Ordering::Relaxed);
+        for _ in 0..32{p.warm_step();}
+        WARM_ALLOWED.store(1,Ordering::Relaxed);
+        assert!(p.warm.job.is_none()&&p.decoded.contains_key("future"));
+        assert_eq!(p.idle_parts().gpu,0);assert!(!p.entries.contains_key("future"));
     }
     #[test]
     fn staged_warm_upload_is_invisible_until_complete_and_matches_odd_stride_alpha(){
