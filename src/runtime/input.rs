@@ -25,11 +25,7 @@ impl CoreRuntime {
 
     #[cfg(feature = "gxm-menu-key-alias")]
     pub fn host_menu_context(&self) -> bool {
-        self.interpreter.lua().load(r#"
-            local f = rawget(_G, 'getGameMode')
-            if type(f) ~= 'function' then return false end
-            return f() == 'adv'
-        "#).eval::<bool>().unwrap_or(false)
+        host_menu_context_available(&self.interpreter)
     }
 
     pub fn feed_mouse(&self, x: i32, y: i32) {
@@ -967,6 +963,27 @@ mod tests {
         assert!(!dispatch.queued && !dispatch.needs_return_frame);
         interpreter.flush_pending_tags().unwrap();
         assert_eq!(interpreter.lua().globals().get::<String>("action").unwrap(), "");
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
+    fn host_menu_context_supports_legacy_predicate_without_bypassing_guards() {
+        let interpreter = Interpreter::new(InterpreterConfig::default());
+        assert!(!super::host_menu_context_available(&interpreter));
+        interpreter.lua().load(r#"
+            blocked = false
+            function get_gamemode(request) return request == 'adv' and not blocked end
+        "#).exec().unwrap();
+        assert!(super::host_menu_context_available(&interpreter));
+        for script in ["blocked = true", "function get_gamemode() return 'adv' end",
+                       "function get_gamemode() error('unavailable') end"] {
+            interpreter.lua().load(script).exec().unwrap();
+            assert!(!super::host_menu_context_available(&interpreter));
+        }
+        interpreter.lua().load("function get_gamemode() return true end; function getGameMode() return 'ui' end").exec().unwrap();
+        assert!(!super::host_menu_context_available(&interpreter));
+        interpreter.lua().load("function getGameMode() return 'adv' end").exec().unwrap();
+        assert!(super::host_menu_context_available(&interpreter));
     }
 
     #[cfg(feature = "gxm-menu-key-alias")]
@@ -1947,6 +1964,19 @@ fn missing_direction_binding<'a>(
         }
     }
     Some(Cow::Owned(binding))
+}
+
+#[cfg(feature = "gxm-menu-key-alias")]
+fn host_menu_context_available(interpreter: &asb_interpreter::Interpreter) -> bool {
+    // Prefer the current mode API. Older scripts expose an input-permission
+    // predicate instead; preserve its wait/modal guards and boolean semantics.
+    interpreter.lua().load(r#"
+        local mode = rawget(_G, 'getGameMode')
+        if type(mode) == 'function' then return mode() == 'adv' end
+        local allowed = rawget(_G, 'get_gamemode')
+        if type(allowed) ~= 'function' then return false end
+        return allowed('adv') == true
+    "#).eval::<bool>().unwrap_or(false)
 }
 
 #[cfg(feature = "gxm-menu-key-alias")]
