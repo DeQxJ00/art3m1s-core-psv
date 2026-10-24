@@ -753,6 +753,16 @@ impl EngineCallbacks for FfiCallbacks {
             .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
     }
 
+    fn emote_variable_labels(&self, id: &str, next: bool) -> asb_interpreter::Result<Vec<String>> {
+        self.emote.lock().unwrap().variable_labels(id, next)
+            .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
+    }
+    fn emote_variable_diff(&self, id: &str, next: bool, key: &str, label: &str,
+        value: f32, frames: f32, easing: u32) -> asb_interpreter::Result<()> {
+        self.emote.lock().unwrap().variable_diff(id, next, key, label, value, frames, easing)
+            .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })
+    }
+
     fn emote_variable(&self, id: &str, next: bool, label: &str) -> asb_interpreter::Result<f32> {
         self.emote.lock().unwrap().variable(id, next, label)
             .map_err(|message| asb_interpreter::Error::RuntimeError { line: 0, message })

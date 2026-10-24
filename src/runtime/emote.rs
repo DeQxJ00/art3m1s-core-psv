@@ -380,6 +380,23 @@ impl EmoteState {
         Ok(self.builtin(id, next)?.mesh_division_ratio)
     }
 
+    pub fn variable_labels(&self, id: &str, next: bool) -> Result<Vec<String>, String> {
+        #[cfg(feature = "emote-recovery")]
+        if let Some(instance) = self.recovered(id, next) { return instance.variable_labels(); }
+        Ok(self.builtin(id, next)?.model.variables().keys().cloned().collect())
+    }
+    pub fn variable_diff(&mut self, id: &str, next: bool, key: &str, label: &str,
+        value: f32, frames: f32, easing: u32) -> Result<(), String> {
+        #[cfg(feature = "emote-recovery")]
+        if let Some(instance) = self.recovered(id, next) {
+            instance.variable_diff(key, label, value, frames, easing)?;
+            self.script_visual_dirty = true;
+            return Ok(());
+        }
+        let _ = (id, next, key, label, value, frames, easing);
+        Err("variable difference requires the recovered E-Mote backend".into())
+    }
+
     pub fn variable(&self, id: &str, next: bool, label: &str) -> Result<f32, String> {
         #[cfg(feature = "emote-recovery")]
         if let Some(instance)=self.recovered(id,next){return instance.query(1,label);}

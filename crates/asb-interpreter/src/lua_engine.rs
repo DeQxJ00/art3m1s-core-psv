@@ -299,6 +299,15 @@ pub trait EngineCallbacks: Send + Sync {
         Err(unsupported_emote())
     }
 
+    fn emote_variable_labels(&self, _id: &str, _next: bool) -> crate::Result<Vec<String>> {
+        Err(unsupported_emote())
+    }
+
+    fn emote_variable_diff(&self, _id: &str, _next: bool, _key: &str, _label: &str,
+        _value: f32, _frames: f32, _easing: u32) -> crate::Result<()> {
+        Err(unsupported_emote())
+    }
+
     fn emote_variable(&self, _id: &str, _next: bool, _label: &str) -> crate::Result<f32> {
         Err(unsupported_emote())
     }
@@ -498,6 +507,19 @@ impl UserData for EmoteLayerApi {
         });
         methods.add_method("getMeshDivisionRatio", |_lua, this, ()| {
             this.ctx.lock().unwrap().callbacks.emote_mesh_ratio(&this.id, this.next)
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method("countVariables", |_lua, this, ()| {
+            this.ctx.lock().unwrap().callbacks.emote_variable_labels(&this.id, this.next)
+                .map(|labels| labels.len()).map_err(mlua::Error::external)
+        });
+        methods.add_method("getVariableLabelAt", |_lua, this, index: i64| {
+            this.ctx.lock().unwrap().callbacks.emote_variable_labels(&this.id, this.next)
+                .map(|labels| usize::try_from(index).ok().and_then(|i| labels.get(i).cloned()).unwrap_or_default())
+                .map_err(mlua::Error::external)
+        });
+        methods.add_method("setVariableDiff", |_lua, this, (key, label, value, frames, easing): (String, String, f32, f32, u32)| {
+            this.ctx.lock().unwrap().callbacks.emote_variable_diff(&this.id, this.next, &key, &label, value, frames, easing)
                 .map_err(mlua::Error::external)
         });
         methods.add_method("getVariable", |_lua, this, label: String| {
@@ -1935,6 +1957,16 @@ mod tests {
             Ok(0.6)
         }
 
+        fn emote_variable_labels(&self, id: &str, next: bool) -> crate::Result<Vec<String>> {
+            assert_eq!((id, next), ("1.0", false));
+            Ok(vec!["face_talk".into(), "face_cheek".into()])
+        }
+        fn emote_variable_diff(&self, id: &str, next: bool, key: &str, label: &str,
+            value: f32, frames: f32, easing: u32) -> crate::Result<()> {
+            assert_eq!((id,next,key,label), ("1.0",false,"cheek","face_cheek"));
+            assert_eq!((value,frames,easing),(0.25,10.0,0)); Ok(())
+        }
+
         fn emote_variable(&self, id: &str, next: bool, label: &str) -> crate::Result<f32> {
             assert_eq!((id, next, label), ("1.0", false, "face_talk"));
             Ok(0.5)
@@ -2310,6 +2342,12 @@ mod tests {
                 assert(not pcall(function() current:setMeshDivisionRatio(value) end))
             end
             assert(current:getVariable("face_talk") == 0.5)
+            assert(current:countVariables() == 2)
+            assert(current:getVariableLabelAt(0) == "face_talk")
+            assert(current:getVariableLabelAt(1) == "face_cheek")
+            assert(current:getVariableLabelAt(2) == "")
+            assert(current:getVariableLabelAt(-1) == "")
+            current:setVariableDiff("cheek", "face_cheek", 0.25, 10, 0)
             assert(current:isTimelinePlaying("active"))
             assert(current:isTimelinePlaying())
             assert(not current:isTimelinePlaying("missing"))

@@ -6,6 +6,8 @@ unsafe extern "C" {
  fn art3m1s_recovery_create_prepared(path:*const std::ffi::c_char,model:u64,width:u32,height:u32,lease:*mut std::ffi::c_void,release:extern "C" fn(*mut std::ffi::c_void))->u64;
  fn art3m1s_recovery_destroy(id:u64);
  fn art3m1s_recovery_command(id:u64,op:u32,label:*const std::ffi::c_char,args:*const f32,flags:u32)->i32;
+ fn art3m1s_recovery_variable_label(id:u64,index:u32)->*const std::ffi::c_char;
+ fn art3m1s_recovery_variable_diff(id:u64,key:*const std::ffi::c_char,label:*const std::ffi::c_char,value:f32,frames:f32,easing:f32)->i32;
  fn art3m1s_recovery_query(id:u64,op:u32,label:*const std::ffi::c_char,out:*mut f32)->i32;
  fn art3m1s_recovery_advance(id:u64,frames:f32)->i32;
  fn art3m1s_recovery_capture(id:u64)->u64;
@@ -46,6 +48,18 @@ impl RecoveryInstance {
   };
   let label=CString::new(label).map_err(|_|"recovery label contains NUL")?;
   if unsafe{art3m1s_recovery_command(self.id,op,label.as_ptr(),args.as_ptr(),flags)}==1{Ok(())}else{Err(format!("recovery command {op} rejected: label={:?} flags={flags} args={args:?}",label.to_string_lossy()))}
+ }
+ pub(super) fn variable_labels(&self)->Result<Vec<String>,String>{
+  self.owner()?;let count=self.query(4, "")? as u32;let mut labels=Vec::with_capacity(count as usize);
+  for index in 0..count {let p=unsafe{art3m1s_recovery_variable_label(self.id,index)};
+   if p.is_null(){return Err("recovery variable label unavailable".into());}
+   labels.push(unsafe{std::ffi::CStr::from_ptr(p)}.to_string_lossy().into_owned());}
+  Ok(labels)
+ }
+ pub(super) fn variable_diff(&self,key:&str,label:&str,value:f32,frames:f32,easing:u32)->Result<(),String>{
+  self.owner()?;let key=CString::new(key).map_err(|_|"invalid difference key")?;
+  let label=CString::new(label).map_err(|_|"invalid variable label")?;
+  if unsafe{art3m1s_recovery_variable_diff(self.id,key.as_ptr(),label.as_ptr(),value,frames,easing as f32)}==1{Ok(())}else{Err("recovery variable difference rejected".into())}
  }
  pub(super) fn query(&self,op:u32,label:&str)->Result<f32,String>{self.owner()?;let label=CString::new(label).map_err(|_|"recovery query label contains NUL")?;let mut value=0.;
   if unsafe{art3m1s_recovery_query(self.id,op,label.as_ptr(),&mut value)}==1{Ok(value)}else{Err("recovery query failed".into())}}
