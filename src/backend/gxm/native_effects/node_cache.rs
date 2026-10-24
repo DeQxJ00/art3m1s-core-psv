@@ -33,7 +33,9 @@ pub(super) fn eligible(frame:&DrawList,gi:usize)->bool {
     super::super::external_effects::registered(&g.effect.name)
         || (g.effect.name==GROUP_COMPOSITE_SHADER && frame.shader_groups[..gi].iter().filter(|n|
             n.start>=g.start && n.end<=g.end && n.start<n.end
-            && super::super::external_effects::registered(&n.effect.name)).take(2).count()>=2)
+            && (super::super::external_effects::registered(&n.effect.name)
+                || (n.effect.name==GROUP_COMPOSITE_SHADER
+                    && scalar(&n.effect,"grayscale",0.0)!=0.0))).take(2).count()>=2)
 }
 fn same_node(a:&ShaderGroup,b:&ShaderGroup)->bool {
     match (&a.key,&b.key) {
@@ -63,6 +65,10 @@ impl NodeCache {
     pub fn release_final(&mut self,slot:usize){self.final_owned[slot]=false;}
     pub fn busy(&self,slot:usize)->bool {self.busy[slot]}
     pub fn protected(&self,slot:usize)->bool {self.protected[slot]}
+    pub fn protected_gray(&self,slot:usize,frame:&DrawList,size:(u32,u32))->bool {
+        self.protected[slot] && (0..frame.shader_groups.len()).any(|gi|
+            gray_prefix_group(frame,gi) && self.entries[slot].input.matches(frame,gi,size))
+    }
     pub fn protect_inputs(&mut self,frame:&DrawList,size:(u32,u32)){
         // Keep reusable inputs safe from other input admissions. A settled
         // final composite may reclaim its slot after consuming these inputs.

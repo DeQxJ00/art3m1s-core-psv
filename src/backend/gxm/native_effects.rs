@@ -537,7 +537,9 @@ fn render_range(frame: &DrawList, start: usize, end: usize, limit: usize, width:
             // still permit independently proven neutral boundaries and pass chains.
             let neutral_allowed=allow_flatten||frame.commands.iter().any(|c|c.recovered_packet.is_some());
             if neutral_allowed
-                && passthrough_group_inner(frame,group_index,width,height,true) {
+                && passthrough_group_inner(frame,group_index,width,height,true)
+                && !(allow_flatten && gray_prefix_group(frame,group_index)
+                    && !has_gray_prefix_child(frame,group_index)) {
                 stats[1]+=1;
                 render_range(frame,group.start,group.end,group_index,width,height,stats,allow_flatten,nodes,admit);
                 index=group.end;continue;
@@ -755,6 +757,29 @@ fn group_has_recovered(frame:&DrawList,index:usize)->bool {
                 frame.mask_commands.get(a..b).is_none_or(|commands|
                     commands.iter().any(|c|c.recovered_packet.is_some())))
 }
+// Retaining a neutral parent can replace several full-stage filtered children
+// with one composite. Simple neutral containers should still draw directly.
+fn costly_neutral_group(frame:&DrawList,index:usize,width:u32,height:u32)->bool {
+    let g=&frame.shader_groups[index];
+    passthrough_group_inner(frame,index,width,height,true)
+        && frame.shader_groups[..index].iter().enumerate().filter(|(i,n)|
+            n.start>=g.start && n.end<=g.end && n.start<n.end
+            && !passthrough_group_inner(frame,*i,width,height,true)
+            && fused_group(frame,*i,width,height).is_none()
+            && local_opaque_group(frame,*i,width,height).is_none()).take(3).count()>=3
+}
+fn gray_prefix_group(frame:&DrawList,index:usize)->bool {
+    let g=&frame.shader_groups[index];
+    g.effect.name==GROUP_COMPOSITE_SHADER && frame.shader_groups[..index].iter().filter(|n|
+        n.start>=g.start && n.end<=g.end && n.start<n.end
+        && n.effect.name==GROUP_COMPOSITE_SHADER && scalar(&n.effect,"grayscale",0.0)!=0.0)
+        .take(3).count()>=3
+}
+fn has_gray_prefix_child(frame:&DrawList,index:usize)->bool {
+    let g=&frame.shader_groups[index];
+    frame.shader_groups[..index].iter().enumerate().any(|(i,n)|
+        n.start==g.start && n.end<g.end && gray_prefix_group(frame,i))
+}
 fn retainable_group(frame:&DrawList,index:usize,width:u32,height:u32)->Option<&ShaderGroup>{
     let g=frame.shader_groups.get(index)?;let e=&g.effect;
     if group_has_recovered(frame,index){return None;}
@@ -769,7 +794,8 @@ fn retainable_group(frame:&DrawList,index:usize,width:u32,height:u32)->Option<&S
         || (!native_pose && commands.iter().any(|c|c.mesh.is_some()||c.native_emote.is_some()||c.stencil.is_some()))
         // Fused draws still run a nontrivial fragment program over the screen.
         // Let stable groups bake once; changing groups keep their direct route.
-        || passthrough_group(frame,index,width,height){return None;}
+        || (passthrough_group(frame,index,width,height)
+            && !costly_neutral_group(frame,index,width,height)){return None;}
     Some(g)
 }
 #[derive(Default)]
@@ -782,10 +808,13 @@ pub(super) struct RetainedGroups {
 impl RetainedGroups {
     fn select(&self, frame:&DrawList, g:&ShaderGroup, size:(u32,u32), revision:u64,
         used:&[bool;4], limit:usize)->Option<usize>{
+        let own_input=frame.shader_groups.iter().position(|n|std::ptr::eq(n,g))
+            .and_then(|gi|self.nodes.find(frame,gi,size));
         // Keep exact earlier states of a looping effect in the existing four
         // targets. Never overwrite a target already submitted in this frame.
         (0..limit).find(|&i|!used[i]&&!self.nodes.busy(i)&&self.slots[i].matches(frame,g,size,revision))
-            .or_else(||(0..limit).filter(|&i|!used[i]&&!self.nodes.busy(i))
+            .or_else(||(0..limit).filter(|&i|!used[i]&&!self.nodes.busy(i)
+                && (!self.nodes.protected_gray(i,frame,size)||own_input==Some(i)))
                 .min_by_key(|&i|(self.slots[i].group.is_some(),self.touched[i])))
     }
 }
@@ -836,7 +865,65 @@ fn overlay_span(frame:&DrawList,width:u32,height:u32,previous:Option<&RetainedGr
     if bounds[2]<=0.||bounds[3]<=0.{return None;}
     Some(ShaderGroup{key:None,start,end,effect:ShaderEffect{name:GROUP_COMPOSITE_SHADER.into(),uniforms:Default::default(),mask_texture:None,user_texture:None},clip_bounds:Some(bounds),mask_range:None})
 }
+// A following multiply sprite depends on its destination. It can join an
+// isolated cached scene only when that scene provably replaces the entire
+// destination with opaque pixels. Keep UI and all later commands outside.
+fn retain_filtered_prefix(frame:&DrawList,width:u32,height:u32)->Option<DrawList> {
+    for (index,g) in frame.shader_groups.iter().enumerate() {
+        if !gray_prefix_group(frame,index) || !costly_neutral_group(frame,index,width,height)
+            || !passthrough_group(frame,index,width,height) {continue;}
+        let end=frame.shader_groups[..index].iter().enumerate().filter(|(i,n)|
+            n.start>=g.start && n.end<=g.end && n.start<n.end
+            && !passthrough_group_inner(frame,*i,width,height,true))
+            .map(|(_,n)|n.end).max()?;
+        if end>=g.end || frame.shader_groups[..index].iter().any(|n|
+            (n.start<end && n.end>end) || (n.start==g.start && n.end==end)) {continue;}
+        let mut prefix=g.clone();prefix.end=end;prefix.key=None;
+        let mut result=frame.clone();result.shader_groups.insert(index,prefix);
+        return Some(result);
+    }
+    None
+}
+fn retain_scene_tint(frame:&DrawList,width:u32,height:u32)->Option<DrawList> {
+    for (index,g) in frame.shader_groups.iter().enumerate() {
+      // The prefix already owns the costly static filters. Keep its animated
+      // reveal tail and following tint live instead of isolating them again.
+      if has_gray_prefix_child(frame,index) {continue;}
+      for end in g.start..=g.end.min(frame.commands.len().saturating_sub(1)) {
+        let tint=&frame.commands[end];
+        if tint.blend!=BlendMode::Multiply || tint.shader.is_some() || tint.mesh.is_some()
+            || tint.stencil.is_some() || tint.native_emote.is_some() || tint.recovered_packet.is_some()
+            || frame.shader_groups.iter().enumerate().any(|(i,n)|i!=index
+                && n.start<=end && n.end>end && (i<index || end==g.end)) {continue;}
+        let mut result=frame.clone();
+        result.shader_groups[index].end=end;
+        if !costly_neutral_group(&result,index,width,height)
+            || !passthrough_group(&result,index,width,height) {continue;}
+        // Prove opacity before the tint, excluding filtered covering sprites.
+        let opaque=frame.commands[g.start..end].iter().enumerate().any(|(offset,c)|
+            opaque_cover(c,width,height) && !frame.shader_groups[..index].iter()
+                .any(|n|n.start<=g.start+offset && g.start+offset<n.end));
+        if !opaque {continue;}
+        result.shader_groups[index]=g.clone();
+        let mut parent=g.clone();parent.end=end+1;parent.key=None;
+        parent.effect.uniforms.insert("opaque".into(),vec![1.]);
+        // During a transition the same parent also owns changing reveal
+        // sprites. Cache only its static prefix; keep those sprites live.
+        result.shader_groups.insert(if end<g.end {index}else{index+1},parent);
+        return Some(result);
+      }
+    }
+    None
+}
 pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&mut RetainedGroups) {
+    let filtered_prefix=if unsafe{art3m1s_gxm_group_passthrough_enabled()!=0} {
+        retain_filtered_prefix(frame,width,height)
+    }else{None};
+    let frame=filtered_prefix.as_ref().unwrap_or(frame);
+    let retained_scene=if unsafe{art3m1s_gxm_group_passthrough_enabled()!=0} {
+        retain_scene_tint(frame,width,height)
+    }else{None};
+    let frame=retained_scene.as_ref().unwrap_or(frame);
     // Bounded diagnostics: expose why a moving stack cannot reuse a filtered result.
     thread_local! {static PAN_REPORT:std::cell::Cell<Option<std::time::Instant>>=const{std::cell::Cell::new(None)};}
     PAN_REPORT.with(|last|{
@@ -913,7 +1000,8 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
     while scopes.len()>1 && index>=scopes.last().unwrap().0 {scopes.pop();}
     let &(scope_end,scope_limit)=scopes.last().unwrap();
     if let Some((gi,g))=next_group(frame,index,scope_end,scope_limit){
-    if enabled && passthrough_group_inner(frame,gi,width,height,group_has_recovered(frame,gi)){
+    if enabled && passthrough_group_inner(frame,gi,width,height,group_has_recovered(frame,gi))
+        && (!costly_neutral_group(frame,gi,width,height)||has_gray_prefix_child(frame,gi)){
         stats[0]+=1;stats[1]+=1;
         scopes.push((g.end,gi));continue;
     }
@@ -974,11 +1062,7 @@ pub(super) fn render_cached(frame: &DrawList, width: u32, height: u32, caches:&m
             // the dedicated policy for animated mosaic/output unchanged.
             cache.input_cached=false;
             let flattened=passthrough_group_inner(frame,gi,width,height,true);
-            let complex_flattened=flattened && frame.shader_groups[..gi].iter().enumerate().filter(|(i,n)|
-                n.start>=g.start && n.end<=g.end && n.start<n.end
-                && !passthrough_group_inner(frame,*i,width,height,true)
-                && fused_group(frame,*i,width,height).is_none()
-                && local_opaque_group(frame,*i,width,height).is_none()).take(4).count()>=4;
+            let complex_flattened=flattened && costly_neutral_group(frame,gi,width,height);
             let capture = !cache.animated_output
                 && g.mask_range.is_none() && unsafe{art3m1s_gxm_group_input_reuse_enabled()!=0}
                 && (!flattened || (complex_flattened && cache.changing_frames==1))
@@ -2421,6 +2505,109 @@ mod tests {
         assert!(cache.slots[0].input_cached);
         EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
         EVENTS.with(|v|assert_eq!(*v.borrow(),["frame","restore-input","bake","end-frame"]));
+    }
+    #[test]
+    fn neutral_parent_retains_filtered_children_without_freezing_outside_ui() {
+        let mut f=layered_gray_frame();
+        f.shader_groups[4].effect.uniforms.clear();
+        assert!(passthrough_group(&f,4,960,544));
+        assert!(costly_neutral_group(&f,4,960,544));
+        assert!(retainable_group(&f,4,960,544).is_some());
+        f.commands.push(f.commands[0].clone());
+        let mut cache=RetainedGroups::default();
+        for _ in 0..2 {render_cached(&f,960,544,&mut cache);}
+        f.commands[8].transform.translation.x+=10.;
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|{
+            assert_eq!(v.borrow().iter().filter(|e|e.as_str()=="cached").count(),1);
+            assert_eq!(v.borrow().iter().filter(|e|e.starts_with("draw:")).count(),1);
+        });
+        f.commands[1].opacity=0.3;
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|assert!(!v.borrow().iter().any(|e|e=="cached")));
+    }
+    fn tinted_scene_frame()->DrawList {
+        let mut f=layered_gray_frame();
+        let cover=neutral_frame().commands[0].clone();
+        f.commands.insert(0,cover.clone());
+        for g in &mut f.shader_groups {g.start+=1;g.end+=1;}
+        f.shader_groups[4].start=0;f.shader_groups[4].effect.uniforms.clear();
+        let mut tint=cover.clone();tint.blend=BlendMode::Multiply;tint.opacity=0.5;
+        f.commands.push(tint);f.commands.push(cover);f
+    }
+    #[test]
+    fn opaque_scene_tint_reuses_one_result_and_invalidates_tint_changes() {
+        let mut f=tinted_scene_frame();
+        let merged=retain_scene_tint(&f,960,544).unwrap();
+        assert_eq!(merged.shader_groups.last().unwrap().end,10);
+        let mut cache=RetainedGroups::default();
+        for _ in 0..2 {render_cached(&f,960,544,&mut cache);}
+        f.commands[10].transform.translation.x=10.;
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|{
+            assert_eq!(v.borrow().iter().filter(|e|e.as_str()=="cached").count(),1);
+            assert_eq!(v.borrow().iter().filter(|e|e.starts_with("draw:")).count(),1);
+        });
+        f.commands[9].opacity=0.25;
+        EVENTS.with(|v|v.borrow_mut().clear());render_cached(&f,960,544,&mut cache);
+        EVENTS.with(|v|assert!(!v.borrow().iter().any(|e|e=="cached")));
+    }
+    #[test]
+    fn scene_tint_keeps_destination_dependent_or_transparent_boundaries() {
+        let f=tinted_scene_frame();
+        for case in 0..5 {
+            let mut f=f.clone();
+            match case {
+                0=>f.commands[0].opacity=0.5,
+                1=>{f.shader_groups[4].effect.uniforms.insert("alpha".into(),vec![0.5]);},
+                2=>f.shader_groups.push(test_group(GROUP_COMPOSITE_SHADER,0,11)),
+                3=>f.commands[9].blend=BlendMode::Screen,
+                _=>f.commands[0].transform.translation.x=1.,
+            }
+            assert!(retain_scene_tint(&f,960,544).is_none(),"case={case}");
+        }
+    }
+    #[test]
+    fn changing_reveal_tail_reuses_static_tinted_prefix() {
+        let mut f=tinted_scene_frame();
+        for g in &mut f.shader_groups[..4] {g.effect.uniforms.insert("grayscale".into(),vec![1.]);}
+        f.shader_groups[4].end=11;
+        let merged=retain_scene_tint(&f,960,544).unwrap();
+        assert_eq!(merged.shader_groups[4].end,10);
+        assert_eq!(merged.shader_groups[5].end,11);
+        assert!(node_cache::eligible(&merged,4));
+        let mut nodes=NodeCache::default();let mut stats=[0,0];
+        nodes.begin();
+        render_range(&merged,0,11,6,960,544,&mut stats,true,&mut nodes,true);
+        f.commands[10].transform.translation.x=20.;
+        let changed=retain_scene_tint(&f,960,544).unwrap();
+        nodes.begin();nodes.protect_inputs(&changed,(960,544));
+        render_range(&changed,0,11,6,960,544,&mut stats,true,&mut nodes,true);
+        nodes.begin();nodes.protect_inputs(&changed,(960,544));
+        EVENTS.with(|v|v.borrow_mut().clear());
+        render_range(&changed,0,11,6,960,544,&mut stats,true,&mut nodes,true);
+        EVENTS.with(|v|{
+            assert!(v.borrow().iter().any(|e|e=="node-source-hit"),"{:?}",v.borrow());
+            assert_eq!(v.borrow().iter().filter(|e|e.starts_with("draw:")).count(),1);
+        });
+    }
+    #[test]
+    fn reveal_before_tint_keeps_gray_prefix_reusable() {
+        let mut f=tinted_scene_frame();
+        for g in &mut f.shader_groups[..4] {g.effect.uniforms.insert("grayscale".into(),vec![1.]);}
+        f.commands.insert(9,f.commands[10].clone());
+        f.shader_groups[4].end=10;
+        let mut cache=RetainedGroups::default();
+        for step in 0..5 {
+            f.commands[9].transform.translation.x=step as f32*30.;
+            EVENTS.with(|v|v.borrow_mut().clear());
+            render_cached(&f,960,544,&mut cache);
+        }
+        EVENTS.with(|v|{
+            assert!(v.borrow().iter().any(|e|e=="cached"),"{:?}",v.borrow());
+            assert!(!v.borrow().iter().any(|e|e=="begin-group"));
+            assert!(v.borrow().iter().filter(|e|e.starts_with("draw:")).count()<=3,"{:?}",v.borrow());
+        });
     }
     #[test]
     fn continuously_moving_flattened_children_stop_extra_input_capture() {

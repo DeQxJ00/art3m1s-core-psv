@@ -472,6 +472,18 @@ pub fn clear_file_size_cache() {
     }
 }
 
+// A save/thumbnail write must not invalidate unrelated immutable image probes.
+// Full invalidation remains explicit on project changes and clear_cache commands.
+fn invalidate_file_size_path(cache: &mut HashMap<String, Option<u64>>, path: &str) {
+    let key=path.replace('\\', "/");
+    cache.retain(|name,_| !name.eq_ignore_ascii_case(&key));
+}
+fn file_size_changed(path: &str) {
+    if let Some(cache)=FILE_SIZE_CACHE.lock().unwrap().as_mut() {
+        invalidate_file_size_path(cache,path);
+    }
+}
+
 pub fn file_reader_registered() -> bool {
     FILE_READER.lock().unwrap().is_some()
 }
@@ -522,7 +534,7 @@ pub fn request_write(path: &str, data: &[u8]) -> Result<(), String> {
             data.len()
         ));
     }
-    clear_file_size_cache();
+    file_size_changed(path);
     Ok(())
 }
 
@@ -539,7 +551,7 @@ pub fn request_delete(path: &str) -> Result<(), String> {
     if r < 0 {
         return Err(format!("delete failed: {path}"));
     }
-    clear_file_size_cache();
+    file_size_changed(path);
     Ok(())
 }
 
@@ -2129,4 +2141,22 @@ pub unsafe extern "C" fn art3m1s_runtime_set_message_cache_enabled(
 #[cfg(feature = "gl-backend")]
 pub unsafe extern "C" fn art3m1s_runtime_set_text_epoch_enabled(rt: *mut crate::runtime::CoreRuntime, enabled: i32) {
     if let Some(runtime) = unsafe { rt.as_mut() } { runtime.set_text_epoch_enabled(enabled != 0); }
+}
+
+/// Whether a visible image mask branch has an active transform/opacity tween.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_image_mask_active(rt: *const CoreRuntime) -> i32 {
+    unsafe { rt.as_ref() }.is_some_and(|rt| rt.image_mask_active()) as i32
+}
+
+#[cfg(test)]
+mod file_size_invalidation_tests {
+    use super::*;
+    #[test] fn mutation_preserves_other_positive_and_negative_probes() {
+        let mut cache=HashMap::from([("save/slot.dat".into(),Some(9)),("SAVE/slot.dat".into(),None),("image/optional.png".into(),None),("image/bg.png".into(),Some(123))]);
+        invalidate_file_size_path(&mut cache,r"save\slot.dat");
+        assert_eq!(cache.len(),2);
+        assert_eq!(cache["image/bg.png"],Some(123));assert_eq!(cache["image/optional.png"],None);
+        cache.insert("save/slot.dat".into(),Some(20));invalidate_file_size_path(&mut cache,"save/slot.dat");assert_eq!(cache.len(),2);
+    }
 }

@@ -91,6 +91,73 @@ pub(crate) fn has_particle_motion(scene: &Scene, now: u64) -> bool {
     false
 }
 
+// Image-based reveal scripts use the conventional mask resource directory,
+// while explicit layer masks may live anywhere. Do not match asset basenames.
+fn mask_resource(path: &str) -> bool {
+    path.trim_start_matches(':').split(['/', '\\']).any(|part| part.eq_ignore_ascii_case("mask"))
+}
+
+// Some scripts construct an aperture from a scaled ordinary image plus
+// repeated opaque-border images. Detect coordinated finite motion rather than
+// assuming the shape is stored in a directory named "mask".
+fn has_image_aperture_motion(scene: &Scene, now: u64) -> bool {
+    if !scene.all_layers().any(|l| l.tweens.iter().any(|t|
+        matches!(t.param.as_str(), "zoom"|"xscale"|"yscale"|"width"|"height")
+        && !t.infinite_loop && t.loop_count.is_none() && t.from!=t.to
+        && t.duration_ms>0 && now>=t.start_ms && !t.is_finished(now))) { return false; }
+    let mut branches = Vec::new();
+    for leaf in scene.all_layers().filter(|l| l.file.is_some() || l.solid_color.is_some()) {
+        let mut axes=0u8;let mut shown=true;let mut id=Some(leaf.id.as_str());
+        while let Some(current)=id {
+            if let Some(layer)=scene.get(current) {
+                if layer.host_hidden || !visible(layer,now) { shown=false;break; }
+                for t in &layer.tweens {
+                    if t.infinite_loop || t.loop_count.is_some() || !t.from.is_finite() || !t.to.is_finite() || t.from==t.to || t.duration_ms==0 || now<t.start_ms || t.is_finished(now) { continue; }
+                    axes |= match t.param.as_str() { "left"|"x"=>1,"top"|"y"=>2,"zoom"|"xscale"|"yscale"|"width"|"height"=>4,_=>0 };
+                }
+            }
+            id=current.rsplit_once('.').map(|(p,_)|p);
+        }
+        if shown && axes!=0 { branches.push((leaf,axes)); }
+    }
+    branches.iter().any(|(shape,axes)| {
+        if axes&4==0 || shape.file.is_none() { return false; }
+        let root=shape.id.split('.').next();
+        branches.iter().any(|(border,_)| {
+            if border.file==shape.file && border.solid_color==shape.solid_color { return false; }
+            let mut count=0;let mut directions=0;
+            for (other,motion) in &branches {
+                if other.id.split('.').next()==root && other.file==border.file && other.solid_color==border.solid_color && motion&3!=0 {
+                    count+=1;directions|=motion&3;
+                }
+            }
+            count>=3 && directions==3
+        })
+    })
+}
+
+pub(crate) fn has_image_mask_motion(scene: &Scene, now: u64) -> bool {
+    if !scene.root_props().is_visible() || scene.root_props().alpha == Some(0) { return false; }
+    if has_image_aperture_motion(scene, now) { return true; }
+    scene.all_layers().filter(|l| l.mask.is_some() || l.props.custom.get("intermediate_render_mask").is_some_and(|s| !s.is_empty()) || l.file.as_deref().is_some_and(mask_resource)).any(|leaf| {
+        let mut animated = false;
+        let mut id = Some(leaf.id.as_str());
+        while let Some(current) = id {
+            if let Some(layer) = scene.get(current) {
+                if layer.host_hidden || !visible(layer, now) { return false; }
+                animated |= layer.tweens.iter().any(|t| {
+                    if !matches!(t.param.as_str(), "left"|"top"|"x"|"y"|"zoom"|"xscale"|"yscale"|"rotate"|"alpha"|"width"|"height") { return false; }
+                    if !t.from.is_finite() || !t.to.is_finite() || t.from == t.to || t.duration_ms == 0 || now < t.start_ms || t.is_finished(now) { return false; }
+                    let cycle = t.duration_ms.saturating_add(t.loop_delay_ms);
+                    !(t.infinite_loop || t.loop_count.is_some()) || (now-t.start_ms)%cycle < t.duration_ms
+                });
+            }
+            id = current.rsplit_once('.').map(|(parent, _)| parent);
+        }
+        animated
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +171,34 @@ mod tests {
         let mut s=Scene::new();s.set_file("1.0",Some("image.png".into()));
         s.get_mut("1").unwrap().props.shader=Some("blur".into());
         s.get_mut("1.0").unwrap().tweens.push(pan());s
+    }
+    #[test] fn ordinary_image_with_moving_borders_is_an_aperture() {
+        let mut s=Scene::new();s.set_file("1.8.0",Some(":cg/shape.png".into()));
+        s.get_mut("1.8").unwrap().tweens.push(Tween{param:"xscale".into(),..pan()});
+        for i in 1..5 {
+            let id=format!("1.{i}.0");s.set_file(&id,Some(":bg/fill.png".into()));
+            s.get_mut(&format!("1.{i}")).unwrap().tweens.push(Tween{param:if i<3{"left"}else{"top"}.into(),..pan()});
+        }
+        assert!(!has_image_mask_motion(&s,99));assert!(has_image_mask_motion(&s,200));
+        assert!(!has_image_mask_motion(&s,1100));
+        s.get_mut("1.8").unwrap().host_hidden=true;assert!(!has_image_mask_motion(&s,200));
+        s.get_mut("1.8").unwrap().host_hidden=false;
+        for i in 1..5 { s.get_mut(&format!("1.{i}")).unwrap().tweens[0].infinite_loop=true; }
+        assert!(!has_image_mask_motion(&s,200));
+    }
+    #[test] fn image_mask_activity_tracks_parent_motion_and_release() {
+        let mut s=Scene::new();s.set_file("1.0",Some(":image/mask/reveal.png".into()));
+        s.get_mut("1").unwrap().tweens.push(Tween{param:"zoom".into(),..pan()});
+        assert!(!has_image_mask_motion(&s,99));assert!(has_image_mask_motion(&s,100));
+        assert!(!has_image_mask_motion(&s,1100));
+        s.get_mut("1").unwrap().host_hidden=true;assert!(!has_image_mask_motion(&s,200));
+        s.get_mut("1").unwrap().host_hidden=false;
+        s.set_file("1.0",Some("image/background.png".into()));assert!(!has_image_mask_motion(&s,200));
+        s.get_mut("1.0").unwrap().mask=Some("custom/reveal.png".into());assert!(has_image_mask_motion(&s,200));
+        s.get_mut("1").unwrap().tweens[0].infinite_loop=true;
+        s.get_mut("1").unwrap().tweens[0].loop_delay_ms=500;
+        assert!(!has_image_mask_motion(&s,1200));assert!(has_image_mask_motion(&s,1600));
+        s.get_mut("1.0").unwrap().props.alpha=Some(0);assert!(!has_image_mask_motion(&s,1600));
     }
     #[test] fn dense_looping_images_clock_policy() {
         let mut s=Scene::new();
