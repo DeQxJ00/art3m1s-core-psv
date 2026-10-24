@@ -675,6 +675,10 @@ impl TextRenderer for GlyphTextRenderer {
     fn set_message_font_sizes_separate(&mut self, enabled: bool, name: u32, dialogue: u32, subtitle: u32) -> bool {
         self.update_message_sizes_separate(enabled, name, dialogue, subtitle)
     }
+    fn set_message_font_sizes_with_choice(&mut self, enabled: bool, name: u32, dialogue: u32, subtitle: u32, choice: u32) -> bool {
+        self.update_message_sizes_with_choice(enabled, name, dialogue, subtitle, choice)
+    }
+    fn set_backlog_font_size(&mut self, percent: u32) -> bool { self.update_backlog_size(percent) }
     fn set_message_position(&mut self, value: crate::text::message_position::MessagePosition) -> bool {
         if !value.valid() { return false; }
         if value != self.message_position {

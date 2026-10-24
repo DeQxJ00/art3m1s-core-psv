@@ -739,7 +739,18 @@ impl CoreRuntime {
         if ok { self.frame_visual_dirty = true; self.pointer_hit_test_dirty = true; }
         ok
     }
+    pub fn set_message_font_sizes_with_choice(&mut self, enabled: bool, name: u32, dialogue: u32, subtitle: u32, choice: u32) -> bool {
+        self.sync_message_font_roles();
+        let ok = self.text_renderer.as_mut().is_some_and(|r| r.set_message_font_sizes_with_choice(enabled, name, dialogue, subtitle, choice));
+        if ok { self.frame_visual_dirty = true; self.pointer_hit_test_dirty = true; }
+        ok
+    }
 
+    pub fn set_backlog_font_size(&mut self, percent: u32) -> bool {
+        let ok = self.text_renderer.as_mut().is_some_and(|r| r.set_backlog_font_size(percent));
+        if ok { self.frame_visual_dirty = true; self.pointer_hit_test_dirty = true; }
+        ok
+    }
     pub fn set_message_position(&mut self, value: crate::text::message_position::MessagePosition) -> bool {
         self.sync_message_font_roles();
         let ok = self.text_renderer.as_mut().is_some_and(|r| r.set_message_position(value));

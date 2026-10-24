@@ -13,7 +13,7 @@ impl MessagePosition {
         self.dialogue.into_iter().chain(self.subtitle).all(|v| (-500..=500).contains(&v))
     }
     pub(super) fn layer(self, id: &str, roles: Option<&MessageLayerIds>) -> (bool, [i32; 2]) {
-        let (body, sub) = if let Some(roles) = roles {
+        let (body, sub) = if let Some(roles) = roles.filter(|roles| !roles.legacy) {
             // An ambiguous mapping must never hide the main text or speaker name.
             if roles.name.as_deref() == Some(id) { return (false, [0, 0]); }
             let body = roles.dialogue.as_deref() == Some(id);
@@ -38,7 +38,7 @@ mod tests {
     fn position_defaults_isolation_and_ambiguous_roles() {
         let settings = MessagePosition { enabled: true, hide_subtitle: true,
             dialogue: [5, -20], subtitle: [-10, 30] };
-        let mut roles = MessageLayerIds { name: Some("speaker".into()),
+        let mut roles = MessageLayerIds { legacy: false, choice: None, name: Some("speaker".into()),
             dialogue: Some("body".into()), subtitle: Some("sub".into()) };
         assert_eq!(settings.layer("body", Some(&roles)), (false, [5, -20]));
         assert_eq!(settings.layer("sub", Some(&roles)), (true, [-10, 30]));

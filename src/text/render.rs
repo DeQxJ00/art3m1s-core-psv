@@ -1239,6 +1239,8 @@ pub trait TextRenderer {
     /// Optional host presentation override, independent of script font state.
     fn set_message_font_sizes(&mut self, _enabled: bool, _name: u32, _dialogue: u32) -> bool { false }
     fn set_message_font_sizes_separate(&mut self, _enabled: bool, _name: u32, _dialogue: u32, _subtitle: u32) -> bool { false }
+    fn set_message_font_sizes_with_choice(&mut self, _enabled: bool, _name: u32, _dialogue: u32, _subtitle: u32, _choice: u32) -> bool { false }
+    fn set_backlog_font_size(&mut self, _percent: u32) -> bool { false }
     fn set_message_position(&mut self, _value: crate::text::message_position::MessagePosition) -> bool { false }
 
     /// Replace the exact game-provided role mapping; None selects legacy compatibility.

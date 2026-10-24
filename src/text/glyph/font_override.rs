@@ -2,14 +2,62 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct MessageFontSizes { enabled: bool, name: u32, dialogue: u32, subtitle: u32 }
+pub(super) struct MessageFontSizes { enabled: bool, name: u32, dialogue: u32, subtitle: u32, choice: u32, backlog: u32 }
 impl Default for MessageFontSizes {
-    fn default() -> Self { Self { enabled: false, name: 100, dialogue: 100, subtitle: 100 } }
+    fn default() -> Self { Self { enabled: false, name: 100, dialogue: 100, subtitle: 100, choice: 100, backlog: 100 } }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
+    fn backlog_body_resize_preserves_names_controls_and_history() {
+        let mut r = GlyphTextRenderer::new();
+        r.set_named_font_bytes("fixture", std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap()).unwrap();
+        for id in ["500.bt.tx.1.0", "500.bt.tx.1.1", "500.bt.tx.2.2", "500.bt.tx.menu.1", "500.bt.tx.1.1.child", "1.mw.adv"] {
+            r.state.active_layer = Some(id.into());
+            r.state.active_layer_mut().font.size = Some(24.0);
+            r.push_text("ABC", false);
+        }
+        let before = r.state.layers.clone();
+        assert!(r.set_message_font_sizes(true, 100, 100));
+        assert!(r.set_backlog_font_size(150));
+        for (id, layer) in &before {
+            if id == "500.bt.tx.1.1" || id == "500.bt.tx.2.2" {
+                assert!(r.state.layers[id].text_buffer[0].advance_x > layer.text_buffer[0].advance_x);
+            } else { assert_eq!(r.state.layers[id].text_buffer, layer.text_buffer); }
+            assert_eq!(r.state.layers[id].page_tags, layer.page_tags);
+            assert_eq!(r.state.layers[id].font, layer.font);
+        }
+        assert!(!r.set_backlog_font_size(151));
+        assert!(r.set_backlog_font_size(100));
+        for (id, layer) in before { assert_eq!(r.state.layers[&id].text_buffer, layer.text_buffer); }
+    }
+    #[test]
+    #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
+    fn choice_resize_updates_both_states_without_changing_other_text() {
+        let mut r = GlyphTextRenderer::new();
+        r.set_named_font_bytes("fixture", std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap()).unwrap();
+        r.set_message_font_roles(Some(asb_interpreter::MessageLayerIds {
+            choice: Some("ui.options".into()), legacy: true, ..Default::default() }));
+        for id in ["ui.options.1.0.0.2", "ui.options.1.0.0.3", "ui.optionsOther", "1.mw.adv"] {
+            r.state.active_layer = Some(id.into());
+            r.state.active_layer_mut().font.size = Some(24.0);
+            r.push_text("ABC", false);
+        }
+        let before = r.state.layers.clone();
+        assert!(r.set_message_font_sizes_with_choice(true, 100, 100, 100, 150));
+        for (id, layer) in &before {
+            if id.starts_with("ui.options.") {
+                assert!(r.state.layers[id].text_buffer[0].advance_x > layer.text_buffer[0].advance_x);
+            } else { assert_eq!(r.state.layers[id].text_buffer, layer.text_buffer); }
+            assert_eq!(r.state.layers[id].font, layer.font);
+        }
+        assert!(!r.set_message_font_sizes_with_choice(true, 100, 100, 100, 151));
+        assert!(r.set_message_font_sizes_with_choice(false, 100, 100, 100, 150));
+        for (id, layer) in before { assert_eq!(r.state.layers[&id].text_buffer, layer.text_buffer); }
+    }
     #[test]
     #[ignore = "requires ART3M1S_TEST_FONT pointing to a local font fixture"]
     fn outline_free_spaces_keep_advance_and_follow_message_resize() {
@@ -23,7 +71,7 @@ mod tests {
             assert_eq!(r.rasterize_glyph(c, 24.0).unwrap(), cold);
         }
         assert_eq!(r.atlases.len(), atlas_count);
-        r.set_message_font_roles(Some(asb_interpreter::MessageLayerIds {
+        r.set_message_font_roles(Some(asb_interpreter::MessageLayerIds { legacy: false, choice: None,
             name: Some("speaker".into()), dialogue: Some("dialogue".into()), subtitle: None }));
         for id in ["dialogue", "speaker", "chapter"] {
             r.state.active_layer = Some(id.into());
@@ -47,7 +95,7 @@ mod tests {
     fn subtitle_size_is_independent_and_restores_existing_pages() {
         let mut r = GlyphTextRenderer::new();
         r.set_named_font_bytes("fixture", std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap()).unwrap();
-        r.set_message_font_roles(Some(asb_interpreter::MessageLayerIds {
+        r.set_message_font_roles(Some(asb_interpreter::MessageLayerIds { legacy: false, choice: None,
             name: Some("speaker".into()), dialogue: Some("body".into()), subtitle: Some("sub".into()) }));
         for id in ["speaker", "body", "sub", "backlog"] {
             r.state.active_layer = Some(id.into());
@@ -74,7 +122,7 @@ mod tests {
             assert_eq!(r.state.layers[&id].font, old.font);
             assert_eq!(r.state.layers[&id].page_tags, old.page_tags);
         }
-        let sizes = MessageFontSizes { enabled: true, name: 100, dialogue: 125, subtitle: 150 };
+        let sizes = MessageFontSizes { enabled: true, name: 100, dialogue: 125, subtitle: 150, choice: 100, backlog: 100 };
         assert_eq!(sizes.scale("1.80.mw.adv_adv", None), 1.25);
         assert_eq!(sizes.scale("1.80.mw.adv_sub", None), 1.5);
         assert_eq!(sizes.scale("1.80.mw.adv_name", None), 1.0);
@@ -94,7 +142,7 @@ mod tests {
         }
         let mut r = GlyphTextRenderer::new();
         r.set_named_font_bytes("fixture", std::fs::read(std::env::var("ART3M1S_TEST_FONT").unwrap()).unwrap()).unwrap();
-        let roles = asb_interpreter::MessageLayerIds { name: Some("speaker".into()),
+        let roles = asb_interpreter::MessageLayerIds { legacy: false, choice: None, name: Some("speaker".into()),
             dialogue: Some("body".into()), subtitle: Some("sub".into()) };
         r.set_message_font_roles(Some(roles.clone()));
         for id in ["body", "sub", "speaker", "backlog"] {
@@ -163,7 +211,7 @@ mod tests {
     }
     #[test]
     fn roles_and_disabled_values_are_independent() {
-        let s = MessageFontSizes { enabled: true, name: 125, dialogue: 150, subtitle: 150 };
+        let s = MessageFontSizes { enabled: true, name: 125, dialogue: 150, subtitle: 150, choice: 100, backlog: 100 };
         assert_eq!(s.scale("100.mw.name", None), 1.25);
         assert_eq!(s.scale("100.mw.adv", None), 1.5);
         assert_eq!(s.scale("100.mw.sub", None), 1.5);
@@ -180,8 +228,8 @@ mod tests {
     }
     #[test]
     fn exact_roles_override_spelling_and_never_match_children() {
-        let s=MessageFontSizes{enabled:true,name:125,dialogue:150,subtitle:150};
-        let roles=asb_interpreter::MessageLayerIds{name:Some("panel.speaker".into()),
+        let s=MessageFontSizes{enabled:true,name:125,dialogue:150,subtitle:150,choice:100,backlog:100};
+        let roles=asb_interpreter::MessageLayerIds{choice:None,legacy:false,name:Some("panel.speaker".into()),
             dialogue:Some("panel.paragraph".into()),subtitle:Some("translation".into())};
         assert_eq!(s.scale("panel.speaker",Some(&roles)),1.25);
         assert_eq!(s.scale("panel.paragraph",Some(&roles)),1.5);
@@ -315,12 +363,17 @@ mod tests {
 impl MessageFontSizes {
     pub(super) fn scale(self, id: &str, roles: Option<&asb_interpreter::MessageLayerIds>) -> f32 {
         if !self.enabled { return 1.0; }
+        // Legacy history body and active-body layers; exclude speaker and controls.
+        if id.strip_prefix("500.bt.tx.").and_then(|tail| tail.split_once('.')).is_some_and(|(entry, text)| !entry.is_empty() && entry.bytes().all(|c| c.is_ascii_digit()) && matches!(text, "1" | "2")) { return self.backlog as f32 / 100.0; }
         if let Some(roles) = roles {
+            if roles.choice.as_deref().is_some_and(|root| id == root || id.strip_prefix(root).is_some_and(|tail| tail.starts_with('.'))) {
+                return self.choice as f32 / 100.0;
+            }
             let percent = if roles.name.as_deref() == Some(id) { self.name }
                 else if roles.dialogue.as_deref() == Some(id) || id == DEFAULT_MESSAGE_LAYER { self.dialogue }
                 else if roles.subtitle.as_deref() == Some(id) { self.subtitle }
                 else { 100 };
-            return percent as f32 / 100.0;
+            if !roles.legacy { return percent as f32 / 100.0; }
         }
         // Older scripts without mw_getmsgid hard-code these layer conventions.
         // Compatibility only: once a resolver exists its exact IDs are authoritative.
@@ -358,9 +411,16 @@ impl GlyphTextRenderer {
         self.update_message_sizes_separate(enabled, name, dialogue, dialogue)
     }
     pub(super) fn update_message_sizes_separate(&mut self, enabled: bool, name: u32, dialogue: u32, subtitle: u32) -> bool {
-        if [name, dialogue, subtitle].iter().any(|v| !(75..=150).contains(v)) { return false; }
-        let next = MessageFontSizes { enabled, name, dialogue, subtitle };
+        self.update_message_sizes_with_choice(enabled, name, dialogue, subtitle, self.message_sizes.choice)
+    }
+    pub(super) fn update_message_sizes_with_choice(&mut self, enabled: bool, name: u32, dialogue: u32, subtitle: u32, choice: u32) -> bool {
+        if [name, dialogue, subtitle, choice].iter().any(|v| !(75..=150).contains(v)) { return false; }
+        let next = MessageFontSizes { enabled, name, dialogue, subtitle, choice, backlog: self.message_sizes.backlog };
         self.update_message_presentation(next, self.message_roles.clone())
+    }
+    pub(super) fn update_backlog_size(&mut self, backlog: u32) -> bool {
+        if !(75..=150).contains(&backlog) { return false; }
+        self.update_message_presentation(MessageFontSizes { backlog, ..self.message_sizes }, self.message_roles.clone())
     }
     pub(super) fn update_message_presentation(&mut self, next: MessageFontSizes,
         roles: Option<asb_interpreter::MessageLayerIds>) -> bool {
