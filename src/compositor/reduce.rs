@@ -24,7 +24,7 @@ mod hit_test;
 /// 由 Lua 脚本通过 `e:tag{"setonpush", key=..., handler="calllua", function="..."}`
 /// 之类的 seton* 标签注册。引擎在检测到相应输入时把它交还解释器执行，自身不解释
 /// handler/function 的含义——与 [`LayerEventHandler`] 同构。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InputHandler {
     /// 命中时先就地执行的标签名（如 `"calllua"`）。
     pub handler: Option<String>,
@@ -296,6 +296,17 @@ impl Compositor {
     }
 
     /// 查询指定事件/键组合的已注册处理器。宿主在检测到输入后调用。
+    pub(crate) fn input_snapshot(&self) -> Vec<(String, String, InputHandler)> {
+        let mut entries: Vec<_> = self.input_handlers.iter().map(|((event, key), handler)|
+            (event.clone(), key.clone(), handler.clone())).collect();
+        entries.sort_by(|a,b| (&a.0,&a.1).cmp(&(&b.0,&b.1)));
+        entries
+    }
+    pub(crate) fn restore_input_snapshot(&mut self, entries: &[(String, String, InputHandler)]) {
+        self.input_handlers = entries.iter().map(|(event,key,handler)|
+            ((event.clone(),key.clone()),handler.clone())).collect();
+    }
+
     pub fn get_input_handler(&self, event_name: &str, key: &str) -> Option<&InputHandler> {
         self.input_handlers
             .get(&(event_name.to_string(), key.to_string()))
@@ -486,7 +497,12 @@ impl Compositor {
             .message_layer_bindings
             .iter()
             .filter(|(message_id, scene_id)| {
-                layer_id_is_same_or_descendant(message_id, deleted_id)
+                // A standalone message can share a name with a temporary
+                // image layer. Deleting that image must not delete the text
+                // after chgmsg layered=0 detaches it. Parent deletion still
+                // removes logical descendants, including menu text overlays.
+                (message_id.as_str() != deleted_id
+                    && layer_id_is_same_or_descendant(message_id, deleted_id))
                     || layer_id_is_same_or_descendant(scene_id, deleted_id)
             })
             .map(|(message_id, scene_id)| (message_id.clone(), scene_id.clone()))
@@ -505,7 +521,8 @@ impl Compositor {
         }
 
         if self.default_message_layer.as_deref().is_some_and(|id| {
-            layer_id_is_same_or_descendant(id, deleted_id)
+            (!self.message_layer_bindings.contains_key(id)
+                && layer_id_is_same_or_descendant(id, deleted_id))
                 || removed.iter().any(|(message_id, _)| message_id == id)
         }) {
             self.default_message_layer = None;
@@ -728,25 +745,24 @@ impl Compositor {
                 // 以便父组可以在退场动画期间禁用所有子按钮。
                 if matches!(mode, "reset" | "disable" | "enable") {
                     let subtree = self.scene.subtree_ids(id);
-                    let mut found = false;
                     for layer_id in subtree {
                         let Some(layer) = self.scene.get_mut(&layer_id) else {
                             continue;
                         };
                         match mode {
-                            "reset" => found |= layer.event_handlers.remove(event_type).is_some(),
+                            "reset" => { layer.event_handlers.remove(event_type); },
                             "disable" | "enable" => {
                                 if let Some(existing) = layer.event_handlers.get_mut(event_type) {
                                     existing.enabled = mode == "enable";
-                                    found = true;
                                 }
                             }
                             _ => unreachable!(),
                         }
                     }
-                    if mode != "enable" || found {
-                        return;
-                    }
+                    // Restoring a modal dialog's event state must not invent
+                    // empty drag handlers on ordinary buttons (or recreate
+                    // layers which have already been deleted).
+                    return;
                 }
 
                 self.scene.ensure(id);
@@ -797,22 +813,25 @@ impl Compositor {
                     &[("file", file), ("label", label), ("handler", handler)],
                     &[("call", call)],
                 );
+                for key in key.split(',').map(str::trim) {
                 self.input_handlers.insert(
-                    (event_name.to_string(), key),
+                    (event_name.to_string(), key.to_string()),
                     InputHandler {
                         handler: handler.map(str::to_string),
                         file: file.map(str::to_string),
                         label: label.map(str::to_string),
                         call,
                         params: extra_params.clone(),
-                        filter_params,
+                        filter_params: filter_params.clone(),
                     },
                 );
+                }
             }
             CompositorEvent::DelInputHandler { event_name, key } => {
                 if let Some(key) = key {
-                    self.input_handlers
-                        .remove(&(event_name.to_string(), key.to_string()));
+                    for key in key.split(',').map(str::trim) {
+                        self.input_handlers.remove(&(event_name.to_string(), key.to_string()));
+                    }
                 } else {
                     self.input_handlers
                         .retain(|(name, _), _| name != event_name);
@@ -1405,7 +1424,7 @@ mod tests {
             }
             assert!(c.scene().get("panel2.other").unwrap().event_handlers["click"].enabled);
         }
-        for mode in ["disable", "reset"] {
+        for mode in ["disable", "reset", "enable"] {
             c.apply_event(&Event::LayerEventHandler {
                 id: "missing".into(), event_type: "click".into(), mode: mode.into(),
                 file: None, label: None, call: false, handler: None,
@@ -1413,6 +1432,12 @@ mod tests {
             });
             assert!(c.scene().get("missing").is_none());
         }
+        c.apply_event(&Event::LayerEventHandler {
+            id: "panel.first".into(), event_type: "drag".into(), mode: "enable".into(),
+            file: None, label: None, call: false, handler: None,
+            penetration: false, extra_params: HashMap::new(),
+        });
+        assert!(!c.scene().get("panel.first").unwrap().event_handlers.contains_key("drag"));
     }
 
     #[test]
@@ -1843,6 +1868,21 @@ mod tests {
         c.apply_event(&Event::Layer(LayerEvent::Delete { id: "1".into() }));
         assert!(c.scene().get("1").is_none());
         assert!(c.scene().get("2").unwrap().tweens.is_empty());
+    }
+
+    #[test]
+    fn deleting_detached_message_image_keeps_standalone_text() {
+        let mut c = Compositor::new();
+        c.ensure_layer("body");
+        c.set_message_layer_binding("body", "body");
+        c.ensure_layer("__message_overlay_body");
+        c.set_message_layer_binding("body", "__message_overlay_body");
+        c.set_default_message_layer(Some("body".into()));
+        c.apply_event(&Event::Layer(LayerEvent::Delete { id: "body".into() }));
+        assert!(c.scene().get("body").is_none());
+        assert!(c.scene().get("__message_overlay_body").is_some());
+        assert!(c.is_message_layer_visible("body"));
+        assert_eq!(c.default_message_layer.as_deref(), Some("body"));
     }
 
     #[test]

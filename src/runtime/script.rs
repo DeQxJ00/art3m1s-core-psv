@@ -731,6 +731,44 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn message_layer_queries_observe_switch_and_conditional_pop_before_dialogue() {
+        for queued in [false, true] {
+            let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
+            it.lua().load(r#"
+                function name_layer(e)
+                    e:tag{"chgmsg", id="name"}
+                end
+            "#).exec().unwrap();
+            let switch = if queued { "[calllua function=name_layer]" } else { "[chgmsg id=name]" };
+            it.load_script("dialogue", &format!(
+                "[chgmsg id=adv]\n{switch}\n[if estimate=\"$s.current_message_layer == 'name'\"]\n[/chgmsg]\n[/if]\n[var name=body_layer data=\"$s.current_message_layer\"]\n"
+            )).unwrap();
+            it.boot("dialogue").unwrap();
+            it.set_callback(|event| if super::super::events::event_requires_state_sync(&event) {
+                CallbackResult::Pause
+            } else { CallbackResult::Continue });
+            let mut active = String::new();
+            let mut stack = Vec::new();
+            loop {
+                match it.run().unwrap() {
+                    ExecutionResult::Wait(Event::MessageLayerSwitch { id, stack: push, .. }) => {
+                        if push { stack.push(active.clone()); }
+                        active = id.unwrap_or_default();
+                    }
+                    ExecutionResult::Wait(Event::MessageLayerPop) => {
+                        active = stack.pop().unwrap();
+                    }
+                    ExecutionResult::Completed => break,
+                    event => panic!("unexpected event: {event:?}"),
+                }
+                it.advance_line();
+                it.set_variable("s.current_message_layer", asb_interpreter::Value::String(active.clone()));
+            }
+            assert_eq!(it.get_variable("body_layer"), Some(asb_interpreter::Value::String("adv".into())));
+        }
+    }
+
+    #[test]
     fn completed_direct_and_queued_transitions_reach_the_next_instruction() {
         for queued in [false, true] {
             let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
@@ -746,6 +784,40 @@ mod tests {
             assert!(matches!(it.run().unwrap(), ExecutionResult::Completed));
             assert_eq!(it.get_variable("continued"), Some(asb_interpreter::Value::Int(1)), "queued={queued}");
         }
+    }
+
+    #[test]
+    fn queued_transition_holds_cleanup_until_completion_without_skipping_next_tag() {
+        let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            function transition(e)
+                e:enqueueTag{'trans', type=1, time=1200, input=0}
+                e:enqueueTag{'var', name='cleanup', data=1}
+                e:enqueueTag{'wait', time=0, input=1}
+                e:enqueueTag{'var', name='restored', data=1}
+            end
+        "#).exec().unwrap();
+        it.load_script("transition", "[calllua function=transition]\n[var name=cover_deleted data=1]\n").unwrap();
+        it.boot("transition").unwrap();
+        it.set_callback(|event| match event {
+            Event::Trans { .. } | Event::Wait { .. } => CallbackResult::Pause,
+            _ => CallbackResult::Continue,
+        });
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Trans { .. })));
+        // Simulate the host polling queued commands while the transition runs.
+        assert!(it.drain_queued_tags_only().unwrap().wait.is_none());
+        assert_eq!(it.get_variable("cleanup"), None);
+        it.lua().load("__engine:tag{'var', name='frame_event', data=1}").exec().unwrap();
+        it.drain_queued_tags_only().unwrap();
+        assert_eq!(it.get_variable("frame_event"), Some(asb_interpreter::Value::Int(1)));
+        super::release_completed_media_wait(&mut it, true);
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait { .. })));
+        assert_eq!(it.get_variable("cleanup"), Some(asb_interpreter::Value::Int(1)));
+        assert_eq!(it.get_variable("cover_deleted"), None);
+        it.advance_line();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Completed));
+        assert_eq!(it.get_variable("restored"), Some(asb_interpreter::Value::Int(1)));
+        assert_eq!(it.get_variable("cover_deleted"), Some(asb_interpreter::Value::Int(1)));
     }
 
     #[test]

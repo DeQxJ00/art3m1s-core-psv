@@ -14,7 +14,9 @@ impl CoreRuntime {
     /// number when this script gives that number a different meaning.
     #[cfg(feature = "gxm-menu-key-alias")]
     pub fn host_action_key(&self, action: &str) -> u32 {
-        resolve_host_action_key(&self.compositor, action)
+        let key = resolve_host_action_key(&self.compositor, action);
+        if key != 0 { return key; }
+        legacy_host_action_key(&self.interpreter, &self.compositor, action)
     }
 
     #[cfg(feature = "gxm-menu-key-alias")]
@@ -25,7 +27,15 @@ impl CoreRuntime {
 
     #[cfg(feature = "gxm-menu-key-alias")]
     pub fn host_menu_context(&self) -> bool {
-        host_menu_context_available(&self.interpreter)
+        if has_host_mode_api(&self.interpreter) {
+            return host_menu_context_available(&self.interpreter);
+        }
+        // Older script packs register function keys directly, without a Lua
+        // mode API. Only expose the host menu at a real dialogue input wait.
+        matches!(self.wait_reason, Some(asb_interpreter::event::WaitReason::Generic | asb_interpreter::event::WaitReason::Generic0))
+            && self.pending_dialog.is_none() && !self.script_forced_stop
+            && legacy_host_action_key(&self.interpreter, &self.compositor, "SAVE") != 0
+            && legacy_host_action_key(&self.interpreter, &self.compositor, "LOAD") != 0
     }
 
     pub fn feed_mouse(&self, x: i32, y: i32) {
@@ -872,6 +882,43 @@ mod tests {
         assert_eq!(resolve_host_action_key(&alias, "MENU"), 225);
         alias.apply_event(&bind("225", "OTHER"));
         assert_eq!(resolve_host_action_key(&alias, "MENU"), 0);
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
+    fn legacy_function_keys_require_live_handlers() {
+        let mut interpreter = Interpreter::default();
+        let mut compositor = Compositor::new();
+        interpreter.set_variable("g.function.save", asb_interpreter::Value::String("114".into()));
+        assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "SAVE"), 0);
+        for (handler, expected) in [("calllua", 114), ("dummy", 0)] {
+            compositor.apply_event(&Event::SetEventHandler {
+                event_name: "push".into(), file: None, label: None, call: false,
+                handler: Some(handler.into()), extra_params: HashMap::from([("key".into(), "114".into())]),
+            });
+            assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "SAVE"), expected);
+        }
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
+    fn legacy_history_list_and_automode_resolve_only_registered_keys() {
+        let mut interpreter = Interpreter::default();
+        let mut compositor = Compositor::new();
+        interpreter.set_variable("g.key.backlog.start", asb_interpreter::Value::String("38,136,151".into()));
+        interpreter.set_variable("g.function.automode", asb_interpreter::Value::String("120".into()));
+        for keys in ["38,136,151", "120"] {
+            compositor.apply_event(&Event::SetEventHandler {
+                event_name: "push".into(), file: None, label: Some("open".into()), call: true,
+                handler: Some("var".into()), extra_params: HashMap::from([("key".into(), keys.into())]),
+            });
+        }
+        assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "BACKLOG"), 38);
+        assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "AUTO"), 120);
+        assert!(compositor.get_input_handler("push", "136").is_some());
+        compositor.apply_event(&Event::DelEventHandler { event_name: "push".into(), key: Some("38,136,151".into()) });
+        assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "BACKLOG"), 0);
+        assert!(compositor.get_input_handler("push", "136").is_none());
     }
 
     #[cfg(feature = "gxm-menu-key-alias")]
@@ -1977,6 +2024,28 @@ fn host_menu_context_available(interpreter: &asb_interpreter::Interpreter) -> bo
         if type(allowed) ~= 'function' then return false end
         return allowed('adv') == true
     "#).eval::<bool>().unwrap_or(false)
+}
+
+#[cfg(feature = "gxm-menu-key-alias")]
+fn has_host_mode_api(interpreter: &asb_interpreter::Interpreter) -> bool {
+    interpreter.lua().load("return type(rawget(_G, 'getGameMode')) == 'function' or type(rawget(_G, 'get_gamemode')) == 'function'")
+        .eval::<bool>().unwrap_or(true)
+}
+
+#[cfg(feature = "gxm-menu-key-alias")]
+fn legacy_host_action_key(interpreter: &asb_interpreter::Interpreter, compositor: &Compositor, action: &str) -> u32 {
+    let primary = format!("g.function.{}", action.to_ascii_lowercase());
+    let alternate = match action {
+        "BACKLOG" => "g.key.backlog.start",
+        "AUTO" => "g.function.automode",
+        _ => "",
+    };
+    [primary.as_str(), alternate].into_iter().filter(|name| !name.is_empty())
+        .filter_map(|name| interpreter.get_variable(name))
+        .flat_map(|value| value.as_string().split(',').filter_map(|s| s.trim().parse::<u32>().ok()).collect::<Vec<_>>())
+        .find(|key| (8..=226).contains(key) && compositor.get_input_handler("push", &key.to_string())
+            .is_some_and(|h| h.handler.as_deref() != Some("dummy") && (h.handler.is_some() || h.label.is_some())))
+        .unwrap_or(0)
 }
 
 #[cfg(feature = "gxm-menu-key-alias")]

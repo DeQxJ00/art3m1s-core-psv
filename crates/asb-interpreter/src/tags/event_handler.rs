@@ -41,7 +41,9 @@ macro_rules! event_handler_struct {
                 let mut extra_params = std::collections::HashMap::new();
                 for (k, v) in &ctx.instruction.params {
                     if !known.contains(&k.as_str()) {
-                        extra_params.insert(k.clone(), v.clone());
+                        extra_params.insert(k.clone(), if k == "key" {
+                            ctx.resolve_param_str(k)?
+                        } else { v.clone() });
                     }
                 }
 
@@ -276,7 +278,7 @@ mod tests {
         };
         assert_eq!(file.as_deref(), Some("system/title.iet"));
         assert_eq!(label.as_deref(), Some("return_title"));
-        assert_eq!(extra_params.get("key").map(String::as_str), Some("$t.key"));
+        assert_eq!(extra_params.get("key").map(String::as_str), Some("27"));
     }
 
     #[test]

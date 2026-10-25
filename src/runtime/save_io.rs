@@ -134,6 +134,11 @@ impl CoreRuntime {
                 data = data.with_message_text(message_text);
             }
         }
+        if let (Some(text), Some(checkpoint)) = (&mut data.message_text, &self.gameplay_save_checkpoint) {
+            if data.current_script == checkpoint.script && data.current_line == checkpoint.line {
+                text.input_handlers = Some(checkpoint.input_handlers.clone());
+            }
+        }
         if data.input_wait_reason.is_none() {
             data.input_wait_reason = crate::save::InputWaitSnapshot::capture(self.wait_reason.as_ref());
         }
@@ -290,6 +295,7 @@ impl CoreRuntime {
             return;
         }
         self.gameplay_save_checkpoint = Some(crate::save::GameplayCheckpoint {
+            input_handlers: self.compositor.input_snapshot(),
             script: script.to_string(),
             line: self.interpreter.current_line(),
             call_stack,

@@ -813,9 +813,9 @@ impl TextRenderer for GlyphTextRenderer {
         // 文档：fontinit 除恢复默认字体外，字体堆栈也将被初始化（清空），
         // 否则之后的 [/font] 仍能弹出旧设置。
         l.font_stack.clear();
-        // 再现记录：以恢复后的字体快照落一条 font 标签，重放时得到同样状态
-        let snapshot = l.font.to_raw();
-        l.page_tags.push(BacklogTag::Font(snapshot));
+        // Keep the reset marker so native scripts can stop dialogue replay
+        // before menu-only text; a font snapshot would erase that boundary.
+        l.page_tags.push(BacklogTag::FontInit);
     }
     fn font_pop(&mut self) {
         self.mark_snapshot_changed();
@@ -1057,7 +1057,7 @@ impl TextRenderer for GlyphTextRenderer {
             ).final_indent;
             // rp 的 backlog 参数：1 入库 / 0 不入库（均无视 writebacklog），
             // 缺省按 writebacklog 的 mode。入库判定与页装配在 Backlog 内完成
-            // （allow=0、无文本、includefont 过滤、页数上限都在 push_page 里）。
+            // （无文本、includefont 过滤、页数上限都在 push_page 里）。
             if self.state.backlog.should_store(bl) {
                 let page = BacklogPage {
                     page_font: Some(l.page_font.clone()),
@@ -2893,6 +2893,7 @@ mod tests {
         let l = r.font_state_mut().active_layer_mut();
         assert_eq!(l.font.size, Some(30.0), "fontinit 应恢复 fontdefault 默认");
         assert!(l.font_stack.is_empty(), "文档：字体堆栈将被初始化（清空）");
+        assert_eq!(l.page_tags.last(), Some(&BacklogTag::FontInit));
     }
 
     #[test]

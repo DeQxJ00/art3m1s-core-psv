@@ -185,6 +185,19 @@ pub struct MessageTextSnapshot {
     pub active_layer: Option<String>,
     #[serde(default)]
     pub layers: Vec<MessageLayerTextSnapshot>,
+    #[serde(default)]
+    pub input_handlers: Option<Vec<(String, String, crate::compositor::reduce::InputHandler)>>,
+    #[serde(default)]
+    pub history: Option<HistorySnapshot>,
+
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistorySnapshot {
+    pub pages: Vec<crate::text::backlog::BacklogPage>,
+    pub settings: crate::text::backlog::BacklogSettings,
+    pub write_mode: bool,
+    pub max_pages: usize,
 }
 
 /// 单个消息层的页首字体与再现标签。
@@ -212,6 +225,7 @@ pub struct CallFrameSnapshot {
 /// 嵌套出去的，编号存档改写回这个等待的 PC/栈/局部变量。
 #[derive(Debug, Clone)]
 pub struct GameplayCheckpoint {
+    pub input_handlers: Vec<(String, String, crate::compositor::reduce::InputHandler)>,
     pub script: String,
     pub line: usize,
     pub call_stack: Vec<CallFrameSnapshot>,
@@ -406,6 +420,7 @@ mod tests {
         variables.set("sysbtn_mode", "set".into());
         variables.set("status", "adv".into());
         GameplayCheckpoint {
+            input_handlers: Vec::new(),
             script: "macro.iet".into(),
             line: 1626,
             input_wait_from_queue: true,
@@ -679,6 +694,11 @@ mod tests {
         data.input_wait_from_queue = Some(false);
         data.input_wait_reason = Some(InputWaitSnapshot::Key { buttons: vec!["circle".into()] });
         data.message_text = Some(MessageTextSnapshot {
+            input_handlers: Some(vec![("push".into(), "38".into(),
+                crate::compositor::reduce::InputHandler { label: Some("history".into()), ..Default::default() })]),
+            history: Some(HistorySnapshot { pages: vec![crate::text::backlog::BacklogPage {
+                tags: vec![crate::text::BacklogTag::Text("Earlier dialogue".into())], ..Default::default()
+            }], settings: Default::default(), write_mode: true, max_pages: 100 }),
             active_layer: Some("dialogue".into()),
             layers: vec![MessageLayerTextSnapshot { id: "dialogue".into(), page_font: Default::default(),
                 tags: vec![crate::text::BacklogTag::IndentModify(1), crate::text::BacklogTag::Text("Restored text".into())] }],

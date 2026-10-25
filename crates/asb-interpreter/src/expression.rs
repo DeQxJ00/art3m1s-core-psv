@@ -167,6 +167,7 @@ enum Token {
     LParen,
     RParen,
     Comma,
+    Dereference,
 }
 
 impl<'a> Lexer<'a> {
@@ -202,6 +203,10 @@ impl<'a> Lexer<'a> {
                 '%' => {
                     self.tokens.push(Token::Percent);
                     self.input.next();
+                }
+                '$' => {
+                    self.input.next();
+                    self.tokens.push(Token::Dereference);
                 }
                 '(' => {
                     self.tokens.push(Token::LParen);
@@ -351,6 +356,7 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     variables: &'a VariableStore,
+    quoted_result: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -359,6 +365,7 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             variables,
+            quoted_result: false,
         }
     }
 
@@ -476,23 +483,28 @@ impl<'a> Parser<'a> {
     /// 解析 + - 运算
     fn parse_addition(&mut self) -> Result<Value> {
         let mut left = self.parse_multiplication()?;
+        let mut left_quoted = self.quoted_result && matches!(left, Value::String(_));
 
         loop {
             match self.peek() {
                 Some(Token::Plus) => {
                     self.next();
                     let right = self.parse_multiplication()?;
-                    left = self.add_values(&left, &right)?;
+                    let right_quoted = self.quoted_result && matches!(right, Value::String(_));
+                    left = self.add_values(&left, &right, left_quoted || right_quoted)?;
+                    left_quoted = matches!(left, Value::String(_)) && (left_quoted || right_quoted);
                 }
                 Some(Token::Minus) => {
                     self.next();
                     let right = self.parse_multiplication()?;
                     left = self.sub_values(&left, &right)?;
+                    left_quoted = false;
                 }
                 _ => break,
             }
         }
 
+        self.quoted_result = left_quoted;
         Ok(left)
     }
 
@@ -526,6 +538,7 @@ impl<'a> Parser<'a> {
 
     /// 解析基本表达式
     fn parse_primary(&mut self) -> Result<Value> {
+        self.quoted_result = false;
         match self.peek().cloned() {
             Some(Token::Number(n)) => {
                 self.next();
@@ -545,6 +558,7 @@ impl<'a> Parser<'a> {
             }
             Some(Token::String(s)) => {
                 self.next();
+                self.quoted_result = true;
                 Ok(Value::String(s))
             }
             Some(Token::Ident(name)) => {
@@ -567,12 +581,21 @@ impl<'a> Parser<'a> {
                     }
                 }
                 // 查找变量
+                self.quoted_result = false;
                 if let Some(value) = self.variables.get(&full_name) {
                     Ok(value.clone())
                 } else {
                     // 变量不存在时返回 0
                     Ok(Value::Int(0))
                 }
+            }
+            Some(Token::Dereference) => {
+                self.next();
+                self.expect(&Token::LParen)?;
+                let name = self.parse_expression()?.as_string();
+                self.expect(&Token::RParen)?;
+                self.quoted_result = false;
+                Ok(self.variables.get(&name).cloned().unwrap_or(Value::Int(0)))
             }
             Some(Token::LParen) => {
                 self.next();
@@ -615,7 +638,18 @@ impl<'a> Parser<'a> {
     }
 
     /// 加法（支持字符串连接）
-    fn add_values(&self, left: &Value, right: &Value) -> Result<Value> {
+    fn add_values(&self, left: &Value, right: &Value, quoted: bool) -> Result<Value> {
+        // CSV/explode and macro parameters can hold numbers as strings.
+        // Arithmetic must not concatenate them; explicit quoted operands
+        // still request concatenation, preserving layer IDs and padded names.
+        if !quoted {
+            if let (Some(l), Some(r)) = (left.as_float(), right.as_float()) {
+                if let (Ok(l), Ok(r)) = (left.as_string().parse::<i64>(), right.as_string().parse::<i64>()) {
+                    if let Some(sum) = l.checked_add(r) { return Ok(Value::Int(sum)); }
+                }
+                return Ok(Value::Float(l + r));
+            }
+        }
         match (left, right) {
             (Value::String(l), _) => Ok(Value::String(format!("{}{}", l, right))),
             (_, Value::String(r)) => Ok(Value::String(format!("{}{}", left, r))),
@@ -705,6 +739,21 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_string_arithmetic_preserves_explicit_concatenation() {
+        let mut vars = VariableStore::new();
+        vars.set("margin", Value::String("28".into()));
+        vars.set("width", Value::String("381".into()));
+        vars.set("id", Value::String("1.80".into()));
+        let evaluator = ExpressionEvaluator::new(&vars);
+        assert_eq!(evaluator.evaluate("margin + width").unwrap().as_string(), "409");
+        assert_eq!(evaluator.evaluate("41 + margin + width").unwrap().as_string(), "450");
+        assert_eq!(evaluator.evaluate("'28' + width").unwrap().as_string(), "28381");
+        assert_eq!(evaluator.evaluate("id + '.1'").unwrap().as_string(), "1.80.1");
+        assert_eq!(evaluator.evaluate("('28') + width").unwrap().as_string(), "28381");
+        assert_eq!(evaluator.evaluate("$('margin') + width").unwrap().as_string(), "409");
+        assert_eq!(evaluator.evaluate("('2' * 3) + width").unwrap().as_string(), "387");
+    }
     use super::*;
 
     fn eval(expr: &str) -> Result<Value> {
@@ -716,6 +765,20 @@ mod tests {
     fn eval_with_vars(expr: &str, vars: &VariableStore) -> Result<Value> {
         let evaluator = ExpressionEvaluator::new(vars);
         evaluator.evaluate(expr)
+    }
+
+    #[test]
+    fn computed_variable_dereference_preserves_value_and_expression_precedence() {
+        let mut vars = VariableStore::new();
+        vars.set("pos".into(), Value::String("center".into()));
+        vars.set("pos_center".into(), Value::Int(640));
+        vars.set("path".into(), Value::String("image/background".into()));
+        let eval = ExpressionEvaluator::new(&vars);
+        assert_eq!(eval.resolve_param("$$('pos_' + pos)").unwrap(), Value::Int(640));
+        assert_eq!(eval.resolve_param("$10 + $('pos_' + pos) / 2").unwrap(), Value::Int(330));
+        assert_eq!(eval.resolve_param_str("$$('path')").unwrap(), "image/background");
+        assert_eq!(eval.resolve_param("$$('missing')").unwrap(), Value::Int(0));
+        assert_eq!(eval.resolve_param("$'literal $(name)'").unwrap(), Value::String("literal $(name)".into()));
     }
 
     #[test]

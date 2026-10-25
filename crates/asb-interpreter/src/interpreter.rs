@@ -302,6 +302,7 @@ pub struct Interpreter {
     macro_files: HashMap<String, Vec<String>>,
     /// Compiled macros retain file-local labels and absolute branch addresses.
     compiled_macro_files: HashMap<String, String>,
+    text_macro_files: HashMap<String, String>,
 }
 
 fn json_to_lua_value(lua: &Lua, value: serde_json::Value) -> mlua::Result<mlua::Value> {
@@ -570,6 +571,7 @@ impl Interpreter {
             macros: MacroRegistry::new(),
             macro_files: HashMap::new(),
             compiled_macro_files: HashMap::new(),
+            text_macro_files: HashMap::new(),
         }
     }
 
@@ -863,6 +865,9 @@ impl Interpreter {
 
     fn step_inner(&mut self) -> Result<ExecutionResult> {
         loop {
+            if self.requeue_restored_click_wait()? {
+                continue;
+            }
             // A queued handler may return to a PC that is already the next
             // script instruction. Re-emit the original wait before flushing
             // deferred tags or executing that instruction.
@@ -880,6 +885,9 @@ impl Interpreter {
             // [calllua]/[lua] 产生，必须走标签管线才能发出对应事件。
             if let Some(result) = self.flush_tag_queue()? {
                 return Ok(result);
+            }
+            if self.requeue_restored_click_wait()? {
+                continue;
             }
             if let Some(event) = self.queued_wait_at_current_position() {
                 self.last_wait_from_queue = true;
@@ -936,29 +944,19 @@ impl Interpreter {
                 continue;
             }
 
-            // 处理剧情文本
-            if instruction.tag == "__text" {
-                let text = instruction.get("text").unwrap_or("").to_string();
-                let result = self.emit_event(Event::ScenarioText {
-                    content: text.clone(),
-                    inline: false,
-                });
-                match result {
-                    CallbackResult::Continue => {
-                        self.current_line += 1;
-                        continue;
-                    }
-                    CallbackResult::Pause => {
-                        return Ok(ExecutionResult::Wait(Event::ScenarioText {
-                            content: text,
-                            inline: false,
-                        }));
-                    }
-                    CallbackResult::Abort => {
-                        return Err(Error::Aborted);
-                    }
+            // Native text blocks become print(data=...), including the normal
+            // tag-filter boundary used for language selection and text rewriting.
+            let instruction = if instruction.tag == "__text" {
+                Instruction {
+                    tag: "print".into(),
+                    params: HashMap::from([(
+                        "data".into(), instruction.get("text").unwrap_or("").to_string()
+                    )]),
+                    line: instruction.line,
                 }
-            }
+            } else {
+                instruction
+            };
 
             // 处理 Lua 代码块：已在脚本加载时统一执行（Artemis 语义，见
             // load_script），行指针走到这里直接跳过。仅当块从未执行过时补跑
@@ -1279,7 +1277,10 @@ impl Interpreter {
                             // 这个 Wait 来自排队标签，current_line 已指向下一条待执行
                             // 指令；记录来源，使 advance_line() 退化为空操作。
                             self.last_wait_from_queue = true;
-                            self.last_queue_pause_is_wait = matches!(event, Event::Wait { .. });
+                            // A queued transition owns its continuation until the host
+                            // reports completion, just like a queued script wait.
+                            self.last_queue_pause_is_wait =
+                                matches!(event, Event::Wait { .. } | Event::Trans { .. });
                             if self.last_queue_pause_is_wait {
                                 self.record_queued_wait_checkpoint(&event);
                             }
@@ -1294,7 +1295,9 @@ impl Interpreter {
                             CallbackResult::Continue => {}
                             CallbackResult::Pause => {
                                 self.last_wait_from_queue = true;
-                                self.last_queue_pause_is_wait = matches!(event, Event::Wait { .. });
+                                // Preserve the continuation of queued waits and transitions.
+                                self.last_queue_pause_is_wait =
+                                    matches!(event, Event::Wait { .. } | Event::Trans { .. });
                                 if self.last_queue_pause_is_wait {
                                     self.record_queued_wait_checkpoint(&event);
                                 }
@@ -1527,6 +1530,9 @@ impl Interpreter {
             // 空数组：无处可去，忽略（脚本至少要留 1 帧）。
             return Ok(());
         };
+        for (file, _) in &frames {
+            self.load_external_script(file)?;
+        }
         self.queued_wait_checkpoints.clear();
         self.active_queued_wait = None;
         self.call_stack = rest
@@ -1617,10 +1623,13 @@ impl Interpreter {
         for name in &names {
             if compiled {
                 self.compiled_macro_files.insert(name.clone(), file.into());
+                self.text_macro_files.remove(name);
             } else {
                 self.compiled_macro_files.remove(name);
+                self.text_macro_files.insert(name.clone(), file.into());
             }
         }
+        if !compiled { self.insert_script(file.to_string(), (*script).clone()); }
         self.macro_files.insert(file.to_string(), names);
         Ok(count)
     }
@@ -1632,6 +1641,7 @@ impl Interpreter {
             for name in names {
                 self.macros.macros.remove(&name);
                 self.compiled_macro_files.remove(&name);
+                self.text_macro_files.remove(&name);
             }
         }
     }
@@ -1641,14 +1651,12 @@ impl Interpreter {
         &self.macros
     }
 
-    /// 编译宏调用原文件标签；文本宏沿用展开后的合成脚本。
+    /// File-backed macros retain their source labels and conditional returns.
+    /// Programmatically registered macros retain the legacy expansion path.
     ///
-    /// docs/spec/macro.md：宏实参自动展开为变量（宏体内 `$param`、
-    /// `var_exist target="param"` 都按变量取用）；同时经
-    /// [`MacroRegistry::expand`] 做值参数的文本替换（estimate/cond 表达式
-    /// 除外，见 macro.rs）。展开结果拼上收尾 [return] 构成合成脚本，用
-    /// `TagResult::Call` 进入，宏体内 if/endif 与显式 [return] 都按普通
-    /// 脚本语义工作。
+    /// File-backed arguments live in a call-depth scope and are restored on
+    /// return. Direct registry entries without a source script still expand
+    /// their value parameters into a synthetic script.
     fn invoke_macro(
         &mut self,
         instruction: &Instruction,
@@ -1666,11 +1674,11 @@ impl Interpreter {
             args
         };
         let compiled_file = self.compiled_macro_files.get(&instruction.tag).cloned();
-        // Compiled macro parameters are local to this invocation. A nested
+        // File-backed macro parameters are local to this invocation. A nested
         // macro must not inherit optional arguments from its caller.
         {
             let mut store = self.variables.lock().unwrap();
-            if compiled_file.is_some() {
+            if compiled_file.is_some() || self.text_macro_files.contains_key(&instruction.tag) {
                 store.push_macro_scope(self.call_stack.len() + 1, &args);
             } else {
                 for (key, value) in &args {
@@ -1679,10 +1687,10 @@ impl Interpreter {
             }
         }
 
-        // Binary macros can branch to another label in their own file and
-        // return from inside a condition. Do not slice them at the first return
-        // or move absolute compiler targets into a synthetic script.
-        if let Some(file) = compiled_file {
+        // Both text and binary macros may call sibling labels and return from
+        // inside a condition. Keep the complete source control flow instead
+        // of slicing at the first return into a label-free synthetic script.
+        if let Some(file) = compiled_file.or_else(|| self.text_macro_files.get(&instruction.tag).cloned()) {
             return Ok(TagResult::Call {
                 file: Some(file),
                 label: instruction.tag.clone(),
@@ -1736,7 +1744,11 @@ impl Interpreter {
                     message: "invalid compiled goto target".into(),
                 });
         }
-        let has_builtin = self.tag_registry.contains(&instruction.tag);
+        // lyc2 is a host compatibility alias, whereas native projects may
+        // register it as a path-expanding script macro. Do not shadow that
+        // macro with the fallback alias.
+        let has_builtin = self.tag_registry.contains(&instruction.tag)
+            && !(instruction.tag == "lyc2" && self.macros.contains(&instruction.tag));
 
         if apply_tag_filter {
             // 场景脚本中的标签先经过 Artemis tag filter。filter 内通过 e:tag /
@@ -2028,10 +2040,22 @@ impl Interpreter {
         // 获取 engine 对象
         let engine: mlua::Value = self.lua.globals().get("__engine")?;
 
-        let result: mlua::Value = match engine {
+        // A filter invoked while draining e:tag commands is nested inside the
+        // current command. Its immediate output must precede the caller's
+        // remaining commands (in particular /chgmsg), not follow them.
+        let pending_immediate = {
+            let mut ctx = self.engine_ctx.lock().unwrap();
+            std::mem::take(&mut ctx.immediate_tag_count)
+        };
+        let result: mlua::Result<mlua::Value> = match engine {
             mlua::Value::UserData(ud) => func.call((ud, param_table)),
             _ => func.call((param_table,)),
-        }?;
+        };
+        {
+            let mut ctx = self.engine_ctx.lock().unwrap();
+            ctx.immediate_tag_count += pending_immediate;
+        }
+        let result = result?;
 
         Ok(if lua_filter_consumes(&result) {
             LuaTagFilterDecision::Consume
@@ -2355,6 +2379,33 @@ impl Interpreter {
         Some(event)
     }
 
+    fn requeue_restored_click_wait(&mut self) -> Result<bool> {
+        let Some(checkpoint) = self.queued_wait_checkpoints.last() else {
+            return Ok(false);
+        };
+        if !checkpoint.allow_queue || checkpoint.advance_on_release
+            || !matches!(checkpoint.event, Event::Wait { reason: WaitReason::Generic })
+            || self.current_script.as_deref() != Some(checkpoint.script.as_str())
+            || self.current_line != checkpoint.line
+            || !same_call_stack(&self.call_stack, &checkpoint.stack)
+            || !self.engine_ctx.lock().unwrap().tag_queue.is_empty()
+        {
+            return Ok(false);
+        }
+        // Reconstruction helpers may enable scripted replay. Give the current
+        // filter a chance to consume the saved click wait before holding it.
+        // With no filter, or a pass-through filter, preserve the saved wait.
+        self.sync_script_state_to_engine();
+        if self.dispatch_lua_tag_filter("@", &HashMap::new())?
+            != LuaTagFilterDecision::Consume
+        {
+            return Ok(false);
+        }
+        self.queued_wait_checkpoints.pop();
+        self.active_queued_wait = None;
+        Ok(true)
+    }
+
     /// 获取变量存储的快照（用于存档）
     ///
     /// 变量现由 `Arc<Mutex<_>>` 持有，返回克隆快照以避免暴露锁。
@@ -2427,6 +2478,12 @@ impl Interpreter {
         line: usize,
         stack: Vec<CallFrame>,
     ) -> Result<()> {
+        // Lua's getScriptBlock can inspect any restored caller immediately,
+        // before control returns to it. Load the entire saved stack first.
+        self.load_external_script(script)?;
+        for frame in &stack {
+            self.load_external_script(&frame.script)?;
+        }
         self.current_script = Some(script.to_string());
         self.current_line = line;
         self.call_stack = stack;
@@ -4002,6 +4059,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plain_dialogue_uses_print_filter_for_language_selection() {
+        let mut it = Interpreter::default();
+        it.lua().load(r#"
+            __engine:setTagFilter({
+                lang = function(e, p)
+                    e:tag{"var", name="current_language", data=p["0"]}
+                    return 1
+                end,
+                print = function(e, p)
+                    if e:var("current_language") ~= "zh" then p.data = nil end
+                    p[1] = "print"
+                    e:tag(p)
+                    return 1
+                end
+            })
+        "#).exec().unwrap();
+        it.load_script("dialogue", "[lang ja]Japanese\n[lang en]English\n[lang zh]Chinese\n").unwrap();
+        it.boot("dialogue").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = seen.clone();
+        it.set_callback(move |event| {
+            if let Event::ScenarioText { content, .. } = event {
+                output.lock().unwrap().push(content.clone());
+            }
+            CallbackResult::Continue
+        });
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Completed));
+        let text = seen.lock().unwrap().join("");
+        assert_eq!(text, "Chinese");
+    }
+
+    #[test]
+    fn registered_layer_macro_takes_precedence_over_compatibility_alias() {
+        let mut it = Interpreter::default();
+        it.set_file_loader(Box::new(|_| Ok(br#"
+*lyc2
+[var name="t.resolved" data="$'assets/' + file"]
+[return]
+"#.to_vec())));
+        it.load_macro_file("helpers.iet").unwrap();
+        it.load_script("main", "*main\n[lyc2 file=\"image/title\"]\n[return]\n").unwrap();
+        it.start("main", "main").unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Completed));
+        assert_eq!(it.variables().get("t.resolved"), Some(&Value::String("assets/image/title".into())));
+    }
+
+    #[test]
+    fn text_macro_restores_arguments_after_nested_calls() {
+        let mut it = Interpreter::default();
+        it.set_file_loader(Box::new(|_| Ok(br#"
+*outer
+[inner id="child" file="nested"]
+[var name="t.outer_id" data="$id"]
+[var name="t.outer_file" data="$file"]
+[return]
+*inner
+[var name="t.inner_id" data="$id"]
+[return]
+"#.to_vec())));
+        it.load_macro_file("helpers.iet").unwrap();
+        it.load_script("main", "*main\n[outer id=\"parent\" file=\"original\"]\n[return]\n").unwrap();
+        it.start("main", "main").unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Completed));
+        assert_eq!(it.variables().get("t.inner_id"), Some(&Value::String("child".into())));
+        assert_eq!(it.variables().get("t.outer_id"), Some(&Value::String("parent".into())));
+        assert_eq!(it.variables().get("t.outer_file"), Some(&Value::String("original".into())));
+    }
+
+    #[test]
+    fn text_macro_retains_sibling_labels_and_conditional_returns() {
+        for queued in [false, true] {
+            for early in [0, 1] {
+                let mut it = Interpreter::default();
+                it.set_file_loader(Box::new(|path| match path {
+                    "helpers.iet" => Ok(br#"
+*clear
+[call label="remove"]
+[var name="t.after" data="1"]
+[return]
+*remove
+[if estimate="$early == '1'"]
+[var name="t.removed" data="1"]
+[return]
+[/if]
+[jump label="finish"]
+[var name="t.bad" data="1"]
+*finish
+[var name="t.removed" data="2"]
+[return]
+"#.to_vec()),
+                    other => Err(crate::Error::ScriptNotFound(other.into())),
+                }));
+                it.load_macro_file("helpers.iet").unwrap();
+                it.lua().load(format!("function invoke(e) e:enqueueTag{{'clear', early='{early}'}} end")).exec().unwrap();
+                let call = if queued { "[calllua function=\"invoke\"]".into() }
+                    else { format!("[clear early=\"{early}\"]") };
+                it.load_script("main", &format!("*main\n{call}\n[return]\n")).unwrap();
+                it.start("main", "main").unwrap();
+                assert!(matches!(it.run().unwrap(), ExecutionResult::Completed));
+                assert_eq!(it.variables().get("t.removed"), Some(&Value::Int(if early == 1 { 1 } else { 2 })));
+                assert_eq!(it.variables().get("t.after"), Some(&Value::Int(1)));
+                assert_eq!(it.variables().get("t.bad"), None);
+                assert!(it.call_stack().is_empty());
+            }
+        }
+    }
+
     /// [macroadd] 注册新宏文件；[macrodel] 后其中的宏恢复为未知标签（Custom）。
     #[test]
     fn macroadd_and_macrodel_register_and_unregister_macro_files() {
@@ -4402,6 +4567,51 @@ mod tests {
         assert_eq!(parts.get::<String>(3).unwrap(), "gamma");
     }
 
+    #[test]
+    fn nested_filter_print_stays_inside_queued_message_layer() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("query", "*main\n[return]\n").unwrap();
+        it.start("query", "main").unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = events.clone();
+        it.set_callback(move |event| {
+            match event {
+                Event::MessageLayerSwitch { id, .. } => capture.lock().unwrap().push(format!("enter:{}", id.as_deref().unwrap_or(""))),
+                Event::ScenarioText { content, .. } => capture.lock().unwrap().push(content.clone()),
+                Event::MessageLayerPop => capture.lock().unwrap().push("leave".into()),
+                _ => {},
+            }
+            CallbackResult::Continue
+        });
+        it.lua().load(r#"
+            __engine:setTagFilter({print=function(e,p)
+                e:tag{'print',data=p.data}; return 1
+            end})
+            __engine:tag{'chgmsg',id='slot'}
+            __engine:tag{'tag',data='print,data,summary'}
+            __engine:tag{'/chgmsg'}
+            __engine:tag{'print',data='after'}
+        "#).exec().unwrap();
+        it.run().unwrap();
+        assert_eq!(*events.lock().unwrap(), ["enter:slot", "summary", "leave", "after"]);
+    }
+
+    #[test]
+    fn cold_restore_exposes_caller_instructions_to_lua() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.set_file_loader(Box::new(|_| Ok(b"*main\n[wait]\n[return]\n".to_vec())));
+        it.restore_position("message", 0, vec![crate::CallFrame {
+            script: "story".into(), return_line: 1,
+        }]).unwrap();
+        it.sync_script_state_to_engine();
+        it.lua().load(r#"
+            local stack = __engine:getScriptStack()
+            assert(#stack == 2)
+            assert(__engine:getScriptBlock(stack[1]).command == 'return')
+            assert(__engine:getScriptBlock(stack[2]).command == 'wait')
+        "#).exec().unwrap();
+    }
+
     #[cfg(feature = "backend-luau")]
     struct TestCallbacks {
         writes: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
@@ -4601,6 +4811,27 @@ mod tests {
         it.advance_line();
         it.run().unwrap();
         assert_eq!(it.get_variable("after_wait"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn restored_wait_uses_filter_after_reconstruction() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "*main\n[@]\n*resume\n[var name=after_wait data=1]\n[stop]\n").unwrap();
+        it.load_script("helper", "*main\n[var name=replay data=1]\n[return]\n").unwrap();
+        it.lua().load(r#"
+            __engine:setTagFilter({["@"] = function(e, p)
+                if e:var("replay") == "1" then return 1 end
+                return 0
+            end})
+        "#).exec().unwrap();
+        it.start("story", "main").unwrap();
+        let resume = it.get_script("story").unwrap().get_label_line("resume").unwrap();
+        it.restore_position("story", resume, Vec::new()).unwrap();
+        it.hold_queued_input_wait();
+        it.lua().load("__engine:enqueueTag{'call', file='helper', label='main'}").exec().unwrap();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("after_wait"), Some(Value::Int(1)));
+        assert!(it.queued_wait_checkpoints.is_empty());
     }
 
     #[test]

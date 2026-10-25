@@ -213,6 +213,9 @@ mod tests {
     fn roles_and_disabled_values_are_independent() {
         let s = MessageFontSizes { enabled: true, name: 125, dialogue: 150, subtitle: 150, choice: 100, backlog: 100 };
         assert_eq!(s.scale("100.mw.name", None), 1.25);
+        assert_eq!(s.scale("name", None), 1.25);
+        assert_eq!(s.scale("adv", None), 1.5);
+        assert_eq!(s.scale("novel", None), 1.5);
         assert_eq!(s.scale("100.mw.adv", None), 1.5);
         assert_eq!(s.scale("100.mw.sub", None), 1.5);
         assert_eq!(s.scale("1.80.mw.adv_name", None), 1.25);
@@ -378,10 +381,11 @@ impl MessageFontSizes {
         // Older scripts without mw_getmsgid hard-code these layer conventions.
         // Compatibility only: once a resolver exists its exact IDs are authoritative.
         // Never broaden this to arbitrary suffix/substring matching.
-        let role = id.rsplit_once(".mw.").map(|(_, role)| role);
+        let role = id.rsplit_once(".mw.").map(|(_, role)| role).or_else(||
+            matches!(id, "adv" | "novel" | "name").then_some(id));
         let percent = match role {
             Some("name" | "adv_name") => self.name,
-            Some("adv" | "adv_adv") => self.dialogue,
+            Some("adv" | "adv_adv" | "novel") => self.dialogue,
             Some("sub" | "adv_sub") => self.subtitle,
             _ if id == DEFAULT_MESSAGE_LAYER => self.dialogue,
             _ => 100,

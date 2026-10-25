@@ -7,6 +7,28 @@ use std::sync::{Arc, LazyLock, Mutex};
 mod message_cache;
 use message_cache::MessageInput;
 
+/// Public tag-query values use the native `tag,key,value` wire format.
+/// Keep the bracket representation private to our snapshots and save files.
+pub(super) fn native_query_tags(tags: Vec<String>) -> Vec<String> {
+    fn escape(value: &str) -> String {
+        value.replace('\\', "\\\\").replace(',', "\\,")
+    }
+    tags.into_iter().filter_map(|tag| {
+        let script = asb_interpreter::Script::parse("message-query", &tag).ok()?;
+        let instruction = script.instructions.first()?;
+        let mut result = escape(&instruction.tag);
+        let mut params: Vec<_> = instruction.params.iter().collect();
+        params.sort_by_key(|(key, _)| *key);
+        for (key, value) in params {
+            result.push(','); result.push_str(&escape(key));
+            // Snapshot attributes escape literal backslashes; the script
+            // parser preserves those pairs (paths normally are not escaped).
+            result.push(','); result.push_str(&escape(&value.replace("\\\\", "\\")));
+        }
+        Some(result)
+    }).collect()
+}
+
 fn text_span_ready(state: &crate::text::render::FontState, span: &TextSpanToken) -> Option<bool> {
     let layer = state.layers.get(&span.layer_id)?;
     (layer.generation == span.generation).then_some(!layer.reveal_pending)
@@ -661,9 +683,8 @@ impl CoreRuntime {
         let state = renderer.font_state();
         let mut layers = Vec::new();
         for (id, layer) in &state.layers {
-            if layer.page_tags.is_empty() {
-                continue;
-            }
+            // Empty speaker/body layers still carry layout needed by the next
+            // line after a narration save. Preserve their font and coordinates.
             layers.push(crate::save::MessageLayerTextSnapshot {
                 id: id.clone(),
                 page_font: layer.page_font.clone(),
@@ -677,6 +698,12 @@ impl CoreRuntime {
         Some(crate::save::MessageTextSnapshot {
             active_layer: state.active_layer.clone(),
             layers,
+            input_handlers: Some(self.compositor.input_snapshot()),
+            history: Some(crate::save::HistorySnapshot {
+                pages: state.backlog.snapshot_pages().map(|page| page.as_ref().clone()).collect(),
+                settings: state.backlog.settings.clone(), write_mode: state.backlog.write_mode,
+                max_pages: state.backlog.max_pages,
+            }),
         })
     }
 
@@ -688,6 +715,18 @@ impl CoreRuntime {
     }
 
     fn restore_message_text_snapshot(&mut self, snapshot: &crate::save::MessageTextSnapshot) {
+        if let Some(entries) = &snapshot.input_handlers {
+            self.compositor.restore_input_snapshot(entries);
+        }
+        if let (Some(history), Some(renderer)) = (&snapshot.history, self.text_renderer.as_mut()) {
+            let backlog = &mut renderer.font_state_mut().backlog;
+            backlog.clear();
+            backlog.max_pages = history.max_pages;
+            for page in &history.pages { backlog.push_page(page.clone()); }
+            backlog.settings = history.settings.clone();
+            backlog.write_mode = history.write_mode;
+        }
+
         crate::core_info!(
             "[runtime] 还原消息层文本 layers={} active={:?}",
             snapshot.layers.len(),
@@ -721,6 +760,7 @@ impl CoreRuntime {
                         crate::text::BacklogTag::Font(settings) => {
                             renderer.apply_font_settings(settings)
                         }
+                        crate::text::BacklogTag::FontInit => renderer.font_init(),
                         crate::text::BacklogTag::RubyStart(text) => renderer.ruby_start(text),
                         crate::text::BacklogTag::RubyEnd => renderer.ruby_end(),
                         crate::text::BacklogTag::Indent { pair, range, nest, logical_range } => {
@@ -909,6 +949,27 @@ pub(super) fn font_fallback_candidates(face: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_message_query_round_trips_through_dynamic_tag() {
+        use asb_interpreter::{Interpreter, InterpreterConfig, Event};
+        let original = "hello, quoted \"text\" \\ path";
+        let tag = crate::text::backlog::BacklogTag::Text(original.into()).to_tag_string();
+        let tags = super::native_query_tags(vec![tag]);
+        assert!(tags[0].starts_with("print,data,"));
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("query", "*main\n[return]\n").unwrap();
+        it.start("query", "main").unwrap();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let capture = received.clone();
+        it.set_callback(move |event| {
+            if let Event::ScenarioText { content, .. } = event { *capture.lock().unwrap() = content.clone(); }
+            asb_interpreter::CallbackResult::Continue
+        });
+        it.lua().globals().set("wire", tags[0].clone()).unwrap();
+        it.lua().load("__engine:enqueueTag{'tag',data=wire}").exec().unwrap();
+        it.run().unwrap();
+        assert_eq!(*received.lock().unwrap(), original);
+    }
     #[cfg(feature = "gxm-text-epoch")]
     #[test]
     fn epoch_snapshot_matches_fresh_queries_across_mutation_and_renderer_replacement() {

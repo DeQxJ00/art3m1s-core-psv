@@ -128,7 +128,18 @@ impl Script {
             // docs/spec/script_syntax.md；预处理器注入的
             // [onlinehead]text[onlineend] 也依赖此规则）
             if line.contains('[') {
-                let segments = split_line_segments(line);
+                let mut joined = String::new();
+                let mut in_tag = false;
+                let mut in_quote = false;
+                append_tag_line(line, &mut joined, &mut in_tag, &mut in_quote);
+                // Attribute lists may span physical lines. Comments outside
+                // quoted values end at the physical line, not the whole tag.
+                while in_tag && line_idx + 1 < lines.len() {
+                    line_idx += 1;
+                    joined.push('\n');
+                    append_tag_line(lines[line_idx], &mut joined, &mut in_tag, &mut in_quote);
+                }
+                let segments = split_line_segments(&joined);
 
                 for segment in segments {
                     let inner = match &segment {
@@ -267,6 +278,27 @@ pub(crate) enum LineSegment {
     Text(String),
 }
 
+fn append_tag_line(line: &str, output: &mut String, in_tag: &mut bool, in_quote: &mut bool) {
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if *in_quote && ch == '\\' && chars.peek() == Some(&'"') {
+            output.push(ch);
+            output.push(chars.next().unwrap());
+            continue;
+        }
+        if !*in_quote && ch == '/' && chars.peek() == Some(&'/') {
+            break;
+        }
+        match ch {
+            '[' if !*in_tag => *in_tag = true,
+            '"' if *in_tag => *in_quote = !*in_quote,
+            ']' if *in_tag && !*in_quote => *in_tag = false,
+            _ => {}
+        }
+        output.push(ch);
+    }
+}
+
 /// 把一行文本按出现顺序切分成标签段与文本段（支持一行多个标签、
 /// 文本与标签混排）。
 ///
@@ -282,7 +314,13 @@ pub(crate) fn split_line_segments(line: &str) -> Vec<LineSegment> {
     let mut in_tag = false;
     let mut in_quote = false; // 仅在标签内部有效
 
-    for ch in line.chars() {
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if in_quote && ch == '\\' && chars.peek() == Some(&'"') {
+            current.push(ch);
+            current.push(chars.next().unwrap());
+            continue;
+        }
         match ch {
             '"' if in_tag => {
                 in_quote = !in_quote;
@@ -392,6 +430,9 @@ fn parse_params(params_str: &str, line: usize) -> Result<HashMap<String, String>
             loop {
                 match chars.next() {
                     Some('"') => break,
+                    Some('\\') if chars.peek() == Some(&'"') => {
+                        value.push(chars.next().unwrap());
+                    }
                     Some(c) => value.push(c),
                     None => {
                         return Err(Error::ParseError {
@@ -462,6 +503,37 @@ fn parse_params(params_str: &str, line: usize) -> Result<HashMap<String, String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quoted_brackets_and_escaped_quotes_do_not_join_following_commands() {
+        let script = super::Script::parse("sample", r#"[wordparts parts="abc\"[]"]
+[font face="font/body.otf"]
+"#).unwrap();
+        assert_eq!(script.instructions.len(), 2);
+        assert_eq!(script.instructions[0].get("parts"), Some("abc\"[]"));
+        assert_eq!(script.instructions[1].tag, "font");
+    }
+    #[test]
+    fn multiline_tag_attributes_keep_comments_and_source_lines_separate() {
+        let script = super::Script::parse("sample", concat!(
+            "[font face=\"font/body.otf\"\n",
+            " size=\"32\" // ignored ] and \" quote\n",
+            " // full line comment\n",
+            " width=\"430\" data=\"https://example.test/[font]\"\n",
+            "]\n",
+            "[print data=\"Confirm language\"]\n",
+            "[lua]\nvalue = 1\n[/lua]\n[return]\n",
+        )).unwrap();
+        assert_eq!(script.instructions.len(), 4);
+        let font = &script.instructions[0];
+        assert_eq!(font.tag, "font");
+        assert_eq!(font.line, 1);
+        assert_eq!(font.get("face"), Some("font/body.otf"));
+        assert_eq!(font.get("width"), Some("430"));
+        assert_eq!(font.get("data"), Some("https://example.test/[font]"));
+        assert_eq!(script.instructions[1].line, 6);
+        assert_eq!(script.instructions[2].tag, "__lua_block");
+        assert_eq!(script.instructions[3].tag, "return");
+    }
     use super::*;
 
     #[test]

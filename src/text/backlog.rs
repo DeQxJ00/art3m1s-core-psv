@@ -49,6 +49,9 @@ pub enum BacklogTag {
     LineBreak,
     /// 字体设置，再现为 `[font k="v" …]`（参数表原样保留）。
     Font(HashMap<String, String>),
+    /// Preserve the native reset marker: script-driven page replay uses it
+    /// to distinguish dialogue from temporary menu text appended afterward.
+    FontInit,
     /// 注音开始，再现为 `[ruby text="…"]`。
     RubyStart(String),
     /// 注音结束，再现为 `[/ruby]`。
@@ -66,6 +69,7 @@ impl BacklogTag {
             BacklogTag::Text(t) => format!("[print data=\"{}\"]", escape_attr(t)),
             BacklogTag::LineBreak => "[rt]".to_string(),
             BacklogTag::Font(params) => tag_with_params("font", params),
+            BacklogTag::FontInit => "[fontinit]".into(),
             BacklogTag::RubyStart(t) => format!("[ruby text=\"{}\"]", escape_attr(t)),
             BacklogTag::RubyEnd => "[/ruby]".to_string(),
             BacklogTag::Indent { pair, range, nest, logical_range } => format!(
@@ -81,7 +85,7 @@ impl BacklogTag {
 }
 
 /// 一页历史：文本段落 + 再现所需的标签序列。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BacklogPage {
     /// 页首字体快照（页开始时当前字体的 raw 参数表）。
     /// `get_backlog_tags` 的 allfont=1 时作为开头的 `[font …]` 输出；
@@ -129,9 +133,9 @@ impl BacklogPage {
 
 /// `backlog` 标签的配置（allow 之外的参数解释器尚未透传，
 /// 字段与缺省值先按文档备好，事件字段补齐后即可直接落值）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BacklogSettings {
-    /// allow=0 禁止使用历史文本 / 1 允许（禁止时换页不入库）。
+    /// Controls the built-in history UI; script-owned history still records pages.
     pub allow: bool,
     /// 历史文本用的消息层 ID（文档默认 "backlog"）。
     pub message_layer: String,
@@ -226,11 +230,11 @@ impl Backlog {
     }
 
     /// 把一页存入历史：
-    /// - allow=false 或页内无文本时丢弃；
+    /// - 页内无文本时丢弃；
     /// - includefont=false 时剥掉页首字体与页内 font 标签；
     /// - 超过 max_pages 丢最旧页。
     pub fn push_page(&mut self, mut page: BacklogPage) {
-        if !self.settings.allow || !page.has_text() {
+        if !page.has_text() {
             return;
         }
         if !self.settings.include_font {
@@ -263,7 +267,7 @@ mod tests {
         backlog.clear();
         backlog.push_page(BacklogPage::default());
         backlog.settings.allow = false;
-        backlog.push_page(text_page("ignored"));
+        backlog.push_page(BacklogPage::default());
         assert!(Arc::ptr_eq(&empty, backlog.snapshot_revision()));
         backlog.settings.allow = true;
         backlog.max_pages = 2;
@@ -335,10 +339,11 @@ mod tests {
         b.push_page(BacklogPage::default());
         assert_eq!(b.size(), 2);
 
-        // allow=0 禁止后不再入库
+        // Disabling the built-in UI must not disable script-driven history.
         b.settings.allow = false;
         b.push_page(text_page("p4"));
         assert_eq!(b.size(), 2);
+        assert_eq!(b.page(1).unwrap().plain_text(), "p4");
 
         b.clear();
         assert_eq!(b.size(), 0);

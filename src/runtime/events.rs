@@ -11,7 +11,10 @@ pub(super) struct RuntimeEvent {
 }
 
 pub(super) fn event_requires_state_sync(event: &Event) -> bool {
-    matches!(event, Event::Exec { .. } | Event::SaveGame { .. })
+    // Scripts may inspect s.current_message_layer immediately after chgmsg,
+    // including to conditionally pop the name layer before printing dialogue.
+    matches!(event, Event::Exec { .. } | Event::SaveGame { .. }
+        | Event::MessageLayerSwitch { .. } | Event::MessageLayerPop)
 }
 
 // Count only the actual events being dispatched, including invalid requests
@@ -1121,9 +1124,11 @@ impl CoreRuntime {
                 backlog_size: Box::new(|| super::text::backlog_snapshot().backlog_size()),
                 backlog_tags: Box::new(|page, allfont| {
                     super::text::backlog_snapshot().backlog_tags(page, allfont)
+                        .map(super::text::native_query_tags)
                 }),
                 message_tags: Box::new(|id, allfont| {
                     super::text::backlog_snapshot().message_tags(id, allfont)
+                        .map(super::text::native_query_tags)
                 }),
                 message_layer_metrics: Box::new(super::text::text_metrics_snapshot),
             },
