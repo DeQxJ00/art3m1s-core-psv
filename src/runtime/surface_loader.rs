@@ -53,7 +53,7 @@ fn demote(payload: &mut Option<Payload>) -> usize {
     let released = pixels.as_raw().capacity();
     *payload = Some(Payload::Encoded(encoded,proof)); released
 }
-struct Entry { refs: usize, ticket: u64, bind_order:u64, prepared:bool, story_suppressed:bool, pending: bool, deferred: bool, demanded: bool, speculative:bool, payload: Option<Payload>,kind:Kind,leased:bool,retry_bytes:usize }
+struct Entry { refs: usize, ticket: u64, bind_order:u64, prepared:bool, story_suppressed:bool, pending: bool, deferred: bool, demanded: bool, speculative:bool, payload: Option<Payload>,kind:Kind,leased:bool,lookahead:bool,retry_bytes:usize }
 struct ReadyClaim { path:String,ticket:u64,bytes:usize,started:std::time::Instant }
 #[derive(Default)]
 struct State {
@@ -353,7 +353,7 @@ impl Loader {
                 // our hard ready cap instead declines pixel admission here.
                 // Foreground demand keeps the existing priority/reclaim path.
                 let speculative=state.entries.get(&path).is_some_and(|e|e.speculative&&!e.demanded);
-                if speculative&&state.entries[&path].refs>0&&total>budget{
+                if speculative&&(state.entries[&path].refs>0||state.entries[&path].lookahead)&&total>budget{
                     // Script-directed first use may borrow pixels from chapter
                     // supplements, never the reverse. Keep their encoded source
                     // and reclaim the most recently queued supplements first.
@@ -426,7 +426,7 @@ impl Loader {
         state.chapter=chapter.into();
         state.story_priority.clear();state.story_managed.clear();state.story_order.clear();state.story_current.clear();state.story_redecoded.clear();state.ready_claim=None;
         state.script_burst=0;
-        for e in state.entries.values_mut(){e.leased=false;}
+        for e in state.entries.values_mut(){e.leased=false;e.lookahead=false;}
         state.entries.retain(|_,e|e.refs>0);
         let live:std::collections::HashSet<_>=state.entries.keys().cloned().collect();
         state.queue.retain(|(p,_)|live.contains(p));
@@ -435,6 +435,40 @@ impl Loader {
         refill(&mut state);self.update_ready_account(&mut state);self.shared.wake.notify_all();
     }
     pub fn preload(&self,path:&str,kind:Kind){self.request(path,true,kind,true);}
+    // Independent rolling ownership: never changes Lua bind/unbind counts or
+    // the chapter mask/animation leases. Retired jobs cannot publish stale data.
+    pub fn update_lookahead(&self,paths:&[String]) {
+        let mut state=self.shared.state.lock().unwrap();
+        if state.stop{return;}
+        let wanted:std::collections::HashSet<_>=paths.iter().take(32)
+            .filter(|p|!crate::ui_image_lifetime::transient_menu_image(p))
+            .map(|p|[p.clone(),format!("{p}.png"),format!("{p}.jpg"),format!("{p}.jpeg"),format!("{p}.dds"),format!("{p}.pvr")]
+                .into_iter().find(|p|state.entries.contains_key(p)).unwrap_or_else(||p.clone())).collect();
+        for (p,e) in &mut state.entries{if !wanted.contains(p){e.lookahead=false;}}
+        let stale:Vec<_>=state.entries.iter().filter(|(_,e)|e.refs==0&&!e.leased&&!e.lookahead)
+            .map(|(p,_)|p.clone()).collect();
+        for p in &stale{state.entries.remove(p);state.remove_queued(p);}
+        let mut scheduled=0;
+        for p in &wanted {
+            let e=state.entries.entry(p.clone()).or_insert(Entry{refs:0,ticket:0,bind_order:0,
+                prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,
+                speculative:true,payload:None,kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0});
+            let entering=!e.lookahead;
+            e.lookahead=true;
+            // A failed attempt is not retried every frame. Moving out and back
+            // into the window, or an actual demand, may retry it.
+            let schedule=entering&&!e.pending&&e.payload.is_none();
+            e.story_suppressed=false;
+            if schedule {
+                state.serial+=1;let ticket=state.serial;
+                let e=state.entries.get_mut(p).unwrap();
+                e.ticket=ticket;e.pending=true;e.deferred=true;e.speculative=true;
+                scheduled+=1;
+            }
+        }
+        refill(&mut state);self.update_ready_account(&mut state);self.shared.wake.notify_all();
+        crate::core_info!("[story-lookahead] window={} scheduled={} retired={}",wanted.len(),scheduled,stale.len());
+    }
     pub fn prioritize_scene(&self,paths:&[String])->usize{
         let mut state=self.shared.state.lock().unwrap();
         state.scene_priority.clear();
@@ -468,7 +502,7 @@ impl Loader {
             .into_iter().find(|p|state.entries.contains_key(p));
         let mut seen=std::collections::HashSet::new();
         let future:Vec<_>=future.iter().filter_map(&key).filter(|p|{
-            let e=&state.entries[p];e.refs>0&&e.kind==Kind::Image
+            let e=&state.entries[p];(e.refs>0||e.lookahead)&&e.kind==Kind::Image
                 &&!crate::ui_image_lifetime::transient_menu_image(p)&&seen.insert(p.clone())
         }).collect();
         let protected:std::collections::HashSet<_>=current.iter().filter_map(key).collect();
@@ -506,7 +540,7 @@ impl Loader {
         let first_binding=!lease&&state.entries.get(path).is_none_or(|e|e.refs==0);
         if lease&&!already_leased&&state.entries.values().filter(|e|e.leased&&e.kind==kind).count()>=128{return;}
         if let Some(e) = state.entries.get_mut(path) { if lease{e.leased=true;}else{e.refs+=1;} }
-        else { state.entries.insert(path.into(), Entry { refs:usize::from(!lease),ticket:0,bind_order:0,prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:false,payload:None,kind,leased:lease,retry_bytes:0 }); }
+        else { state.entries.insert(path.into(), Entry { refs:usize::from(!lease),ticket:0,bind_order:0,prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:false,payload:None,kind,leased:lease,lookahead:false,retry_bytes:0 }); }
         // A chapter hint can precede its Lua binding. Track script order apart
         // from the cancellation ticket; never invalidate an in-flight load.
         if first_binding{state.serial+=1;let order=state.serial;state.entries.get_mut(path).unwrap().bind_order=order;}
@@ -611,7 +645,7 @@ impl Loader {
             .into_iter().find(|p| state.entries.contains_key(p))?;
         let entry = state.entries.get(&key)?;
         if state.stop || entry.pending || entry.demanded || entry.story_suppressed
-            || entry.refs == 0 || entry.kind != Kind::Image
+            || (entry.refs == 0 && !entry.lookahead) || entry.kind != Kind::Image
             || crate::ui_image_lifetime::transient_menu_image(&key) { return None; }
         let(w,h)=match &entry.payload{
             Some(Payload::Pixels(p,_,Some(_)))=>p.dimensions(),
@@ -672,7 +706,7 @@ impl Loader {
         let mut state = self.shared.state.lock().unwrap();
         if let Some(e) = state.entries.get_mut(path) {
             e.refs = e.refs.saturating_sub(1);
-            if e.refs == 0&&!e.leased { state.entries.remove(path); state.remove_queued(path); }
+            if e.refs == 0&&!e.leased&&!e.lookahead { state.entries.remove(path); state.remove_queued(path); }
         }
         self.update_ready_account(&mut state);
         refill(&mut state);
@@ -682,6 +716,8 @@ impl Loader {
     pub fn cancel(&self) {
         let mut state = self.shared.state.lock().unwrap();
         state.clear_queues();
+        for e in state.entries.values_mut(){e.lookahead=false;}
+        state.entries.retain(|_,e|e.refs>0||e.leased);
         let active=state.active.clone();
         let parked=state.parked.clone();
         for (path,e) in state.entries.iter_mut() { if e.leased{e.deferred=e.pending&&!active.as_ref().is_some_and(|(p,t)|p==path&&*t==e.ticket)&&!parked.as_ref().is_some_and(|(p,t)|p==path&&*t==e.ticket);}else{e.pending = false; e.deferred=false;e.retry_bytes=0;} }
@@ -727,7 +763,7 @@ fn retry_capacity_with_reclaim(state:&mut State,budget:usize,reclaim_budget:usiz
     let mask_free=Kind::Mask.cap().saturating_sub(state.kind_parts(Kind::Mask).total());
     let animation_free=Kind::Animation.cap().saturating_sub(state.kind_parts(Kind::Animation).total());
     let candidate=state.entries.iter().filter(|(p,e)|!state.story_redecoded.contains(*p)&&e.retry_bytes>0&&e.retry_bytes<=free&&e.payload.is_none()
-        &&(e.refs>0||e.leased)&&e.retry_bytes<=match e.kind{Kind::Image=>usize::MAX,Kind::Mask=>mask_free,Kind::Animation=>animation_free})
+        &&(e.refs>0||e.leased||e.lookahead)&&e.retry_bytes<=match e.kind{Kind::Image=>usize::MAX,Kind::Mask=>mask_free,Kind::Animation=>animation_free})
         .min_by_key(|(_,e)|(e.refs==0,if e.refs>0{e.bind_order}else{e.ticket})).map(|(p,_)|p.clone());
     let Some(path)=candidate else{return false;};
     let e=state.entries.get_mut(&path).unwrap();
@@ -748,7 +784,7 @@ fn rehydrate_story(state:&mut State,budget:usize)->bool{
     for path in state.story_order.iter().take(STORY_DECODE_WINDOW){
         if state.story_current.contains(path){continue;}
         let Some(e)=state.entries.get(path) else{continue;};
-        if e.refs==0||e.kind!=Kind::Image||e.story_suppressed||e.demanded{continue;}
+        if (e.refs==0&&!e.lookahead)||e.kind!=Kind::Image||e.story_suppressed||e.demanded{continue;}
         let bytes=match e.payload.as_ref(){
             Some(Payload::Pixels(p,_,_))=>p.as_raw().len(),
             Some(Payload::Encoded(b,Some(proof))) if !b.is_empty()&&b.capacity()<=MAX_PAUSED_SOURCE=>{
@@ -1034,6 +1070,10 @@ pub(super) fn preload(paths:&[String],kind:Kind,chapter:Option<&str>,comments:su
 pub(super) fn take(path:&str)->Option<Payload>{handle()?.take(path)}
 pub(super) fn take_warm_pixels(path:&str,max:usize)->Option<Payload>{handle()?.take_warm_pixels(path,max)}
 pub(super) fn update_story_plan(future:&[String],current:&[String]){if let Some(l)=handle(){l.update_story_plan(future,current);}}
+pub(super) fn update_lookahead(paths:&[String],comments:super::png_comments::SharedComments){
+    let loader=if paths.is_empty(){handle()}else{worker(comments)};
+    if let Some(l)=loader{l.update_lookahead(paths);}
+}
 pub(super) fn retain_menu_images_resolving(paths:impl FnOnce()->std::collections::HashSet<String>){if let Some(l)=handle(){l.retain_menu_images_resolving(paths);}}
 pub(super) fn prioritize_scene(paths:&[String]){
     if let Some(loader)=handle(){
@@ -1048,6 +1088,30 @@ pub(super) fn shutdown(){super::ogv_cache::cancel_plan();let loader=LOADER.lock(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lookahead_lifetime_is_independent_of_lua_and_chapter_leases() {
+        let loader=Loader::new(|_,_|Some(Payload::Encoded(vec![1,2,3].into(),None))).unwrap();
+        loader.update_lookahead(&["future".into()]);loader.wait("future");
+        {
+            let state=loader.shared.state.lock().unwrap();
+            assert_eq!(state.entries["future"].refs,0);
+            assert!(state.entries["future"].lookahead);
+            assert_eq!(state.script_preload_counts().planned,0);
+        }
+        loader.bind("future",true);
+        loader.preload("mask",Kind::Mask);loader.wait("mask");
+        loader.update_lookahead(&["next".into()]);loader.wait("next");
+        assert!(loader.take("future").is_some());
+        loader.unbind("future");loader.update_lookahead(&[]);
+        {let state=loader.shared.state.lock().unwrap();
+            assert!(!state.entries.contains_key("future"));
+            assert!(!state.entries.contains_key("next"));
+            assert!(state.entries["mask"].leased);
+        }
+        loader.update_lookahead(&["next".into()]);loader.wait("next");loader.cancel();
+        assert!(!loader.shared.state.lock().unwrap().entries.contains_key("next"));
+        loader.shutdown();
+    }
     #[test] fn native_compression_stays_encoded_and_honors_cancellation(){
         let source=crate::native_texture::tests::pvr(11,0,32,16);
         assert!(matches!(decode_source(source.clone().into(),&||false,&|_|false,BUDGET),LoadStep::Complete(Some(Payload::Encoded(_,None)))));
@@ -1080,7 +1144,7 @@ mod tests {
     }
     fn story_entry(payload:Payload)->Entry{
         Entry{refs:1,ticket:1,bind_order:1,prepared:true,story_suppressed:false,pending:false,
-            deferred:false,demanded:false,speculative:true,payload:Some(payload),kind:Kind::Image,leased:false,retry_bytes:0}
+            deferred:false,demanded:false,speculative:true,payload:Some(payload),kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0}
     }
     fn story_payload(decoded:bool)->Payload{
         let image=image::RgbaImage::from_pixel(32,32,image::Rgba([8,12,20,139]));
@@ -1563,7 +1627,7 @@ mod tests {
     fn scene_priority_preserves_bounded_queues_and_rejects_stale_tickets(){
         let mut state=State::default();
         for i in 0..100{
-            state.entries.insert(format!("q{i}"),Entry{refs:1,ticket:i,bind_order:i,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,retry_bytes:0});
+            state.entries.insert(format!("q{i}"),Entry{refs:1,ticket:i,bind_order:i,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0});
         }
         refill(&mut state);
         state.scene_priority=VecDeque::from([("q99".into(),99),("q98".into(),98),("q97".into(),96)]);
@@ -1736,7 +1800,7 @@ mod tests {
     }
     #[test] fn three_lanes_share_queue_limit_and_urgent_demand_beats_rotation(){
         let mut s=State::default();
-        for i in 0..100{let kind=[Kind::Image,Kind::Mask,Kind::Animation][i%3];s.entries.insert(format!("p{i}"),Entry{refs:1,ticket:i as u64,bind_order:i as u64,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind,leased:false,retry_bytes:0});}
+        for i in 0..100{let kind=[Kind::Image,Kind::Mask,Kind::Animation][i%3];s.entries.insert(format!("p{i}"),Entry{refs:1,ticket:i as u64,bind_order:i as u64,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind,leased:false,lookahead:false,retry_bytes:0});}
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         assert_eq!(s.pop_job().unwrap().0,"p0");assert_eq!(s.pop_job().unwrap().0,"p1");assert_eq!(s.pop_job().unwrap().0,"p2");assert_eq!(s.pop_job().unwrap().0,"p3");
         refill(&mut s);promote(&mut s,"p99");assert_eq!(s.queue_len(),MAX_QUEUE);assert_eq!(s.pop_job().unwrap().0,"p99");
@@ -1744,11 +1808,11 @@ mod tests {
     #[test] fn lua_jobs_bypass_full_supplement_queue_but_effects_are_not_starved(){
         let mut s=State::default();
         for i in 0..80{
-            s.entries.insert(format!("effect{i}"),Entry{refs:0,ticket:i,bind_order:0,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,retry_bytes:0});
+            s.entries.insert(format!("effect{i}"),Entry{refs:0,ticket:i,bind_order:0,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,lookahead:false,retry_bytes:0});
         }
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         for i in 0..9{
-            s.entries.insert(format!("lua{i}"),Entry{refs:1,ticket:100+i,bind_order:100+i,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,retry_bytes:0});
+            s.entries.insert(format!("lua{i}"),Entry{refs:1,ticket:100+i,bind_order:100+i,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0});
         }
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         for expected in ["lua0","lua1","lua2","lua3","effect0","lua4","lua5","lua6","lua7","effect1","lua8"]{
@@ -1807,7 +1871,7 @@ mod tests {
     #[test] fn capacity_refill_prefers_lua_order_over_earlier_chapter_tickets(){
         let mut s=State::default();
         for (path,refs,ticket,bind_order) in [("effect",0,1,0),("second",1,2,20),("first",1,3,10)]{
-            s.entries.insert(path.into(),Entry{refs,ticket,bind_order,prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,retry_bytes:72});
+            s.entries.insert(path.into(),Entry{refs,ticket,bind_order,prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,lookahead:false,retry_bytes:72});
         }
         assert!(retry_capacity(&mut s,72));
         assert_eq!(s.pop_job().unwrap().0,"first");

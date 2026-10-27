@@ -65,6 +65,7 @@ impl CoreRuntime {
         super::emote_source_cache::reset();
         super::ogv_cache::reset();
         self.ogv_timeline_cursor=Default::default();
+        self.surface_timeline_cursor=Default::default();
         self.emote_timeline_cursor=Default::default();
         self.install_interpreter(project.create_interpreter());
 

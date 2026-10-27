@@ -352,6 +352,7 @@ impl CoreRuntime {
         self.clear_scene_text();
         self.hovered_layers.clear();
         self.wait_reason = None;
+        self.surface_timeline_cursor=Default::default();
         data.restore(&mut self.interpreter)
             .map_err(|e| format!("恢复存档状态失败: {e:?}"))?;
         // Bind the wait to the saved PC before onLoad can call/jump into a

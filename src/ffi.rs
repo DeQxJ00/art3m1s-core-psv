@@ -1545,6 +1545,14 @@ pub unsafe extern "C" fn art3m1s_runtime_set_ignore_background_alpha(rt: *mut Co
     unsafe { rt.as_mut() }.map_or(0, |r| i32::from(r.set_ignore_background_alpha(enabled != 0)))
 }
 
+/// Startup-only per-game bounded story image lookahead.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_set_story_lookahead(rt:*mut CoreRuntime,enabled:c_int)->c_int{
+    let Some(runtime)=(unsafe{rt.as_mut()})else{return 0;};
+    runtime.story_lookahead_enabled=enabled!=0;
+    1
+}
+
 /// Startup-only per-game CPU image compression policy. Folders are newline separated.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_runtime_set_cpu_image_compression(rt:*mut CoreRuntime,enabled:i32,size_check:i32,min_bytes:u32,ratio:i32,percent:u32,runs:i32,mean_bytes:u32,folders:*const c_char)->i32{

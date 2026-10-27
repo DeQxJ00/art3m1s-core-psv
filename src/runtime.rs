@@ -104,6 +104,7 @@ pub struct CoreRuntime {
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     pub(crate) cpu_image_compression:crate::cpu_image_compression::Policy,
     surface_timeline_cursor: asb_interpreter::SurfaceTimelineCursor,
+    pub(crate) story_lookahead_enabled: bool,
     emote_timeline_cursor: asb_interpreter::EmoteTimelineCursor,
     ogv_timeline_cursor: asb_interpreter::OgvTimelineCursor,
     png_comments: png_comments::SharedComments,
@@ -298,6 +299,7 @@ impl CoreRuntime {
             #[cfg(all(target_os="vita",feature="gxm-backend"))]
             cpu_image_compression:Default::default(),
             surface_timeline_cursor: Default::default(),
+            story_lookahead_enabled: false,
             emote_timeline_cursor: Default::default(),
             ogv_timeline_cursor: Default::default(),
             png_comments: Default::default(),

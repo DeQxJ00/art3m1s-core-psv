@@ -40,10 +40,16 @@ impl CoreRuntime {
             super::emote_source_cache::plan(&paths,self.png_comments.clone(),recovered);
         }
         let timeline_started=std::time::Instant::now();
-        if let Some(future)=self.interpreter.query_surface_timeline(&mut self.surface_timeline_cursor) {
+        let future=if self.story_lookahead_enabled {
+            self.interpreter.query_surface_lookahead(&mut self.surface_timeline_cursor)
+        }else{self.interpreter.query_surface_timeline(&mut self.surface_timeline_cursor)};
+        if let Some(future)=future {
             self.texture_provider.set_warm_plan(&future);
             let scan_us=timeline_started.elapsed().as_micros();
             let future:Vec<_>=future.into_iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,&p)).collect();
+            if self.story_lookahead_enabled {
+                super::surface_loader::update_lookahead(&future,self.png_comments.clone());
+            }
             let mut files=self.compositor.scene().collect_files();
             files.extend(RenderPipeline::new(&self.compositor).retained_files());
             let current:Vec<_>=files.into_iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,&p)).collect();
