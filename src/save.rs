@@ -182,6 +182,8 @@ impl InputWaitSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MessageTextSnapshot {
     #[serde(default)]
+    pub skip_config: Option<SkipConfigSnapshot>,
+    #[serde(default)]
     pub active_layer: Option<String>,
     #[serde(default)]
     pub layers: Vec<MessageLayerTextSnapshot>,
@@ -198,6 +200,13 @@ pub struct HistorySnapshot {
     pub settings: crate::text::backlog::BacklogSettings,
     pub write_mode: bool,
     pub max_pages: usize,
+}
+
+/// Permission and policy only; held keys and active skip modes are transient.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkipConfigSnapshot {
+    pub allow: bool,
+    pub unread: bool,
 }
 
 /// 单个消息层的页首字体与再现标签。
@@ -225,6 +234,7 @@ pub struct CallFrameSnapshot {
 /// 嵌套出去的，编号存档改写回这个等待的 PC/栈/局部变量。
 #[derive(Debug, Clone)]
 pub struct GameplayCheckpoint {
+    pub skip_config: SkipConfigSnapshot,
     pub input_handlers: Vec<(String, String, crate::compositor::reduce::InputHandler)>,
     pub script: String,
     pub line: usize,
@@ -420,6 +430,7 @@ mod tests {
         variables.set("sysbtn_mode", "set".into());
         variables.set("status", "adv".into());
         GameplayCheckpoint {
+            skip_config: SkipConfigSnapshot { allow: true, unread: false },
             input_handlers: Vec::new(),
             script: "macro.iet".into(),
             line: 1626,
@@ -694,6 +705,7 @@ mod tests {
         data.input_wait_from_queue = Some(false);
         data.input_wait_reason = Some(InputWaitSnapshot::Key { buttons: vec!["circle".into()] });
         data.message_text = Some(MessageTextSnapshot {
+            skip_config: Some(SkipConfigSnapshot { allow: true, unread: true }),
             input_handlers: Some(vec![("push".into(), "38".into(),
                 crate::compositor::reduce::InputHandler { label: Some("history".into()), ..Default::default() })]),
             history: Some(HistorySnapshot { pages: vec![crate::text::backlog::BacklogPage {
@@ -708,6 +720,10 @@ mod tests {
         assert_eq!(restored.input_wait_from_queue, Some(false));
         assert_eq!(restored.input_wait_reason, data.input_wait_reason);
         assert_eq!(restored.message_text, data.message_text);
+        let mut old_text = serde_json::to_value(data.message_text.as_ref().unwrap()).unwrap();
+        old_text.as_object_mut().unwrap().remove("skip_config");
+        let old_text: MessageTextSnapshot = serde_json::from_value(old_text).unwrap();
+        assert!(old_text.skip_config.is_none());
         for key in ["waiting_for_input", "input_wait_from_queue", "input_wait_reason", "message_text"] {
             json.as_object_mut().unwrap().remove(key);
         }

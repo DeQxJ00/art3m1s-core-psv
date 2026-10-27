@@ -595,6 +595,13 @@ impl CoreRuntime {
 
     // ── controlskip：按住临时跳过 ─────────────────────────────────────
 
+    pub(super) fn capture_skip_config(&self) -> crate::save::SkipConfigSnapshot {
+        crate::save::SkipConfigSnapshot {
+            allow: self.control.skip_allowed,
+            unread: self.control.skip_unread,
+        }
+    }
+
     /// role 14 的物理按键状态切换。强制跳过忽略已读/未读，仅受 [skip allow=]
     /// 功能开关约束；进入/退出时派发脚本注册的 controlskipin/out。
     pub(super) fn set_control_skip(&mut self, active: bool) {
@@ -606,7 +613,7 @@ impl CoreRuntime {
         self.control.control_skip_active = active;
         let is_skipping = self.control.skip_active();
         let is_control_skipping = self.control.control_skip_effective();
-        crate::core_debug!(
+        crate::core_info!(
             "[controlskip] pressed={} allow={} effective={}",
             active,
             self.control.skip_allowed,
@@ -840,6 +847,9 @@ impl CoreRuntime {
     pub(super) fn apply_keyconfig(&mut self, params: &HashMap<String, String>) {
         match parse_keyconfig(params) {
             Some((role, keys)) => {
+                if role == ROLE_CONTROL_SKIP {
+                    crate::core_info!("[controlskip] configured_keys={keys:?}");
+                }
                 self.control.keymap.insert(role, keys);
             }
             None => {

@@ -137,6 +137,7 @@ impl CoreRuntime {
         if let (Some(text), Some(checkpoint)) = (&mut data.message_text, &self.gameplay_save_checkpoint) {
             if data.current_script == checkpoint.script && data.current_line == checkpoint.line {
                 text.input_handlers = Some(checkpoint.input_handlers.clone());
+                text.skip_config = Some(checkpoint.skip_config.clone());
             }
         }
         if data.input_wait_reason.is_none() {
@@ -295,6 +296,7 @@ impl CoreRuntime {
             return;
         }
         self.gameplay_save_checkpoint = Some(crate::save::GameplayCheckpoint {
+            skip_config: self.capture_skip_config(),
             input_handlers: self.compositor.input_snapshot(),
             script: script.to_string(),
             line: self.interpreter.current_line(),

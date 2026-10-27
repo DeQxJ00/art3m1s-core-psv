@@ -696,6 +696,7 @@ impl CoreRuntime {
         }
         layers.sort_by(|a, b| a.id.cmp(&b.id));
         Some(crate::save::MessageTextSnapshot {
+            skip_config: Some(self.capture_skip_config()),
             active_layer: state.active_layer.clone(),
             layers,
             input_handlers: Some(self.compositor.input_snapshot()),
@@ -715,6 +716,11 @@ impl CoreRuntime {
     }
 
     fn restore_message_text_snapshot(&mut self, snapshot: &crate::save::MessageTextSnapshot) {
+        // Reconstruction may disable skip while replaying the scene. Restore
+        // the saved permission with the final dialogue, never the held state.
+        if let Some(config) = &snapshot.skip_config {
+            self.apply_skip_config(Some(config.allow), Some(config.unread));
+        }
         if let Some(entries) = &snapshot.input_handlers {
             self.compositor.restore_input_snapshot(entries);
         }
