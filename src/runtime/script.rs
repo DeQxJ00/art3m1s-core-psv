@@ -35,11 +35,26 @@ impl CoreRuntime {
             }
         }
 
-        // e:setScriptStatus 强制停止（如状态 4「停止，不接受用户输入」）：脚本被强制
-        // 暂停，剧情不推进；同样放在 onEnterFrame 之后，好让 Lua 每帧处理里
-        // e:setScriptStatus(0) 自我恢复。
+        // Explicit status stops scenario fallthrough, not registered events.
+        // A menu preview may restore status 3 after issuing a zero-time wait.
+        // Keep draining queued UI/timer handlers just as for [stop]; otherwise
+        // restoring that status permanently strands every menu button.
         if self.script_forced_stop {
-            return;
+            if !self.has_queued_tags() {
+                return;
+            }
+            let saved_wait = self.wait_reason.clone();
+            self.drain_queued_tags_while_stopped(
+                saved_wait.clone().unwrap_or(WaitReason::Stop { reason: None }), profile);
+            if self.wait_reason.is_some() {
+                self.wait_reason = saved_wait;
+                return;
+            }
+            // A queued jump/call has explicitly transferred execution. Ordinary
+            // preview/property tags must leave the suspended scenario untouched.
+            self.script_forced_stop = false;
+            self.last_engine_status = 0;
+            self.script_status.store(0, Ordering::SeqCst);
         }
 
         let has_tags = self.has_queued_tags();

@@ -703,6 +703,59 @@ __engine:setEventHandler{onDebugSkipOut="checkpoint"}
         assert_eq!(runtime.interpreter.get_variable("after_timer"), Some(Value::Int(1)));
     }
 
+    #[test]
+    #[ignore = "Requires EGL/ANGLE; ART3M1S_TEST_ANGLE_PATH selects the Windows DLL directory"]
+    fn preview_status_restore_keeps_menu_handlers_live() {
+        use crate::backend::gl::platform::{AngleBackend, GfxBackend};
+        use asb_interpreter::Value;
+        if let Ok(path) = std::env::var("ART3M1S_TEST_ANGLE_PATH") {
+            let path = std::ffi::CString::new(path).unwrap();
+            unsafe { crate::ffi::art3m1s_set_angle_path(path.as_ptr()); }
+        }
+        let backend = if cfg!(target_os = "windows") { AngleBackend::D3D11 } else { AngleBackend::OpenGL };
+        for touch in [false, true] {
+        let mut runtime = CoreRuntime::create(8, 8, GfxBackend::Angle(backend)).unwrap();
+        runtime.wire_engine_callbacks();
+        runtime.wire_event_callback();
+        runtime.interpreter.load_script("menu", r#"
+*main
+[wait time=1 input=0]
+[calllua function=preview]
+[setonpush key=27 call=0 label=leave]
+[lyc id=1 width=8 height=8 color=0xFFFFFFFF]
+[lyevent id=1 type=click call=0 label=leave]
+[stop]
+[var name=wrong_fallthrough data=1]
+*leave
+[var name=closed data=1]
+[stop]
+"#).unwrap();
+        runtime.interpreter.lua().load(r#"
+function preview(e)
+    observed_status = e:getScriptStatus()
+    e:tag{"wait", time=0}
+    e:setScriptStatus(observed_status)
+end
+"#).exec().unwrap();
+        runtime.interpreter.start("menu", "main").unwrap();
+        for _ in 0..8 { runtime.advance_without_render(17); }
+        assert_eq!(runtime.interpreter.lua().globals().get::<u8>("observed_status").unwrap(), 0,
+            "a normal script call after a completed timer is running, not still waiting");
+        // A periodic preview restores the idle menu's stopped status.
+        runtime.interpreter.lua().load("preview(__engine)").exec().unwrap();
+        for _ in 0..3 { runtime.advance_without_render(17); }
+        assert_ne!(runtime.interpreter.get_variable("wrong_fallthrough"), Some(Value::Int(1)));
+        if touch { runtime.feed_mouse(2, 2); runtime.feed_mouse_button(1, true); }
+        else { runtime.feed_key_down(27); }
+        runtime.advance_without_render(17);
+        if touch { runtime.feed_mouse_button(1, false); }
+        else { runtime.feed_key_up(27); }
+        for _ in 0..3 { runtime.advance_without_render(17); }
+        assert_eq!(runtime.interpreter.get_variable("closed"), Some(Value::Int(1)),
+            "restoring stopped status must still allow registered menu handlers (touch={touch})");
+        }
+    }
+
     #[cfg(all(target_os = "macos", feature = "gl-backend"))]
     #[test]
     fn reset_restarts_boot_without_replacing_lua_runtime() {
