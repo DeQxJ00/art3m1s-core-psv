@@ -218,7 +218,7 @@ impl CoreRuntime {
                     handler.file.as_deref(),
                     handler.label.as_deref(),
                     handler.call,
-                    &HashMap::new(),
+                    &handler.extra_params,
                     &[],
                 );
             }
@@ -298,7 +298,7 @@ impl CoreRuntime {
                 handler.file.as_deref(),
                 handler.label.as_deref(),
                 handler.call,
-                &HashMap::new(),
+                &handler.extra_params,
                 &[],
             );
         }
@@ -785,10 +785,12 @@ impl CoreRuntime {
                 label,
                 call,
                 handler,
+                extra_params,
             } => {
                 self.video.set_finish_handler(
                     id.as_deref(),
                     VideoFinishHandler {
+                        extra_params: extra_params.clone(),
                         file: file.clone(),
                         label: label.clone(),
                         call: *call,

@@ -76,6 +76,8 @@ impl Default for VideoConfig {
 /// 对应 Artemis 的 `setonvideofinish` 标签。
 #[derive(Debug, Clone)]
 pub struct VideoFinishHandler {
+    /// Parameters forwarded to the completion tag, including the layer ID.
+    pub extra_params: HashMap<String, String>,
     /// 跳转/调用目标脚本文件
     pub file: Option<String>,
     /// 跳转/调用目标标签

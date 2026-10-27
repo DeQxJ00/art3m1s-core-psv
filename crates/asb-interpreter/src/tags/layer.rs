@@ -811,6 +811,21 @@ mod tests {
         };
         assert_eq!(id, None);
     }
+
+    #[test]
+    fn videofinish_handlers_preserve_callback_parameters() {
+        let TagResult::Emit(Event::VideoFinishHandler { extra_params, .. }) = exec(
+            &SetOnVideofinishHandler,
+            "setonvideofinish",
+            &[("id", "10.2.0"), ("handler", "forcedcalllua"),
+              ("function", "restorePortrait"), ("id2", "10.2.1"), ("delete", "1")],
+        ) else { panic!("expected completion handler"); };
+        assert_eq!(extra_params.get("id").map(String::as_str), Some("10.2.0"));
+        assert_eq!(extra_params.get("id2").map(String::as_str), Some("10.2.1"));
+        assert_eq!(extra_params.get("function").map(String::as_str), Some("restorePortrait"));
+        assert_eq!(extra_params.get("delete").map(String::as_str), Some("1"));
+        assert!(!extra_params.contains_key("handler"));
+    }
 }
 
 /// [anime] 动画处理器
@@ -944,12 +959,17 @@ impl TagHandler for SetOnVideofinishHandler {
             != 0;
         let handler = ctx.instruction.get("handler").map(|s| s.to_string());
 
+        let extra_params = ctx.instruction.params.iter()
+            .filter(|(key, _)| !["file", "label", "call", "handler"].contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         Ok(TagResult::Emit(Event::VideoFinishHandler {
             id,
             file,
             label,
             call,
             handler,
+            extra_params,
         }))
     }
 }

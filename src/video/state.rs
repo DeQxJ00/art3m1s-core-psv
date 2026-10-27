@@ -224,6 +224,7 @@ mod tests {
         let mut backend = VideoStateBackend::new();
 
         let handler = VideoFinishHandler {
+            extra_params: Default::default(),
             file: Some("script.asb".to_string()),
             label: Some("@finish".to_string()),
             call: false,
@@ -243,6 +244,7 @@ mod tests {
         let mut backend = VideoStateBackend::new();
 
         let handler = VideoFinishHandler {
+            extra_params: Default::default(),
             file: Some("mv.asb".to_string()),
             label: Some("@done".to_string()),
             call: false,
@@ -273,6 +275,10 @@ mod tests {
         let mut backend = VideoStateBackend::new();
 
         let handler = VideoFinishHandler {
+            extra_params: std::collections::HashMap::from([
+                ("function".into(), "restorePortrait".into()),
+                ("id2".into(), "1.80".into()),
+            ]),
             file: Some("mv.asb".to_string()),
             label: Some("@done".to_string()),
             call: false,
@@ -293,6 +299,8 @@ mod tests {
         assert_eq!(events[0].id, Some("1".to_string()));
         let event_handler = events[0].handler.as_ref().expect("图层完成处理器应被派发");
         assert_eq!(event_handler.file.as_deref(), Some("mv.asb"));
+        assert_eq!(event_handler.extra_params.get("function").map(String::as_str), Some("restorePortrait"));
+        assert_eq!(event_handler.extra_params.get("id2").map(String::as_str), Some("1.80"));
     }
 
     #[test]
@@ -301,6 +309,7 @@ mod tests {
         let mut backend = VideoStateBackend::new();
 
         let handler = VideoFinishHandler {
+            extra_params: Default::default(),
             file: Some("global.asb".to_string()),
             label: None,
             call: false,

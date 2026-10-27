@@ -547,6 +547,7 @@ pub enum Event {
         label: Option<String>,
         call: bool,
         handler: Option<String>,
+        extra_params: HashMap<String, String>,
     },
     /// 解除视频播放完成事件处理器 [delonvideofinish]
     VideoFinishHandlerDel {
