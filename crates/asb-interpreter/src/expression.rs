@@ -591,9 +591,16 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Dereference) => {
                 self.next();
-                self.expect(&Token::LParen)?;
+                // Without parentheses, the remaining expression computes the
+                // variable name (including any concatenated suffix).
+                let grouped = self.peek() == Some(&Token::LParen);
+                if grouped {
+                    self.next();
+                }
                 let name = self.parse_expression()?.as_string();
-                self.expect(&Token::RParen)?;
+                if grouped {
+                    self.expect(&Token::RParen)?;
+                }
                 self.quoted_result = false;
                 Ok(self.variables.get(&name).cloned().unwrap_or(Value::Int(0)))
             }
@@ -791,6 +798,20 @@ mod tests {
         }
         assert_eq!(eval("(2 + 3) * 4").unwrap(), Value::Int(20));
         assert_eq!(eval("2 * (3 + 4").unwrap(), Value::Int(14));
+    }
+
+    #[test]
+    fn ungrouped_computed_variable_reads_the_complete_name() {
+        let mut vars = VariableStore::new();
+        vars.set("suffix".into(), Value::String("intro".into()));
+        vars.set("seen_intro".into(), Value::Int(1));
+        vars.set("path_intro".into(), Value::String("movie/intro.ogv".into()));
+        let eval = ExpressionEvaluator::new(&vars);
+        assert_eq!(eval.resolve_param("$$'seen_' + suffix").unwrap(), Value::Int(1));
+        assert_eq!(eval.resolve_param("$$'missing_' + suffix").unwrap(), Value::Int(0));
+        assert_eq!(eval.resolve_param_str("$$'path_' + suffix").unwrap(), "movie/intro.ogv");
+        assert_eq!(eval.resolve_param("$'literal $suffix'").unwrap(), Value::String("literal $suffix".into()));
+        assert!(eval.resolve_param("$$'seen_' +").is_err());
     }
 
     #[test]
