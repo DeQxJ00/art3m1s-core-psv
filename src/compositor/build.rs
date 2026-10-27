@@ -257,8 +257,6 @@ fn visit_uncached(
     }
 
     let mark = cache.as_deref().and_then(|c| c.profile_mark());
-    let local = local_transform(&props);
-    let world = parent_transform * local;
     let intermediate_mode = props.intermediate_render.unwrap_or(0);
     let intermediate_render = intermediate_mode != 0;
     let intermediate_mask = props.custom.get("intermediate_render_mask")
@@ -273,7 +271,6 @@ fn visit_uncached(
     } else {
         parent_opacity * props.opacity()
     };
-    let clip_bounds = subtree_clip_bounds(&props, world, parent_clip, provider);
     let children = scene.ordered_children(id);
     let local_shader = declared_shader(scene, id, &props, provider, cache);
     let group_shader = local_shader
@@ -298,9 +295,8 @@ fn visit_uncached(
         .and_then(|map| map.get(id))
         .map(String::as_str);
     let effective_file = override_name.or(layer.file.as_deref());
-    if let Some(file) = effective_file
-        && !file.is_empty()
-        && let Some((texture, info, sprite_crop)) = match (&layer.mask, override_name) {
+    let resolved = effective_file.filter(|file| !file.is_empty()).and_then(|file| {
+        match (&layer.mask, override_name) {
             // lyedit 结果已是最终像素，不再叠加蒙版。
             (Some(mask), None) if !mask.is_empty() => provider.resolve_with_mask(file, mask).map(|(id,size)|(id,size,None)),
             _ if override_name.is_none()&&command_shader.is_none()&&props.clip_rect().is_none()
@@ -309,7 +305,14 @@ fn visit_uncached(
                 &&(intermediate_render||color_filter(&props).is_identity())=>provider.resolve_sprite(file),
             _ => provider.resolve(file).map(|(id,size)|(id,size,None)),
         }
-    {
+    });
+    let (width, height) = resolved.as_ref().map(|(_, info, _)| (info.width as f32, info.height as f32))
+        .unwrap_or_else(|| if layer.solid_color.is_some() {
+            (props.width.unwrap_or(0.0), props.height.unwrap_or(0.0))
+        } else { (0.0, 0.0) });
+    let world = parent_transform * props.local_transform_with_size(width, height);
+    let clip_bounds = subtree_clip_bounds(&props, world, parent_clip, provider);
+    if let Some((texture, info, sprite_crop)) = resolved {
         // 计算裁剪矩形
         let (visual_world,visual_info)=if let Some([x,y,w,h])=sprite_crop{
             (world*Affine2::from_translation(Vec2::new(x as f32,y as f32)),crate::render_pipeline::draw::TextureInfo{width:w,height:h})
@@ -627,10 +630,6 @@ pub(crate) fn resolved_props(
     props
 }
 
-fn local_transform(props: &LayerProps) -> Affine2 {
-    props.local_transform()
-}
-
 fn subtree_clip_bounds(
     props: &LayerProps,
     world: Affine2,
@@ -707,6 +706,32 @@ mod tests {
     use crate::compositor::mock::{MockProvider, TEXTURE_SIZE};
     use crate::render_pipeline::draw::{TextureId, TextureInfo};
     use std::collections::HashMap;
+
+    #[test]
+    fn mirrored_halves_join_at_center_with_cached_and_restored_scene() {
+        let mut scene = Scene::new();
+        scene.create("9.1.0", Some("bar".into()));
+        scene.create("9.1.1", Some("bar".into()));
+        scene.set_props("9.1", &raw(&[("left", "224"), ("top", "-200")]));
+        scene.set_props("9.1.1", &raw(&[("left", "256"), ("reversex", "1")]));
+        let mut provider = MockProvider::new();
+        let mut cache = super::super::build_cache::SceneBuildCache::default();
+        for _ in 0..2 {
+            cache.begin(1, false, std::iter::empty());
+            let frame = build_frame_reusing_cached(&scene, 0, &mut provider,
+                None, None, None, true, DrawList::new(), Some(&mut cache));
+            cache.finish();
+            assert_eq!(frame.commands.len(), 2);
+            let a = &frame.commands[0];
+            let b = &frame.commands[1];
+            assert_eq!(a.transform.transform_point2(Vec2::new(256.0, 0.0)).x, 480.0);
+            assert_eq!(b.transform.transform_point2(Vec2::new(256.0, 0.0)).x, 480.0);
+            assert_eq!(b.transform.transform_point2(Vec2::ZERO).x, 736.0);
+        }
+        let restored: Scene = serde_json::from_str(&serde_json::to_string(&scene).unwrap()).unwrap();
+        assert_eq!(build_frame(&scene, 0, &mut provider, None),
+            build_frame(&restored, 0, &mut provider, None));
+    }
 
     #[test]
     fn moving_empty_groups_match_general_traversal_with_inherited_effects() {

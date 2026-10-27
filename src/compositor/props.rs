@@ -198,9 +198,17 @@ impl LayerProps {
     /// 按 Artemis 语义，缩放与旋转都绕锚点进行，最终再平移到 (left, top)。
     /// 渲染（build）与命中检测（hit_test）共用这一份实现，保证两侧几何一致。
     pub fn local_transform(&self) -> glam::Affine2 {
+        self.local_transform_with_size(0.0, 0.0)
+    }
+
+    /// Native image layers default each unspecified anchor to the center of
+    /// the full image, before clipping. Empty grouping layers have no extent.
+    /// Explicit anchors (including zero) must not be replaced by this default.
+    pub fn local_transform_with_size(&self, width: f32, height: f32) -> glam::Affine2 {
         let (left, top) = self.offset();
         let (sx, sy) = self.scale();
-        let (ax, ay) = self.anchor();
+        let ax = self.anchor_x.unwrap_or(width * 0.5);
+        let ay = self.anchor_y.unwrap_or(height * 0.5);
         let rot = self.rotation_radians();
 
         // T(offset + anchor) * R * S * T(-anchor), without four
@@ -315,6 +323,28 @@ fn parse_name_list(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_anchor_defaults_match_native_transform_probe() {
+        use glam::Vec2;
+        for (extra, expected) in [
+            (vec![("reversex", "1")], [500.0, 300.0]),
+            (vec![("reversex", "1"), ("anchorx", "30")], [360.0, 160.0]),
+            (vec![("reversex", "1"), ("anchorx", "0")], [300.0, 100.0]),
+            (vec![("xscale", "50")], [350.0, 450.0]),
+            (vec![("reversex", "1"), ("xscale", "50")], [450.0, 350.0]),
+            // Clipping does not move the full image's default anchor.
+            (vec![("reversex", "1"), ("clip", "0,0,100,40")], [500.0, 300.0]),
+        ] {
+            let mut props = LayerProps::from_raw(&raw(&extra));
+            props.left = Some(300.0);
+            let transform = props.local_transform_with_size(200.0, 40.0);
+            assert_eq!(transform.transform_point2(Vec2::ZERO).x, expected[0]);
+            assert_eq!(transform.transform_point2(Vec2::new(200.0, 0.0)).x, expected[1]);
+        }
+        let props = LayerProps::from_raw(&raw(&[("left", "300"), ("reversex", "1")]));
+        assert_eq!(props.local_transform().transform_point2(Vec2::new(200.0, 0.0)).x, 100.0);
+    }
+
     #[test]
     fn direct_affine_matches_anchor_rotation_scale_chain() {
         use glam::{Affine2, Vec2};

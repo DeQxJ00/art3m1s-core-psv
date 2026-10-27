@@ -16,6 +16,34 @@ pub(super) struct LayerQueryState {
 }
 
 impl LayerQueryState {
+    pub fn observe_tag(&mut self, tag: &str, params: &HashMap<String, String>) {
+        use asb_interpreter::event::LayerEvent;
+        let Some(id) = params.get("id") else { return };
+        let id = id.clone();
+        let event = match tag {
+            "lyc" => LayerEvent::Create {
+                id: id.clone(), file: params.get("file").cloned().unwrap_or_default(),
+            },
+            "lyc2" => LayerEvent::Create2 {
+                id: id.clone(), file: params.get("file").cloned().unwrap_or_default(),
+                alpha: params.get("alpha").and_then(|v| v.parse().ok()),
+            },
+            "lydel" => LayerEvent::Delete { id: id.clone() },
+            "lyprop" => LayerEvent::SetProperties {
+                id: id.clone(), properties: params.iter().filter(|(k, _)| k.as_str() != "id")
+                    .map(|(k, v)| (k.clone(), v.clone())).collect(),
+            },
+            _ => return,
+        };
+        self.observe(&Event::Layer(event));
+        if tag == "lyc" {
+            let properties = params.iter()
+                .filter(|(k, _)| matches!(k.as_str(), "mask" | "width" | "height" | "color"))
+                .map(|(k, v)| (k.clone(), v.clone())).collect();
+            self.observe(&Event::Layer(LayerEvent::SetProperties { id, properties }));
+        }
+    }
+
     pub fn sync_clock(&mut self, scene: &Compositor, mut cached: impl FnMut(&str) -> Option<TextureInfo>) {
         let ids = self.scene.sync_query_clock_from(scene, &mut self.accepted_revisions);
         for id in ids {
@@ -207,6 +235,14 @@ mod tests {
 [lua]
 function createCharacter(e)
     e:tag{"lyc", id="10.1.6.0.0.1.a.1", file="body"}
+    e:tag{"var", name="immediate", system="get_layer_info", id="10.1.6.0.0.1.a.1", writelocal=1}
+    e:tag{"var", name="bar_left", data=(960-tonumber(e:var("immediate.width"))*2)/2}
+    e:tag{"var", name="button_center", data=tonumber(e:var("immediate.width"))/2}
+    e:tag{"lyprop", id="10.1.6.0.0.1.a.1", left=35, clip="0,0,480,40"}
+    e:tag{"var", name="clipped", system="get_layer_info", id="10.1.6.0.0.1.a.1"}
+    e:tag{"var", name="clipped_center", data=tonumber(e:var("clipped.width"))/2}
+    e:enqueueTag{"lyprop", id="10.1.6.0.0.1.a.1", left=900}
+    e:tag{"var", name="before_deferred", system="get_layer_info", id="10.1.6.0.0.1.a.1"}
 end
 function placeCharacter(e)
     e:tag{"var", name="q", system="get_layer_info", style="map"}
@@ -221,13 +257,17 @@ end
             .unwrap();
         interpreter.start("main", "").unwrap();
         interpreter.run().unwrap();
+        for (name, expected) in [("bar_left", "-544"), ("button_center", "512"),
+            ("clipped_center", "240"), ("before_deferred.left", "35")] {
+            assert_eq!(interpreter.variables().get(name).unwrap().to_string(), expected, "{name}");
+        }
         assert_eq!(
             interpreter
                 .variables()
                 .get("observed_height")
                 .unwrap()
                 .to_string(),
-            "760"
+            "40"
         );
     }
 

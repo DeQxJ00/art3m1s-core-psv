@@ -116,7 +116,15 @@ impl Compositor {
             return;
         }
 
-        let world = parent_transform * local_transform(&props);
+        // Resolve the original extent, not the clip, for native default anchors.
+        let image_info = layer.file.as_deref().filter(|file| !file.is_empty())
+            .and_then(|file| provider.resolve(file).map(|(_, info)| info));
+        let (anchor_w, anchor_h) = image_info.map(|info|
+            (info.width as f32 / scale, info.height as f32 / scale))
+            .unwrap_or_else(|| if layer.solid_color.is_some() {
+                (props.width.unwrap_or(0.0), props.height.unwrap_or(0.0))
+            } else { (0.0, 0.0) });
+        let world = parent_transform * props.local_transform_with_size(anchor_w, anchor_h);
 
         // 先递归检测子层（高 z-order 优先，reverse 遍历）。
         // 注意按 Artemis 图层顺序排序（与绘制次序一致），不能用原始插入顺序，
@@ -136,12 +144,8 @@ impl Compositor {
             } else if let Some(clip) = props.clip_rect() {
                 // clip = [x, y, w, h]，取 w 和 h
                 (clip[2], clip[3])
-            } else if let Some(file) = &layer.file {
-                if let Some((_, info)) = provider.resolve(file) {
-                    (info.width as f32 / scale, info.height as f32 / scale)
-                } else {
-                    return;
-                }
+            } else if let Some(info) = image_info {
+                (info.width as f32 / scale, info.height as f32 / scale)
             } else {
                 return;
             };
@@ -221,8 +225,4 @@ impl Compositor {
         // and threshold=0 permits fully transparent rectangular input areas.
         hit_alpha < threshold
     }
-}
-
-fn local_transform(props: &LayerProps) -> Affine2 {
-    props.local_transform()
 }

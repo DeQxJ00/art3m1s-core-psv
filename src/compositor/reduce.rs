@@ -1594,6 +1594,27 @@ mod tests {
     }
 
     #[test]
+    fn mirrored_button_hit_area_uses_full_image_default_anchor() {
+        let mut c = Compositor::new();
+        c.apply_event(&create("1", "button"));
+        c.apply_event(&Event::Layer(LayerEvent::SetProperties {
+            id: "1".into(), properties: HashMap::from([
+                ("left".into(), "300".into()), ("reversex".into(), "1".into()),
+                ("clip".into(), "0,0,128,40".into()),
+            ]),
+        }));
+        c.apply_event(&Event::LayerEventHandler {
+            id: "1".into(), event_type: "click".into(), mode: String::new(),
+            file: None, label: None, call: false, handler: Some("calllua".into()),
+            penetration: false, extra_params: HashMap::new(),
+        });
+        let mut provider = MockProvider::new();
+        assert_eq!(c.hit_test(500.0, 20.0, &mut provider), Some("1".into()));
+        assert_eq!(c.hit_test(350.0, 20.0, &mut provider), None);
+        assert_eq!(c.hit_test(200.0, 20.0, &mut provider), None);
+    }
+
+    #[test]
     fn hit_test_follows_active_tween_geometry() {
         let mut c = Compositor::new();
         c.apply_event(&create("1", "button"));

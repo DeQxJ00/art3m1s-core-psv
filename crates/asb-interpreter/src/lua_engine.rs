@@ -71,6 +71,10 @@ pub trait EngineCallbacks: Send + Sync {
     /// 执行标签（返回标签名和参数）
     fn enqueue_tag(&self, tag: String, params: HashMap<String, String>);
 
+    /// Make immediate layer mutations visible to synchronous Lua queries.
+    /// Deferred enqueueTag calls must not use this hook.
+    fn observe_immediate_tag(&self, _tag: &str, _params: &HashMap<String, String>) {}
+
     /// 设置事件处理器
     fn set_event_handler(&self, handlers: HashMap<String, String>);
 
@@ -678,6 +682,7 @@ impl UserData for EngineApi {
                 // 移除数字键 1 (tag name)
                 params.remove("1");
                 let mut ctx = this.ctx.lock().unwrap();
+                ctx.callbacks.observe_immediate_tag(&tag_name, &params);
                 ctx.callbacks.enqueue_tag(tag_name.clone(), params.clone());
 
                 // var 标签不产出事件，且脚本常在同一 Lua 函数内紧接着用 e:var 读回

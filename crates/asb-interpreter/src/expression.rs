@@ -600,7 +600,12 @@ impl<'a> Parser<'a> {
             Some(Token::LParen) => {
                 self.next();
                 let value = self.parse_expression()?;
-                self.expect(&Token::RParen)?;
+                // Shipped scripts may leave a grouping parenthesis open at
+                // the end of a parameter. Only an otherwise complete group
+                // may end at EOF; dynamic variable segments remain strict.
+                if self.peek().is_some() {
+                    self.expect(&Token::RParen)?;
+                }
                 Ok(value)
             }
             Some(Token::Minus) => {
@@ -765,6 +770,27 @@ mod tests {
     fn eval_with_vars(expr: &str, vars: &VariableStore) -> Result<Value> {
         let evaluator = ExpressionEvaluator::new(vars);
         evaluator.evaluate(expr)
+    }
+
+    #[test]
+    fn trailing_group_can_end_at_eof_without_relaxing_dynamic_names() {
+        let mut vars = VariableStore::new();
+        vars.set("choice.pushed", Value::Int(2));
+        for flag in [0, 1] {
+            vars.set("choice.2.notrans", Value::Int(flag));
+            let evaluator = ExpressionEvaluator::new(&vars);
+            for expression in ["$(choice.(choice.pushed).notrans == 0",
+                "$((choice.(choice.pushed).notrans == 0"] {
+                assert_eq!(evaluator.resolve_param(expression).unwrap(),
+                    evaluator.resolve_param("$choice.(choice.pushed).notrans == 0").unwrap());
+            }
+            assert_eq!(evaluator.resolve_param("$(choice.(choice.pushed).notrans").unwrap(), Value::Int(flag));
+        }
+        for expression in ["(", "(1 +", "choice.(choice.pushed", "$('name'", "(1 + )"] {
+            assert!(eval_with_vars(expression, &vars).is_err(), "{expression}");
+        }
+        assert_eq!(eval("(2 + 3) * 4").unwrap(), Value::Int(20));
+        assert_eq!(eval("2 * (3 + 4").unwrap(), Value::Int(14));
     }
 
     #[test]
