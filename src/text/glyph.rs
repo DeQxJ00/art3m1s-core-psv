@@ -845,9 +845,15 @@ impl TextRenderer for GlyphTextRenderer {
             self.state.layer_stack.push(prev_id.clone());
         }
         self.state.active_layer = id.map(|s| s.to_string());
+        let is_new = !self
+            .state
+            .layers
+            .contains_key(id.unwrap_or(DEFAULT_MESSAGE_LAYER));
         let layer = self.state.active_layer_mut();
         if let Some((left, top, width, height, font)) = prev_state {
-            if layer.left == 0.0 && layer.top == 0.0 {
+            // Zero is a valid local origin for UI text, not an unset marker.
+            // Only a newly created page inherits the previous page's layout.
+            if is_new {
                 layer.left = left;
                 layer.top = top;
                 layer.width = width;
@@ -2374,6 +2380,41 @@ mod tests {
         r.push_page_break(Some(0));
         assert!(r.state.active_layer_mut().text_buffer.is_empty());
         assert_ne!(r.state.active_layer_mut().generation, generation);
+    }
+
+    #[test]
+    fn reselecting_zero_origin_message_layer_preserves_layout() {
+        for id in [Some("choice.2"), None] {
+            let mut r = GlyphTextRenderer::new();
+            r.switch_message_layer(Some("body"), false);
+            r.apply_font_settings(&HashMap::from([
+                ("left".into(), "81".into()),
+                ("top".into(), "423".into()),
+                ("width".into(), "600".into()),
+                ("height".into(), "100".into()),
+                ("size".into(), "24".into()),
+            ]));
+            r.switch_message_layer(id, true);
+            // Preserve inheritance for newly created pages.
+            assert_eq!(r.state.active_layer_mut().top, 423.0);
+            r.font_init();
+            r.apply_font_settings(&HashMap::from([
+                ("left".into(), "0".into()),
+                ("top".into(), "0".into()),
+                ("width".into(), "122".into()),
+                ("height".into(), "35".into()),
+                ("size".into(), "30".into()),
+            ]));
+            r.pop_message_layer();
+            for stack in [true, false] {
+                r.switch_message_layer(id, stack);
+                let layer = r.state.active_layer_mut();
+                assert_eq!((layer.left, layer.top), (0.0, 0.0));
+                assert_eq!((layer.width, layer.height), (122.0, 35.0));
+                assert_eq!(layer.font.size, Some(30.0));
+                r.pop_message_layer();
+            }
+        }
     }
 
     #[test]
