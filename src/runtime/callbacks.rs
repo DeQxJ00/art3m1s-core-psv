@@ -458,6 +458,16 @@ impl EngineCallbacks for FfiCallbacks {
 
     fn include(&self, _path: &str) {}
     fn preload_hints_enabled(&self)->bool{cfg!(all(target_os="vita",feature="gxm-backend"))}
+    fn preload_emote_sources(&self,paths:&[String]){
+        #[cfg(all(target_os="vita",feature="gxm-backend"))]
+        {
+            let paths:Vec<_>=paths.iter().take(128).map(|p|magic_path::resolve_path(&self.magic_paths,p)).collect();
+            let recovered=self.emote.lock().unwrap().recovered_backend();
+            super::emote_source_cache::plan(&paths,self.png_comments.clone(),recovered);
+        }
+        #[cfg(not(all(target_os="vita",feature="gxm-backend")))]
+        let _=paths;
+    }
     fn preload_chapter_masks(&self,chapter:&str,paths:&[String]){
         #[cfg(all(target_os="vita",feature="gxm-backend"))]
         {

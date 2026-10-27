@@ -129,6 +129,7 @@ pub trait EngineCallbacks: Send + Sync {
     /// 加载 Lua 文件
     fn include(&self, path: &str);
     fn preload_hints_enabled(&self)->bool{false}
+    fn preload_emote_sources(&self,_paths:&[String]){}
     fn preload_chapter_masks(&self,_chapter:&str,_paths:&[String]){}
     fn preload_animation_frames(&self,_pattern:&str,_frames:&[String]){}
 
@@ -891,7 +892,10 @@ impl UserData for EngineApi {
             let startup = crate::optional_startup::repair_source(&path, source);
             let source = startup.as_deref().unwrap_or(source);
             let delay = crate::delay_alias::repair_source(&path, source);
-            lua.load(delay.as_deref().unwrap_or(source))
+            let source=delay.as_deref().unwrap_or(source);
+            let warmup=hints.then(||crate::emote_cache_warmup::repair_source(&path,source)).flatten();
+            if warmup.is_some(){this.ctx.lock().unwrap().callbacks.debug(1,"[emote-warmup] disposable desktop players replaced with bounded PSB prefetch",true);}
+            lua.load(warmup.as_deref().unwrap_or(source))
                 .set_name(path.as_str())
                 .exec()
                 .map_err(|e| mlua::Error::external(format!("include 执行 {path} 失败: {e}")))?;
@@ -1486,6 +1490,24 @@ impl UserData for EngineApi {
         });
 
         // e:createEmoteLayer{id=, files={...}, width=, height=} -> EmoteLayer
+        methods.add_method("preloadEmoteSources", |_lua,this,files:mlua::Table| {
+            let ctx=this.ctx.lock().unwrap();
+            if !ctx.callbacks.preload_hints_enabled(){return Ok(false);}
+            let mut paths=Vec::new();
+            for i in 1..=128 {
+                match files.raw_get::<mlua::Value>(i)? {
+                    mlua::Value::Nil=>break,
+                    mlua::Value::String(s)=>{
+                        let s=s.to_str()?;
+                        if !s.is_empty()&&s.len()<=1024&&!s.contains('\0'){paths.push(s.to_string());}
+                    }
+                    _=>return Err(mlua::Error::external("invalid model preload path")),
+                }
+            }
+            ctx.callbacks.preload_emote_sources(&paths);
+            Ok(true)
+        });
+
         methods.add_method("createEmoteLayer", |_lua, this, t: mlua::Table| {
             let id: String = t.get("id")?;
             let width: u32 = t.get("width")?;

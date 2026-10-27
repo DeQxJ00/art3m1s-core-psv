@@ -61,6 +61,7 @@ pub use emote_timeline::EmoteTimelineCursor;
 pub use surface_timeline::SurfaceTimelineCursor;
 mod message_roles;
 mod emote_restore;
+mod emote_cache_warmup;
 mod optional_startup;
 mod delay_alias;
 mod toolbar_roles;
