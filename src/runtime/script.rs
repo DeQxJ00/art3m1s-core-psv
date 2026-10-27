@@ -608,6 +608,13 @@ impl CoreRuntime {
         saw_queued_call: bool,
         saw_queued_jump: bool,
     ) {
+        if saw_queued_jump && !saw_queued_call {
+            if let Some(frame) = self.active_inline_event_frame.as_ref()
+                && !frame.claimed_by_jump
+            {
+                self.interpreter.discard_event_jump_stop(&frame.script, frame.line, &frame.stack);
+            }
+        }
         let has_queued_tags = self.has_queued_tags();
         if let Err(error) = settle_inline_event_frame(
             &mut self.interpreter,

@@ -2356,6 +2356,31 @@ impl Interpreter {
         self.active_queued_wait = None;
     }
 
+    /// An inline event's synthetic return frame must not shelter a queued UI
+    /// stop from an explicit jump. Ordinary calls retain their caller's waits;
+    /// jumping out of the UI abandons its stop and deferred continuation, just
+    /// as a jump without a synthetic frame does. The returned story PC can
+    /// then execute its own click wait again.
+    pub fn discard_event_jump_stop(&mut self, script: &str, line: usize, stack: &[CallFrame]) {
+        let Some(index) = self.queued_wait_checkpoints.iter().position(|checkpoint| {
+            checkpoint.script == script && checkpoint.line == line
+                && same_call_stack(&checkpoint.stack, stack)
+                && matches!(&checkpoint.event, Event::Wait {
+                    reason: WaitReason::Stop { reason: None }
+                })
+        }) else { return; };
+        self.queued_wait_checkpoints.remove(index);
+        self.active_queued_wait = match self.active_queued_wait {
+            Some(active) if active == index => {
+                self.last_wait_from_queue = false;
+                self.last_queue_pause_is_wait = false;
+                None
+            }
+            Some(active) if active > index => Some(active - 1),
+            active => active,
+        };
+    }
+
     fn queued_wait_blocks_before_flush(&self) -> bool {
         let Some(checkpoint) = self.queued_wait_checkpoints.last() else {
             return false;
@@ -2768,6 +2793,28 @@ mod tests {
             })
         ));
         it
+    }
+
+    #[test]
+    fn event_jump_discards_only_matching_plain_stop_checkpoint() {
+        let mut it = queued_stop_fixture();
+        let line = it.current_line();
+        it.discard_event_jump_stop("other", line, &[]);
+        assert_eq!(it.queued_wait_checkpoints.len(), 1);
+        let event = it.queued_wait_checkpoints[0].event.clone();
+        for reason in [WaitReason::Generic, WaitReason::Timed { milliseconds: 100, input: 0 },
+            WaitReason::Stop { reason: Some("video".into()) }] {
+            it.queued_wait_checkpoints[0].event = Event::Wait { reason };
+            it.discard_event_jump_stop("story", line, &[]);
+            assert_eq!(it.queued_wait_checkpoints.len(), 1);
+        }
+        it.queued_wait_checkpoints[0].event = event;
+        it.discard_event_jump_stop("story", line, &[]);
+        assert!(it.queued_wait_checkpoints.is_empty());
+        assert!(it.active_queued_wait.is_none());
+        assert!(!it.last_wait_from_queue);
+        assert!(it.engine_context().lock().unwrap().tag_queue.is_empty(),
+            "jump must discard the abandoned stop's deferred commands");
     }
 
     #[test]
