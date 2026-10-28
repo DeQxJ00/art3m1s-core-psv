@@ -292,3 +292,33 @@ fn preparse_pressure_keeps_bytes_for_retry_demand_and_cancellation(){
     assert_eq!(oversized.bytes.len(),48);assert!(oversized._reservation.is_none());
     assert!(!c.state.lock().unwrap().entries.contains_key("large"));
 }
+
+#[test]fn configured_policy_survives_reload_but_data_and_jobs_do_not(){
+    const MIB:usize=1024*1024;
+    let budget=CacheBudget::new(192*MIB);let mut session=Session::new();
+    assert!(session.configure(6,64));
+    let old=session.get(budget.clone());
+    drop(old.read_with("old",|c,_,_|Ok(source(c,16))).unwrap());
+    old.plan(&["future".into()]);let ticket=old.state.lock().unwrap().pending["future"].ticket;
+    session.reset();
+    assert!(session.cache.is_none());assert!(!old.valid("future",ticket));
+    assert!(old.state.lock().unwrap().entries.is_empty());assert_eq!(budget.lock().unwrap().emote,0);
+    let fresh=session.get(budget.clone());
+    assert!(!Arc::ptr_eq(&old,&fresh));assert_eq!((fresh.max_entries,fresh.limit),(6,64*MIB));
+    assert_eq!(fresh.state.lock().unwrap().misses,0);
+    // Two live 18 MiB sources exceed the old 32 MiB default, but fit 64 MiB.
+    let one=fresh.reserve(18*MIB).unwrap();let two=fresh.reserve(18*MIB).unwrap();
+    assert_eq!(budget.lock().unwrap().emote,36*MIB);drop((one,two));
+    assert!(!session.configure(0,64));assert!(!session.configure(4,129));
+    assert!(Arc::ptr_eq(&fresh,&session.get(budget.clone())));
+    assert!(session.configure(2,16));session.reset();
+    let next=session.get(budget);assert_eq!((next.max_entries,next.limit),(2,16*MIB));
+}
+#[test]fn reset_keeps_live_source_accounted_until_owner_releases_it(){
+    let budget=CacheBudget::new(128);let mut session=Session::new();
+    let old=session.get(budget.clone());
+    let active=old.read_with("active",|c,_,_|Ok(source(c,32))).unwrap();
+    session.reset();assert_eq!(budget.lock().unwrap().emote,32);
+    let fresh=session.get(budget.clone());assert!(fresh.state.lock().unwrap().entries.is_empty());
+    drop(active);assert_eq!(budget.lock().unwrap().emote,0);
+}

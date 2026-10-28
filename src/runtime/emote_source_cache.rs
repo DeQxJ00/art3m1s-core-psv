@@ -355,27 +355,44 @@ fn read_bytes(path:&str,size:usize,valid:impl Fn()->bool)->Result<Vec<u8>,String
     { if !valid(){return Err("model read cancelled".into());}bytes=crate::ffi::request_file(path)?; }
     Ok(bytes)
 }
-static SESSION:Mutex<Option<Arc<Cache>>>=Mutex::new(None);
-fn session()->Arc<Cache> {SESSION.lock().unwrap().get_or_insert_with(||Arc::new(Cache::new(crate::image_cache_budget::session_budget(),LIMIT))).clone()}
+// Policy survives project reloads; data, counters and pending work do not.
+struct Session {
+    groups:usize,
+    limit:usize,
+    cache:Option<Arc<Cache>>,
+}
+impl Session {
+    const fn new()->Self {Self{groups:4,limit:LIMIT,cache:None}}
+    fn reset(&mut self){if let Some(c)=self.cache.take(){c.clear();}}
+    fn configure(&mut self,count:usize,mib:usize)->bool {
+        if !(1..=16).contains(&count)||!(8..=128).contains(&mib){return false;}
+        self.reset();self.groups=count;self.limit=mib*1024*1024;true
+    }
+    fn get(&mut self,budget:SharedCacheBudget)->Arc<Cache>{
+        self.cache.get_or_insert_with(||{
+            let mut c=Cache::new(budget,self.limit);c.max_entries=self.groups;
+            crate::core_info!("[psb-cache-active] count={} mib={}",self.groups,self.limit/1048576);
+            Arc::new(c)
+        }).clone()
+    }
+}
+static SESSION:Mutex<Session>=Mutex::new(Session::new());
+fn session()->Arc<Cache> {SESSION.lock().unwrap().get(crate::image_cache_budget::session_budget())}
 // Applied by the host before loading a game; never changes live player state.
 #[unsafe(no_mangle)]
 pub extern "C" fn art3m1s_emote_source_cache_configure(count:usize,mib:usize)->i32 {
-    if !(1..=16).contains(&count)||!(8..=128).contains(&mib){return 0;}
-    let mut slot=SESSION.lock().unwrap();
-    if let Some(old)=slot.take(){old.clear();}
-    let mut cache=Cache::new(crate::image_cache_budget::session_budget(),mib*1024*1024);
-    cache.max_entries=count;*slot=Some(Arc::new(cache));1
+    i32::from(SESSION.lock().unwrap().configure(count,mib))
 }
 pub(super) fn read(path:&str)->Result<Arc<Source>,String>{session().read_with(path,|c,p,t|load_source(c,p,t,false))}
 #[cfg(feature="emote-recovery")]
 pub(super) fn recovered(source:&Arc<Source>,path:&str)->Result<Arc<RecoveredModel>,String>{session().recovered_model(source,path,None)}
 pub(super) fn parsed(source:&Arc<Source>,path:&str)->Result<Arc<ParsedModel>,String>{session().model(source,path)}
-pub(super) fn invalidate(path:&str){if let Some(c)=SESSION.lock().unwrap().as_ref(){c.state.lock().unwrap().entries.remove(&key(path));}}
-pub(super) fn reset(){if let Some(c)=SESSION.lock().unwrap().take(){c.clear();}}
-pub(super) fn cancel_plan(){if let Some(c)=SESSION.lock().unwrap().as_ref(){c.plan(&[]);}}
-pub(super) fn reclaim(needed:usize){if let Some(c)=SESSION.lock().unwrap().as_ref(){let mut s=c.state.lock().unwrap();c.evict_locked(&mut s,needed,false);}}
-pub(super) fn process_one()->bool{let c=SESSION.lock().unwrap().clone();c.is_some_and(|c|c.process_one())}
-pub(super) fn pending()->bool{SESSION.lock().unwrap().as_ref().is_some_and(|c|!c.state.lock().unwrap().queue.is_empty())}
+pub(super) fn invalidate(path:&str){if let Some(c)=SESSION.lock().unwrap().cache.as_ref(){c.state.lock().unwrap().entries.remove(&key(path));}}
+pub(super) fn reset(){SESSION.lock().unwrap().reset();}
+pub(super) fn cancel_plan(){if let Some(c)=SESSION.lock().unwrap().cache.as_ref(){c.plan(&[]);}}
+pub(super) fn reclaim(needed:usize){if let Some(c)=SESSION.lock().unwrap().cache.as_ref(){let mut s=c.state.lock().unwrap();c.evict_locked(&mut s,needed,false);}}
+pub(super) fn process_one()->bool{let c=SESSION.lock().unwrap().cache.clone();c.is_some_and(|c|c.process_one())}
+pub(super) fn pending()->bool{SESSION.lock().unwrap().cache.as_ref().is_some_and(|c|!c.state.lock().unwrap().queue.is_empty())}
 #[cfg(all(target_os="vita",feature="gxm-backend"))]
 pub(super) fn plan(paths:&[String],comments:super::png_comments::SharedComments,recovered_backend:bool){
  let c=session();
@@ -391,7 +408,7 @@ pub unsafe extern "C" fn art3m1s_emote_source_cache_snapshot(out:*mut u64,count:
     if out.is_null()||count<8{return 0;}
     let Ok(slot)=SESSION.try_lock()else{return 0;};
     let n=if count>=11{11}else{8};
-    let Some(c)=slot.as_ref()else{unsafe{std::ptr::write_bytes(out,0,n)};return 1;};
+    let Some(c)=slot.cache.as_ref()else{unsafe{std::ptr::write_bytes(out,0,n)};return 1;};
     let Ok(s)=c.state.try_lock()else{return 0;};let Ok(b)=c.budget.try_lock()else{return 0;};
     let v=[b.emote as u64,s.entries.len() as u64,s.hits,s.misses,s.prefetch_hits,s.evictions,
         s.plan.len() as u64,s.plan.iter().filter(|p|s.entries.contains_key(*p)).count() as u64,
