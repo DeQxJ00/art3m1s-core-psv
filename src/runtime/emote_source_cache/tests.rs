@@ -309,8 +309,9 @@ fn preparse_pressure_keeps_bytes_for_retry_demand_and_cancellation(){
     // Two live 18 MiB sources exceed the old 32 MiB default, but fit 64 MiB.
     let one=fresh.reserve(18*MIB).unwrap();let two=fresh.reserve(18*MIB).unwrap();
     assert_eq!(budget.lock().unwrap().emote,36*MIB);drop((one,two));
-    assert!(!session.configure(0,64));assert!(!session.configure(4,129));
+    assert!(!session.configure(0,64));assert!(!session.configure(4,usize::MAX));
     assert!(Arc::ptr_eq(&fresh,&session.get(budget.clone())));
+    assert!(session.configure(4,256));assert_eq!(session.limit,256*MIB);
     assert!(session.configure(2,16));session.reset();
     let next=session.get(budget);assert_eq!((next.max_entries,next.limit),(2,16*MIB));
 }

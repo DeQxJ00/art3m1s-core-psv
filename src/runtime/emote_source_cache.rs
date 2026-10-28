@@ -365,8 +365,9 @@ impl Session {
     const fn new()->Self {Self{groups:4,limit:LIMIT,cache:None}}
     fn reset(&mut self){if let Some(c)=self.cache.take(){c.clear();}}
     fn configure(&mut self,count:usize,mib:usize)->bool {
-        if !(1..=16).contains(&count)||!(8..=128).contains(&mib){return false;}
-        self.reset();self.groups=count;self.limit=mib*1024*1024;true
+        if !(1..=16).contains(&count)||mib==0{return false;}
+        let Some(limit)=mib.checked_mul(1024*1024) else{return false;};
+        self.reset();self.groups=count;self.limit=limit;true
     }
     fn get(&mut self,budget:SharedCacheBudget)->Arc<Cache>{
         self.cache.get_or_insert_with(||{
@@ -403,16 +404,17 @@ pub(super) fn plan(paths:&[String],comments:super::png_comments::SharedComments,
 
 /// Independent optional HUD extension: allocated source bytes, retained models,
 /// hits, misses, prefetch hits, evictions, planned models, resident planned models.
+/// Slots 8--10: parsed usage/hits/misses. Slot 11: configured capacity in bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_emote_source_cache_snapshot(out:*mut u64,count:usize)->i32{
     if out.is_null()||count<8{return 0;}
     let Ok(slot)=SESSION.try_lock()else{return 0;};
-    let n=if count>=11{11}else{8};
-    let Some(c)=slot.cache.as_ref()else{unsafe{std::ptr::write_bytes(out,0,n)};return 1;};
+    let n=if count>=12{12}else if count>=11{11}else{8};
+    let Some(c)=slot.cache.as_ref()else{unsafe{std::ptr::write_bytes(out,0,n);if n>=12{*out.add(11)=slot.limit as u64;}};return 1;};
     let Ok(s)=c.state.try_lock()else{return 0;};let Ok(b)=c.budget.try_lock()else{return 0;};
     let v=[b.emote as u64,s.entries.len() as u64,s.hits,s.misses,s.prefetch_hits,s.evictions,
         s.plan.len() as u64,s.plan.iter().filter(|p|s.entries.contains_key(*p)).count() as u64,
-        c.parsed_live.load(Ordering::Relaxed) as u64,c.parsed_hits.load(Ordering::Relaxed) as u64,c.parsed_misses.load(Ordering::Relaxed) as u64];
+        c.parsed_live.load(Ordering::Relaxed) as u64,c.parsed_hits.load(Ordering::Relaxed) as u64,c.parsed_misses.load(Ordering::Relaxed) as u64,c.limit as u64];
     unsafe{std::ptr::copy_nonoverlapping(v.as_ptr(),out,n)};1
 }
 
