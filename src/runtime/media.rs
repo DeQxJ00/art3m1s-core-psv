@@ -9,6 +9,32 @@ use asb_interpreter::tags::var_handler::{SoundChannelInfo, SoundInfoSnapshot};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+fn dispatch_video_finish(interpreter: &asb_interpreter::Interpreter, handler: &VideoFinishHandler) {
+    let mut params = handler.extra_params.clone();
+    if let Some(tag) = &handler.handler { params.insert("handler".into(), tag.clone()); }
+    if let Some(file) = &handler.file { params.insert("file".into(), file.clone()); }
+    if let Some(label) = &handler.label { params.insert("label".into(), label.clone()); }
+    params.insert("call".into(), if handler.call { "1" } else { "0" }.into());
+    if matches!(interpreter.run_event_filter("setonvideofinish", &params), Some(1 | 2)) {
+        return;
+    }
+    if let Some(tag) = &handler.handler {
+        // Completion handlers are script-level tags, including custom filters.
+        // Raw e:tag queue entries intentionally bypass those filters.
+        let escape = |text: &str| text.replace('\\', "\\\\").replace(',', "\\,");
+        let mut data = escape(tag);
+        for (key, value) in &handler.extra_params {
+            data.push(',');data.push_str(&escape(key));
+            data.push(',');data.push_str(&escape(value));
+        }
+        interpreter.engine_context().lock().unwrap().tag_queue.push((
+            "tag".into(), HashMap::from([("data".into(), data)]),
+        ));
+    }
+    input::enqueue_handler_tags(interpreter, None, handler.file.as_deref(),
+        handler.label.as_deref(), handler.call, &HashMap::new(), &[]);
+}
+
 fn automode_sound_ids_ready(ids: &[String], state: &crate::audio::AudioState) -> bool {
     !ids.iter().any(|id| {
         state.voice_channels.get(id).or_else(|| state.se_channels.get(id))
@@ -51,6 +77,19 @@ fn ab_loop_file(file: &str) -> Option<String> {
 }
 
 impl CoreRuntime {
+    pub fn notify_video_layer_ready(&mut self, id: &str) {
+        if self.pending_video_first_frames.remove(id) { self.frame_visual_dirty = true; }
+    }
+
+    pub(super) fn waiting_for_video_first_frames(&self) -> bool {
+        self.pending_video_first_frames.iter().any(|id| self.video_layer_is_bound(id))
+    }
+
+    pub fn video_layer_is_bound(&self, id: &str) -> bool {
+        self.video.video_state().video_layers.get(id).is_some_and(|v| v.playing)
+            && self.compositor.scene().get(id).and_then(|layer| layer.file.as_deref())
+                == Some(video_layer_texture_name(id).as_str())
+    }
     pub fn set_volume(&mut self, volume_type: &str, value: f32) {
         let v = value.clamp(0.0, 1.0);
         match volume_type {
@@ -210,17 +249,9 @@ impl CoreRuntime {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
 
-            // Enqueue handler tags if registered.
+            // Dispatch through the same event/filter boundary as host completion.
             if let Some(handler) = event.handler {
-                input::enqueue_handler_tags(
-                    &self.interpreter,
-                    handler.handler.as_deref(),
-                    handler.file.as_deref(),
-                    handler.label.as_deref(),
-                    handler.call,
-                    &handler.extra_params,
-                    &[],
-                );
+                dispatch_video_finish(&self.interpreter, &handler);
             }
         }
     }
@@ -292,15 +323,7 @@ impl CoreRuntime {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         if let Some(handler) = handler {
-            input::enqueue_handler_tags(
-                &self.interpreter,
-                handler.handler.as_deref(),
-                handler.file.as_deref(),
-                handler.label.as_deref(),
-                handler.call,
-                &handler.extra_params,
-                &[],
-            );
+            dispatch_video_finish(&self.interpreter, &handler);
         }
     }
 
@@ -448,6 +471,7 @@ impl CoreRuntime {
     }
 
     fn clear_video_layer_texture(&mut self, id: &str) {
+        self.pending_video_first_frames.remove(id);
         let texture_name = video_layer_texture_name(id);
         self.compositor
             .clear_layer_file_if_matches(id, &texture_name);
@@ -761,6 +785,9 @@ impl CoreRuntime {
                 match id {
                     Some(layer_id) => {
                         self.video.play_layer(layer_id, &config);
+                        if crate::ffi::media_command_callback_registered() {
+                            self.pending_video_first_frames.insert(layer_id.clone());
+                        }
                         self.bind_video_layer_texture(layer_id);
                     }
                     None => self.video.play_fullscreen(&config),
@@ -892,6 +919,40 @@ impl CoreRuntime {
 #[cfg(test)]
 mod tests {
     use super::ab_loop_file;
+
+    #[test]
+    fn video_finish_runs_custom_tag_filter_and_preserves_parameters() {
+        use asb_interpreter::{Interpreter, InterpreterConfig};
+        let mut interpreter = Interpreter::new(InterpreterConfig::default());
+        interpreter.lua().load(r#"
+            calls = 0
+            __engine:setTagFilter({restore_image=function(e,p)
+                calls = calls + 1
+                restored = p.id2
+                return 1
+            end})
+        "#).exec().unwrap();
+        let handler = crate::video::VideoFinishHandler {
+            handler: Some("restore_image".into()),
+            extra_params: std::collections::HashMap::from([("id2".into(), "body,static\\1".into())]),
+            file: None, label: None, call: false,
+        };
+        super::dispatch_video_finish(&interpreter, &handler);
+        interpreter.drain_queued_tags_only().unwrap();
+        assert_eq!(interpreter.lua().globals().get::<i32>("calls").unwrap(), 1);
+        assert_eq!(interpreter.lua().globals().get::<String>("restored").unwrap(), "body,static\\1");
+        interpreter.lua().load(r#"
+            __engine:setEventFilter(function(e,name,p)
+                assert(name == 'setonvideofinish')
+                assert(p.handler == 'restore_image')
+                calls = calls + 1
+                return 1
+            end)
+        "#).exec().unwrap();
+        super::dispatch_video_finish(&interpreter, &handler);
+        interpreter.drain_queued_tags_only().unwrap();
+        assert_eq!(interpreter.lua().globals().get::<i32>("calls").unwrap(), 2);
+    }
 
     #[test]
     fn native_auto_waits_only_for_selected_sound_ids() {

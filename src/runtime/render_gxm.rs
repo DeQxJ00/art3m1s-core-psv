@@ -122,7 +122,7 @@ impl CoreRuntime {
         // Pending captures and first-frame loading keep the conservative path.
         // Once captured, transition geometry uses the same immutable clock and
         // texture revision as any other prepared frame.
-        if self.prepared_gxm_frame.is_some() || self.last_submitted_frame.is_none()
+        if self.waiting_for_video_first_frames() || self.prepared_gxm_frame.is_some() || self.last_submitted_frame.is_none()
             || !self.emote.lock().unwrap().uses_recovered()
             || RenderPipeline::new(&self.compositor).needs_trans_capture()
             || self.texture_provider.needs_upload_retry() { return; }
@@ -181,6 +181,12 @@ impl CoreRuntime {
         &mut self,
         profile: &mut crate::profiler::FrameProfile,
     ) -> Option<RenderRegion> {
+        // Preserve a complete scene while sibling movie layers await upload,
+        // including commands not yet consumed by the host decoder queue.
+        if self.waiting_for_video_first_frames() {
+            self.renderer.render(self.last_submitted_frame.as_ref().unwrap_or(&DrawList::default()));
+            return Some(RenderRegion::Full);
+        }
         let transition_start=RenderPipeline::new(&self.compositor).is_transition_in_progress()
             .then(std::time::Instant::now);
         if RenderPipeline::new(&self.compositor).needs_trans_capture() {

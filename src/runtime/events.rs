@@ -1196,7 +1196,18 @@ pub(super) fn layer_info_entry(
         .or_else(|| texture_info.map(|info| info.height as f32))
         .unwrap_or(0.0);
     let mut info = props.custom.clone();
+    let [red, green, blue] = props.color_multiply.unwrap_or([1.0; 3])
+        .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u32);
+    let color_multiply = (red << 16) | (green << 8) | blue;
+    let layer_mode = match props.layer_mode.as_deref() {
+        Some("add") => "1",
+        Some("multiply" | "mul") => "2",
+        Some("screen") => "4",
+        _ => "0",
+    };
     info.extend([
+        ("colormultiply".into(), color_multiply.to_string()),
+        ("layermode".into(), layer_mode.into()),
         ("left".to_string(), trim_layer_float(left)),
         ("top".to_string(), trim_layer_float(top)),
         ("width".to_string(), trim_layer_float(width)),
@@ -1547,6 +1558,8 @@ mod tests {
         let info = layer_info_entry(c.scene().get("button.2").unwrap(), 0, None);
         assert_eq!(info["visible"], "1");
         assert_eq!(info["alpha"], "255");
+        assert_eq!(info["colormultiply"], "16777215");
+        assert_eq!(info["layermode"], "0");
         c.apply_event(&Event::Layer(LayerEvent::SetProperties {
             id: "button.2".into(),
             properties: HashMap::from([
@@ -1554,6 +1567,8 @@ mod tests {
                 ("anchorx".into(), "32".into()),
                 ("xscale".into(), "125".into()),
                 ("clickablethreshold".into(), "64".into()),
+                ("colormultiply".into(), "804020".into()),
+                ("layermode".into(), "multiply".into()),
             ]),
         }));
         let info = layer_info_entry(c.scene().get("button.2").unwrap(), 0, None);
@@ -1562,6 +1577,8 @@ mod tests {
             "transparent hover layers remain enabled"
         );
         assert_eq!(info["alpha"], "0");
+        assert_eq!(info["colormultiply"], "8405024");
+        assert_eq!(info["layermode"], "2");
         assert_eq!(info["anchorx"], "32");
         assert_eq!(info["xscale"], "125");
         assert_eq!(info["clickablethreshold"], "64");

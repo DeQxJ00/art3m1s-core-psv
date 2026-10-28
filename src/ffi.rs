@@ -1706,6 +1706,15 @@ pub unsafe extern "C" fn art3m1s_runtime_notify_video_finished(
 }
 
 /// Host calls only between frames, outside any other runtime call/GXM scene.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_video_layer_is_bound(rt:*const CoreRuntime,id:*const c_char)->c_int {
+    if rt.is_null() || id.is_null(){return 0;}
+    let Ok(id)=(unsafe{std::ffi::CStr::from_ptr(id).to_str()}) else{return 0;};
+    unsafe{&*rt}.video_layer_is_bound(id) as c_int
+}
+
+/// Host calls only between frames, outside any other runtime call/GXM scene.
 #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_runtime_reclaim_video_gpu_cache(rt:*mut CoreRuntime,bytes:usize)->usize {
@@ -1810,6 +1819,16 @@ pub unsafe extern "C" fn art3m1s_runtime_video_gl_end(rt: *mut CoreRuntime) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.end_video_gl_render();
     }));
+}
+
+/// Called on the main thread after a layer's first frame upload succeeds.
+#[cfg(feature = "gl-backend")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_runtime_video_layer_ready(rt: *mut CoreRuntime, id: *const c_char) {
+    if rt.is_null() || id.is_null() { return; }
+    if let Ok(id) = unsafe { std::ffi::CStr::from_ptr(id) }.to_str() {
+        unsafe { &mut *rt }.notify_video_layer_ready(id);
+    }
 }
 
 /// Upload one RGBA8 frame for a currently playing video layer.
