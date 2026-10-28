@@ -16,7 +16,7 @@ impl BlockKey {
     fn read(t:&Table,key:&str)->Option<Self>{
         match t.raw_get::<Value>(key).ok()? {
             Value::String(_)=>text(t,key).map(Self::Named),
-            Value::Integer(n) if n>0=>Some(Self::Indexed(n)),
+            Value::Integer(n) if n>0=>Some(Self::Indexed(n.into())),
             Value::Number(n) if n.is_finite()&&n>=1.&&n<=9007199254740991.&&n.fract()==0.=>Some(Self::Indexed(n as i64)),
             _=>None,
         }
