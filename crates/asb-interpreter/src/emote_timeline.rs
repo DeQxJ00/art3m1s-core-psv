@@ -35,7 +35,10 @@ impl Interpreter {
     pub fn query_emote_timeline(&self,cursor:&mut EmoteTimelineCursor)->Option<Vec<String>>{
         let g=self.lua().globals();
         let inputs=(||{
-            let game=table(&g,"game")?;let ext=text(&game,"fgext")?;
+            // Some scripts leave the image extension unchanged and switch the
+            // character loader through emote.flag, appending .psb directly.
+            let emote_active=table(&g,"emote").is_some_and(|t|matches!(t.raw_get::<Value>("flag"),Ok(Value::Boolean(true))));
+            let ext=if emote_active {".psb".to_owned()}else{text(&table(&g,"game")?,"fgext")?};
             if !ext.eq_ignore_ascii_case(".psb"){return None;}
             let ast=table(&g,"ast")?;let ip=table(&table(&g,"scr")?,"ip")?;
             Some((ast,(text(&ip,"file")?,BlockKey::read(&ip,"block")?,ext)))
@@ -124,6 +127,23 @@ impl Interpreter {
         ast={};for i=1,65 do ast[i]={{'text'}} end
         ast[65]={{'fg',path=':fg/',file='too-far'}}"#).exec().unwrap();
         assert_eq!(it.query_emote_timeline(&mut EmoteTimelineCursor::default()),Some(vec![]));
+    }
+
+    #[test]fn emote_flag_overrides_image_extension_and_refreshes_plan(){
+        let it=Interpreter::new(Default::default());
+        it.lua().load(r#"game={fgext='.png'};emote={flag=true};
+        scr={ip={file='chapter',block=1}};
+        ast={ {{'text'}}, {{'fg',path=':fg/',file='body',mode=3}},
+          {{'fg',path=':fg/',file='other',mode=3}} }"#).exec().unwrap();
+        let mut c=EmoteTimelineCursor::default();
+        assert_eq!(it.query_emote_timeline(&mut c).unwrap(),[":fg/body.psb",":fg/other.psb"]);
+        assert!(it.query_emote_timeline(&mut c).is_none());
+        it.lua().load("emote.flag=false").exec().unwrap();
+        assert_eq!(it.query_emote_timeline(&mut c),Some(vec![]));
+        it.lua().load("emote.flag='false'").exec().unwrap();
+        assert!(it.query_emote_timeline(&mut c).is_none());
+        it.lua().load("emote.flag=true;game=nil").exec().unwrap();
+        assert_eq!(it.query_emote_timeline(&mut c).unwrap(),[":fg/body.psb",":fg/other.psb"]);
     }
 
 }
