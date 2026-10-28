@@ -98,6 +98,16 @@ pub(crate) fn decode_luma(decoder:impl image::ImageDecoder,limit:usize)->Option<
 pub extern "C" fn art3m1s_resource_ledger_version()->u32 {3}
 #[unsafe(no_mangle)]
 pub extern "C" fn art3m1s_resource_ledger_audio_version()->u32 {3}
+/// Read-only, versioned CDRAM usage for the optional performance overlay.
+/// This is instrumented engine ownership, not total driver/system usage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_resource_gpu_snapshot(out:*mut u64,count:usize)->i32 {
+    if out.is_null() || count<3 {return 0;}
+    let c=LEDGER.lock().unwrap_or_else(|e|e.into_inner()).totals[1];
+    let values=[1,c.live,c.peak];
+    unsafe {std::ptr::copy_nonoverlapping(values.as_ptr(),out,values.len());}
+    1
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn art3m1s_resource_event(region:u32,owner:u32,live:i64,reserved:i64,retired:i64){
     LEDGER.lock().unwrap_or_else(|e|e.into_inner()).event(region as usize,owner as usize,live,reserved,retired);
@@ -111,6 +121,15 @@ pub extern "C" fn art3m1s_resource_report(){
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn gpu_snapshot_validates_capacity_and_preserves_tail(){
+        let mut out=[u64::MAX;5];
+        assert_eq!(unsafe {art3m1s_resource_gpu_snapshot(std::ptr::null_mut(),3)},0);
+        assert_eq!(unsafe {art3m1s_resource_gpu_snapshot(out.as_mut_ptr(),2)},0);
+        assert_eq!(out,[u64::MAX;5]);
+        assert_eq!(unsafe {art3m1s_resource_gpu_snapshot(out.as_mut_ptr(),5)},1);
+        assert_eq!(out[0],1);assert!(out[2]>=out[1]);
+        assert_eq!(&out[3..],&[u64::MAX;2]);
+    }
     #[test] fn gray_decoder_preserves_all_values_and_honors_limit(){
         use image::ImageEncoder;
         let raw:Vec<u8>=(0..256).map(|v|v as u8).collect();let mut png=Vec::new();
