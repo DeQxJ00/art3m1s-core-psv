@@ -402,7 +402,7 @@ fn fused_group(frame:&DrawList,index:usize,width:u32,height:u32)->Option<EffectD
     single_group_draw(g,c,width,height)
 }
 fn single_group_draw(g:&ShaderGroup,c:&DrawCommand,width:u32,height:u32)->Option<EffectDraw>{
-    if c.blend!=BlendMode::Alpha || c.mesh.is_some() || c.shader.is_some()
+    if !matches!(c.blend,BlendMode::Alpha|BlendMode::Add) || c.mesh.is_some() || c.shader.is_some()
         || c.stencil.is_some() || c.native_emote.is_some() || c.color.grayscale || c.color.negative {return None;}
     let mut draw=encode(c,width,height)?;
     let group=encode(&group_command(g,width,height),width,height)?;
@@ -417,7 +417,11 @@ fn single_group_draw(g:&ShaderGroup,c:&DrawCommand,width:u32,height:u32)->Option
     }
     let source_tint=draw.tint;draw.tint=group.tint;draw.effects=group.effects;
     draw.effects.corners[..4].copy_from_slice(&source_tint);
-    draw.effects.flags[0]=4.0;draw.effects.transition[3]=source_tint[3];draw.blend=group.blend;
+    // A lone additive sprite on a cleared target stores RGB * alpha, but
+    // its alpha blend factor is SRC_ALPHA as well: retain alpha squared.
+    draw.effects.flags[0]=4.0;
+    draw.effects.transition[3]=if c.blend==BlendMode::Add {-1.0} else {source_tint[3]};
+    draw.blend=group.blend;
     Some(draw)
 }
 // A small opaque base only changes the pixels it covers. Fuse the full-cover
@@ -2883,6 +2887,24 @@ mod tests {
         f.commands[1].shader=None;
         f.commands[0].texture=TextureId(4041); // All empty still needs the opaque group output.
         assert!(fused_group(&f,0,960,544).is_none());
+    }
+
+    #[test]
+    fn single_additive_sprite_fuses_without_distributing_over_overlapping_children() {
+        let mut f=neutral_frame();f.commands.truncate(1);f.shader_groups[0].end=1;
+        f.commands[0].blend=BlendMode::Add;f.commands[0].opacity=0.65;
+        f.shader_groups[0].effect.uniforms.insert("blendMode".into(),vec![1.]);
+        f.shader_groups[0].effect.uniforms.insert("alpha".into(),vec![0.6]);
+        let d=fused_group(&f,0,960,544).expect("one additive source can fuse its clear intermediate");
+        assert_eq!(d.blend,6);assert_eq!(d.effects.flags[0],4.);
+        assert_eq!(d.effects.transition[3],-1.); // Preserve squared source alpha in the additive intermediate.
+        assert_eq!(d.effects.corners[3],0.65);assert_eq!(d.tint[3],0.6);
+        f.commands.push(f.commands[0].clone());f.shader_groups[0].end=2;
+        assert!(fused_group(&f,0,960,544).is_none());
+        f.commands.truncate(1);f.shader_groups[0].end=1;
+        for blend in [BlendMode::Multiply,BlendMode::Screen,BlendMode::NativeAdd,BlendMode::PremultipliedAdd] {
+            f.commands[0].blend=blend;assert!(fused_group(&f,0,960,544).is_none());
+        }
     }
 
     #[test]
