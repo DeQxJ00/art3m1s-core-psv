@@ -745,6 +745,37 @@ __engine:setEventHandler{onDebugSkipOut="checkpoint"}
 
     #[test]
     #[ignore = "Requires EGL/ANGLE; ART3M1S_TEST_ANGLE_PATH selects the Windows DLL directory"]
+    fn inline_transition_completes_without_a_dialogue_click() {
+        use crate::backend::gl::platform::{AngleBackend, GfxBackend};
+        use asb_interpreter::event::WaitReason;
+        if let Ok(path) = std::env::var("ART3M1S_TEST_ANGLE_PATH") {
+            let path = std::ffi::CString::new(path).unwrap();
+            unsafe { crate::ffi::art3m1s_set_angle_path(path.as_ptr()); }
+        }
+        let backend = if cfg!(target_os = "windows") { AngleBackend::D3D11 } else { AngleBackend::OpenGL };
+        let mut runtime = CoreRuntime::create(8, 8, GfxBackend::Angle(backend)).unwrap();
+        runtime.wire_engine_callbacks();
+        runtime.wire_event_callback();
+        runtime.interpreter.load_script("story", "*main\n[var name=resumed data=1]\n[stop]\n").unwrap();
+        runtime.interpreter.start("story", "main").unwrap();
+        // A key callback can arrive between two scenario instructions. Its
+        // transition must resume on completion even when no click handler is active.
+        runtime.begin_inline_event_frame();
+        runtime.interpreter.lua().load(r#"
+            __engine:enqueueTag{"trans", type=1, time=1, input=0}
+        "#).exec().unwrap();
+        runtime.advance_without_render(17);
+        assert!(!matches!(runtime.wait_reason, Some(WaitReason::Generic | WaitReason::Generic0)),
+            "a transition must not become an unreachable dialogue click");
+        // The renderer reports completion independently of input.
+        runtime.compositor.advance(100);
+        for _ in 0..6 { runtime.advance_without_render(17); }
+        assert_eq!(runtime.interpreter.get_variable("resumed"), Some(asb_interpreter::Value::Int(1)));
+        assert!(runtime.interpreter.call_stack().is_empty());
+    }
+
+    #[test]
+    #[ignore = "Requires EGL/ANGLE; ART3M1S_TEST_ANGLE_PATH selects the Windows DLL directory"]
     fn preview_status_restore_keeps_menu_handlers_live() {
         use crate::backend::gl::platform::{AngleBackend, GfxBackend};
         use asb_interpreter::Value;

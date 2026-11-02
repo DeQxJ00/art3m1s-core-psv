@@ -301,6 +301,7 @@ impl CoreRuntime {
         if video_resume || trans_resume {
             self.wait_reason = None;
             release_completed_media_wait(&mut self.interpreter, trans_resume);
+            self.finish_inline_event_frame(false, false, false);
             return;
         }
 
@@ -596,7 +597,18 @@ impl CoreRuntime {
         self.finish_inline_event_frame(drain.wait.is_some(), drain.saw_call, drain.saw_jump);
         if let Some(event) = drain.wait {
             self.wait_reason = Some(match event {
-                Event::Wait { reason } => reason,
+                Event::Wait { reason } => {
+                    if let WaitReason::Timed { milliseconds, .. } = &reason {
+                        self.timed_remaining_ms = *milliseconds;
+                    }
+                    reason
+                }
+                // An input callback may start a transition between scenario
+                // instructions (for example when releasing Skip). It has no
+                // dialogue click handler yet. Preserve the asynchronous wait
+                // so completion releases its queued continuation normally.
+                Event::Trans { .. } => WaitReason::Stop { reason: Some("trans".into()) },
+                Event::VideoPlay { id: None, .. } => WaitReason::Stop { reason: Some("video".into()) },
                 _ => WaitReason::Generic,
             });
         }
