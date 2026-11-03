@@ -385,6 +385,7 @@ impl EngineCallbacks for FfiCallbacks {
     fn enqueue_tag(&self, _tag: String, _params: HashMap<String, String>) {}
     fn observe_immediate_tag(&self, tag: &str, params: &HashMap<String, String>) {
         self.layer_info.lock().unwrap().observe_tag(tag, params);
+        super::text::observe_immediate_text(tag, params);
     }
     fn set_event_handler(&self, _handlers: HashMap<String, String>) {}
 

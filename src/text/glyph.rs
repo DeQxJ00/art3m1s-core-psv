@@ -21,6 +21,7 @@ use command_cache::{CommandCache, Environment as CommandEnvironment};
 mod layout_cache;
 use layout_cache::LayoutCache;
 mod outline;
+mod immediate_metrics;
 use outline::{OutlineKey, OutlineRegion};
 #[cfg(test)]
 mod native_commands_tests;
@@ -170,11 +171,16 @@ mod font_override;
 use font_override::MessageFontSizes;
 
 pub struct GlyphTextRenderer {
+    metrics_only: bool,
     message_sizes: MessageFontSizes,
     message_position: crate::text::message_position::MessagePosition,
     message_roles: Option<asb_interpreter::MessageLayerIds>,
+    measurement_global: std::sync::Arc<()>,
+    measurement_versions: HashMap<String, std::sync::Arc<()>>,
     #[cfg(feature = "gxm-text-epoch")]
     snapshot_revision: snapshot_revision::SnapshotRevision,
+    #[cfg(feature = "gxm-text-epoch")]
+    query_revision: snapshot_revision::SnapshotRevision,
     state: FontState,
     font: Option<LoadedFont>,
     font_generation: u64,
@@ -527,22 +533,47 @@ fn layout_glyphs_indented(
 
 impl GlyphTextRenderer {
     fn mark_snapshot_changed(&mut self) {
+        self.measurement_global = std::sync::Arc::new(());
+        self.mark_query_snapshot_changed();
+    }
+
+    fn mark_active_snapshot_changed(&mut self) {
+        let id = self.state.active_layer.as_deref().unwrap_or(DEFAULT_MESSAGE_LAYER);
+        self.measurement_versions.insert(id.to_owned(), std::sync::Arc::new(()));
+        self.mark_query_snapshot_changed();
+    }
+
+    fn mark_query_snapshot_changed(&mut self) {
+        #[cfg(feature = "gxm-text-epoch")]
+        self.query_revision.bump();
+        self.mark_visual_snapshot_changed();
+    }
+
+    fn mark_visual_snapshot_changed(&mut self) {
         #[cfg(feature = "gxm-text-epoch")]
         self.snapshot_revision.bump();
     }
     pub fn new() -> Self {
+        Self::new_internal(false)
+    }
+    fn new_internal(metrics_only: bool) -> Self {
         Self {
+            metrics_only,
             message_sizes: MessageFontSizes::default(),
             message_position: Default::default(),
             message_roles: None,
+            measurement_global: std::sync::Arc::new(()),
+            measurement_versions: HashMap::new(),
             state: FontState::new(),
             #[cfg(feature = "gxm-text-epoch")]
             snapshot_revision: Default::default(),
+            #[cfg(feature = "gxm-text-epoch")]
+            query_revision: Default::default(),
             font: None,
             font_generation: 0,
             next_font_generation: 0,
             fonts: HashMap::new(),
-            atlases: vec![Atlas::new(0)],
+            atlases: if metrics_only { Vec::new() } else { vec![Atlas::new(0)] },
             cache: HashMap::new(),
             outlines: HashMap::new(),
             #[cfg(feature = "gxm-text-epoch")]
@@ -616,7 +647,7 @@ impl GlyphTextRenderer {
         let w = b.width().ceil() as u32;
         let h = b.height().ceil() as u32;
         let offset_y = sf.ascent() + b.min.y;
-        let (page, ax, ay, aw, ah) = if w > 0 && h > 0 && w < ATLAS_SZ && h < ATLAS_SZ {
+        let (page, ax, ay, aw, ah) = if !self.metrics_only && w > 0 && h > 0 && w < ATLAS_SZ && h < ATLAS_SZ {
             // Preserve the existing largest supported glyph dimensions.
             let pad = u32::from(w + 2 <= ATLAS_SZ && h + 2 <= ATLAS_SZ);
             let (page, x, y) = self.alloc_atlas_region(w + 1 + pad, h + 1 + pad);
@@ -669,6 +700,10 @@ impl GlyphTextRenderer {
 }
 
 impl TextRenderer for GlyphTextRenderer {
+    fn measurement_snapshot(&self) -> Option<GlyphTextRenderer> { Some(self.measurement_copy()) }
+    fn sync_measurement_snapshot(&self, target: &mut GlyphTextRenderer) {
+        self.sync_measurement_copy(target);
+    }
     fn set_message_font_sizes(&mut self, enabled: bool, name: u32, dialogue: u32) -> bool {
         self.update_message_sizes(enabled, name, dialogue)
     }
@@ -694,7 +729,7 @@ impl TextRenderer for GlyphTextRenderer {
         self.update_message_presentation(self.message_sizes, roles)
     }
     #[cfg(feature = "gxm-text-epoch")]
-    fn snapshot_revision(&self) -> Option<(u64, u64)> { self.snapshot_revision.token() }
+    fn snapshot_revision(&self) -> Option<(u64, u64)> { self.query_revision.token() }
     fn set_layout_cache_enabled(&mut self, enabled: bool) {
         self.mark_snapshot_changed();
         self.layout_cache.borrow_mut().enabled = enabled;
@@ -737,7 +772,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn select_cached_font(&mut self, face: &str) -> bool {
-        self.mark_snapshot_changed();
+        self.mark_query_snapshot_changed();
         let Some((font, generation)) = self.fonts.get(face) else {
             return false;
         };
@@ -778,7 +813,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn apply_font_settings(&mut self, s: &HashMap<String, String>) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         let l = self.state.active_layer_mut();
         // 按 Artemis 约定，stack 参数默认为 1（true）：应用新样式前先把当前样式压栈，
         // 之后 [font_close] 可逐层恢复。
@@ -806,7 +841,7 @@ impl TextRenderer for GlyphTextRenderer {
         }
     }
     fn font_init(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         let d = self.state.default_font.clone();
         let l = self.state.active_layer_mut();
         l.font = d;
@@ -818,7 +853,7 @@ impl TextRenderer for GlyphTextRenderer {
         l.page_tags.push(BacklogTag::FontInit);
     }
     fn font_pop(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         let l = self.state.active_layer_mut();
         if let Some(v) = l.font_stack.pop() {
             l.font = v;
@@ -829,11 +864,11 @@ impl TextRenderer for GlyphTextRenderer {
         }
     }
     fn font_default(&mut self, s: &HashMap<String, String>) {
-        self.mark_snapshot_changed();
+        self.mark_query_snapshot_changed();
         self.state.default_font.merge_raw(s);
     }
     fn switch_message_layer(&mut self, id: Option<&str>, stack: bool) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         let prev_state = self.state.active_layer.as_ref().and_then(|aid| {
             self.state
                 .layers
@@ -867,13 +902,13 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn pop_message_layer(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         if let Some(prev) = self.state.layer_stack.pop() {
             self.state.active_layer = Some(prev);
         }
     }
     fn set_glyph_config(&mut self, c: &HashMap<String, String>) {
-        self.mark_snapshot_changed();
+        self.mark_query_snapshot_changed();
         self.state.glyph_config.clone_from(c);
         // 同步解析成结构化配置，供点击等待图标摆放查询使用
         self.state.glyph_icon = GlyphIconConfig::from_raw(c);
@@ -933,7 +968,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn push_text(&mut self, content: &str, _inline: bool) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         // 再现记录先于光栅化：即使字体尚未加载，本页的逻辑文本流
         // （get_message_tags / backlog 入库）也必须完整。
         self.state
@@ -967,7 +1002,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn push_text_tracked(&mut self, content: &str, inline: bool) -> Option<TextSpanToken> {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         let (layer_id, generation, start, page_tag_index, font_size, font_face) = {
             let layer = self.state.active_layer_mut();
             (
@@ -1014,7 +1049,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn push_line_break(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         // rt 标签 omitblankline：若最后一行为空行（缓冲为空或上一个字形已是换行）
         // 则跳过本次换行，防止意外空行。解释器尚未透传该参数，先内置默认行为 1。
         let omit = self.state.layout.rt_omit_blank_line;
@@ -1053,7 +1088,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn push_page_break(&mut self, bl: Option<i32>) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         let lid = self.state.active_layer.clone().unwrap_or_default();
         if let Some(l) = self.state.layers.get_mut(&lid) {
             let final_indent = self.layout_cache.borrow_mut().layout_indented(
@@ -1093,14 +1128,14 @@ impl TextRenderer for GlyphTextRenderer {
     // ── ruby / link ──
 
     fn ruby_start(&mut self, text: &str) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         let l = self.state.active_layer_mut();
         l.open_ruby = Some((l.text_buffer.len(), text.to_string()));
         l.page_tags.push(BacklogTag::RubyStart(text.to_string()));
     }
 
     fn ruby_end(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_active_snapshot_changed();
         let (start, text, ruby_sz) = {
             let l = self.state.active_layer_mut();
             let Some((start, text)) = l.open_ruby.take() else {
@@ -1139,7 +1174,7 @@ impl TextRenderer for GlyphTextRenderer {
         shadow_color: Option<&str>,
         outline_color: Option<&str>,
     ) {
-        self.mark_snapshot_changed();
+        self.mark_query_snapshot_changed();
         let l = self.state.active_layer_mut();
         let start = l.text_buffer.len();
         // 链接本身不进再现标签序列（历史页里的链接不需要可点击），
@@ -1158,7 +1193,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn link_end(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_query_snapshot_changed();
         let l = self.state.active_layer_mut();
         let len = l.text_buffer.len();
         if let Some(link) = l.links.iter_mut().rev().find(|k| k.end.is_none()) {
@@ -1167,7 +1202,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn set_links_enabled(&mut self, enabled: bool) {
-        self.mark_snapshot_changed();
+        self.mark_query_snapshot_changed();
         self.state.links_enabled = enabled;
         if !enabled {
             // linkdisable：不可点击也不强调 → 清掉所有 hover 状态
@@ -1240,7 +1275,7 @@ impl TextRenderer for GlyphTextRenderer {
                 }
             }
         }
-        if changed { self.mark_snapshot_changed(); }
+        if changed { self.mark_query_snapshot_changed(); }
         changed
     }
 
@@ -1660,7 +1695,7 @@ impl TextRenderer for GlyphTextRenderer {
     // ── 逐字显示（Scetween） ──
 
     fn set_scetween(&mut self, config: ScetweenConfig) {
-        self.mark_snapshot_changed();
+        self.mark_visual_snapshot_changed();
         let layer = self.state.active_layer_mut();
         match config.set_mode {
             crate::text::render::ScetweenSetMode::Init => {
@@ -1678,7 +1713,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn reset_reveal(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_visual_snapshot_changed();
         let layer = self.state.active_layer_mut();
         layer.reveal_index = 0;
         layer.reveal_pending = true;
@@ -1687,7 +1722,7 @@ impl TextRenderer for GlyphTextRenderer {
 
     fn advance_reveal(&mut self, delta_ms: u64) {
         if self.state.layers.values().any(|l| l.reveal_pending && !l.text_buffer.is_empty()) {
-            self.mark_snapshot_changed();
+            self.mark_visual_snapshot_changed();
         }
         let lids: Vec<String> = self.state.layers.keys().cloned().collect();
         for lid in &lids {
@@ -1779,7 +1814,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn reveal_all(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_visual_snapshot_changed();
         for (_lid, layer) in self.state.layers.iter_mut() {
             if layer.text_buffer.is_empty() {
                 continue;
@@ -1811,7 +1846,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn hide_text(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_visual_snapshot_changed();
         let layer = self.state.active_layer_mut();
         layer.text_hidden = true;
         layer.reveal_index = 0;
@@ -1820,7 +1855,7 @@ impl TextRenderer for GlyphTextRenderer {
     }
 
     fn show_text(&mut self) {
-        self.mark_snapshot_changed();
+        self.mark_visual_snapshot_changed();
         let layer = self.state.active_layer_mut();
         layer.text_hidden = false;
         layer.reveal_index = 0;

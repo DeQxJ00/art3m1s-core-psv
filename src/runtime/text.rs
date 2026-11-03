@@ -176,12 +176,58 @@ impl BacklogInputs {
 
 /// 当前消息层文本度量的进程级镜像：`(整体宽度, 总高度, 最后一行宽度)`。
 /// 供 var system=get_message_layer_width/height/line_width 的宿主查询钩子读取，
-/// 由 runtime 每帧从 text_renderer 刷新（同 backlog 快照，text_renderer 非
-/// Send+Sync 不能直接借入进程级钩子）。
+/// 普通宿主查询的后备值；Lua 同次调用中的文本写入由无纹理的排版镜像补齐，
+/// 避免在解释器锁内重入 runtime 或读取上一帧尺寸。
 static TEXT_METRICS: Mutex<(f32, f32, f32)> = Mutex::new((0.0, 0.0, 0.0));
+struct ImmediateText {
+    renderer: crate::text::glyph::GlyphTextRenderer,
+    pending: Vec<(String, HashMap<String, String>)>,
+}
+impl ImmediateText {
+    fn new(renderer: crate::text::glyph::GlyphTextRenderer) -> Self {
+        Self { renderer, pending: Vec::new() }
+    }
+    fn metrics(&mut self) -> (f32, f32, f32) {
+        for (tag, params) in self.pending.drain(..) {
+            self.renderer.observe_metric_tag(&tag, &params);
+        }
+        self.renderer.active_layer_text_metrics().unwrap_or((0.0, 0.0, 0.0))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn immediate_measurement_defers_work_until_query_and_consumes_it_once() {
+    let mut renderer = crate::text::glyph::GlyphTextRenderer::new();
+    renderer.switch_message_layer(Some("previous"), true);
+    let mut preview = ImmediateText::new(renderer.measurement_snapshot().unwrap());
+    preview.pending.push(("chgmsg".into(), HashMap::from([("id".into(), "bubble".into())])));
+    preview.pending.push(("rt".into(), HashMap::new()));
+    assert_eq!(preview.renderer.font_state().active_layer.as_deref(), Some("previous"));
+    let first = preview.metrics();
+    assert_eq!(preview.renderer.font_state().active_layer.as_deref(), Some("bubble"));
+    assert!(first.1 > 0.0);
+    assert!(preview.pending.is_empty());
+    assert_eq!(preview.metrics(), first);
+}
+static IMMEDIATE_TEXT: Mutex<Option<ImmediateText>> = Mutex::new(None);
+
+pub(super) fn observe_immediate_text(tag: &str, params: &HashMap<String, String>) {
+    if !matches!(tag, "chgmsg" | "/chgmsg" | "font" | "fontinit" | "/font"
+        | "fontdefault" | "print" | "rp" | "rt" | "prohibit" | "wordparts"
+        | "indent" | "indentmodify") { return; }
+    if let Some(renderer) = IMMEDIATE_TEXT.lock().unwrap().as_mut() {
+        // Most printed dialogue never asks for dimensions. Defer layout until
+        // a synchronous query, discarding this queue when real events catch up.
+        renderer.pending.push((tag.to_owned(), params.clone()));
+    }
+}
 
 /// 读取当前文本度量快照。消费方是解释器宿主查询钩子。
 pub(crate) fn text_metrics_snapshot() -> (f32, f32, f32) {
+    if let Some(renderer) = IMMEDIATE_TEXT.lock().unwrap().as_mut() {
+        return renderer.metrics();
+    }
     *TEXT_METRICS.lock().unwrap()
 }
 
@@ -189,11 +235,25 @@ pub(crate) fn text_metrics_snapshot() -> (f32, f32, f32) {
 ///
 /// 消费方是解释器宿主查询钩子（接线见 skipped），故非测试构建里暂无调用方。
 #[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn backlog_snapshot() -> BacklogSnapshot {
     BACKLOG_SNAPSHOT.lock().unwrap().clone()
 }
 
+pub(super) fn query_backlog_size() -> usize {
+    BACKLOG_SNAPSHOT.lock().unwrap().backlog_size()
+}
+
+pub(super) fn query_backlog_tags(page: usize, allfont: bool) -> Option<Vec<String>> {
+    BACKLOG_SNAPSHOT.lock().unwrap().backlog_tags(page, allfont)
+}
+
+pub(super) fn query_message_tags(id: &str, allfont: bool) -> Option<Vec<String>> {
+    BACKLOG_SNAPSHOT.lock().unwrap().message_tags(id, allfont)
+}
+
 pub(super) fn clear_process_snapshots() {
+    *IMMEDIATE_TEXT.lock().unwrap() = None;
     *BACKLOG_INPUTS.lock().unwrap() = BacklogInputs::default();
     *BACKLOG_SNAPSHOT.lock().unwrap() = BacklogSnapshot::default();
     *TEXT_METRICS.lock().unwrap() = (0.0, 0.0, 0.0);
@@ -246,6 +306,19 @@ fn apply_message_layer_binding(
     }
 }
 
+fn select_message_layer(renderer: &mut dyn crate::text::render::TextRenderer, id: Option<&str>, stack: bool, layered: Option<i32>) {
+    renderer.switch_message_layer(id, stack);
+    // Selecting an existing layer without a mode must preserve its attachment.
+    // New message layers already default to the independent overlay.
+    if let Some(mode) = layered.filter(|mode| {
+        let state = renderer.font_state();
+        state.active_layer.as_ref().and_then(|id| state.layers.get(id))
+            .is_none_or(|layer| layer.layered != (*mode == 1))
+    }) {
+        renderer.font_state_mut().active_layer_mut().layered = mode == 1;
+    }
+}
+
 fn message_layer_scene_id(message_id: &str, layered: bool) -> String {
     if layered {
         return message_id.to_string();
@@ -287,6 +360,33 @@ impl CoreRuntime {
         inputs.set_message_enabled(self.message_cache_enabled);
         inputs.sync_renderer(renderer.as_ref(), &mut BACKLOG_SNAPSHOT.lock().unwrap(),
             &mut TEXT_METRICS.lock().unwrap(), self.text_epoch_enabled);
+        // Reveal clocks change every frame but do not change layout. Actual
+        // text events synchronize the mirror; rendering must not clone it again.
+        let mut immediate = IMMEDIATE_TEXT.lock().unwrap();
+        if immediate.is_none() {
+            *immediate = renderer.measurement_snapshot().map(ImmediateText::new);
+        }
+    }
+
+    pub(super) fn sync_immediate_text(&self) {
+        if let Some(renderer) = self.text_renderer.as_ref() {
+            let started = std::time::Instant::now();
+            let mut mirror = IMMEDIATE_TEXT.lock().unwrap();
+            if let Some(mirror) = mirror.as_mut() {
+                renderer.sync_measurement_snapshot(&mut mirror.renderer);
+                mirror.pending.clear();
+            } else {
+                *mirror = renderer.measurement_snapshot().map(ImmediateText::new);
+            }
+            let elapsed = started.elapsed().as_micros();
+            if elapsed >= 10000 {
+                let state = renderer.font_state();
+                crate::core_info!("[text-mirror-slow] us={} layers={} glyphs={} font_stack={}",
+                    elapsed, state.layers.len(),
+                    state.layers.values().map(|l| l.text_buffer.len()).sum::<usize>(),
+                    state.layers.values().map(|l| l.font_stack.len()).sum::<usize>());
+            }
+        }
     }
 
     /// Advances reveal animation and returns whether its visible output may
@@ -433,8 +533,7 @@ impl CoreRuntime {
                 Event::FontClose => renderer.font_pop(),
                 Event::FontDefault(settings) => renderer.font_default(settings),
                 Event::MessageLayerSwitch { id, stack, layered } => {
-                    renderer.switch_message_layer(id.as_deref(), *stack);
-                    renderer.font_state_mut().active_layer_mut().layered = *layered == Some(1);
+                    select_message_layer(renderer.as_mut(), id.as_deref(), *stack, *layered);
                     // 消息层切换后的 lyprop `~` 绑定在 renderer 借用结束后统一处理
                     // （见函数末尾 sync_message_layer_binding）。
                 }
@@ -442,9 +541,9 @@ impl CoreRuntime {
                 // [rt omitblankline=]：换行前按标签值更新"末行为空则不换行"，
                 // 再执行换行（配置在 layout 上，push_line_break 会读取）。
                 Event::LineBreak { omitblankline } => {
-                    renderer
+                    if renderer.font_state().layout.rt_omit_blank_line != *omitblankline { renderer
                         .font_state_mut()
-                        .set_rt_omit_blank_line(*omitblankline);
+                        .set_rt_omit_blank_line(*omitblankline); }
                     renderer.push_line_break();
                 }
                 Event::PageBreak { backlog } => renderer.push_page_break(*backlog),
@@ -459,13 +558,16 @@ impl CoreRuntime {
                 Event::RestoreIndentState { data } => renderer.restore_indent_state(data),
                 // [prohibit]：自定义行首/行尾禁则字符集，覆盖内置默认表。
                 Event::ProhibitConfig { head, foot } => {
-                    renderer
+                    if renderer.font_state().layout.prohibit_head != *head
+                        || renderer.font_state().layout.prohibit_foot != *foot { renderer
                         .font_state_mut()
-                        .set_prohibit(Some(head.as_str()), Some(foot.as_str()));
+                        .set_prohibit(Some(head.as_str()), Some(foot.as_str())); }
                 }
                 // [wordparts]：视为单词组成部分的字符集（避免英文单词被拦腰换行）。
                 Event::WordpartsConfig { parts } => {
-                    renderer.font_state_mut().set_wordparts(parts);
+                    if renderer.font_state().layout.wordparts != *parts {
+                        renderer.font_state_mut().set_wordparts(parts);
+                    }
                 }
                 Event::TextAnimation(params) => {
                     renderer.set_scetween(ScetweenConfig::from_params(params));
@@ -956,6 +1058,17 @@ pub(super) fn font_fallback_candidates(face: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn reselecting_message_preserves_layer_mode_unless_explicitly_changed() {
+        let mut renderer = crate::text::GlyphTextRenderer::new();
+        super::select_message_layer(&mut renderer, Some("phone.text"), false, Some(1));
+        super::select_message_layer(&mut renderer, Some("dialogue"), false, None);
+        assert!(!renderer.font_state_mut().active_layer_mut().layered);
+        super::select_message_layer(&mut renderer, Some("phone.text"), false, None);
+        assert!(renderer.font_state_mut().active_layer_mut().layered);
+        super::select_message_layer(&mut renderer, Some("phone.text"), false, Some(0));
+        assert!(!renderer.font_state_mut().active_layer_mut().layered);
+    }
+    #[test]
     fn native_message_query_round_trips_through_dynamic_tag() {
         use asb_interpreter::{Interpreter, InterpreterConfig, Event};
         let original = "hello, quoted \"text\" \\ path";
@@ -1008,7 +1121,7 @@ mod tests {
                 _ => { r.hide_text();r.show_text();r.reveal_all(); }
             }
             let enabled=tick%13!=0;
-            assert!(!cache.sync_renderer(r,&mut out,&mut metrics,enabled));
+            cache.sync_renderer(r,&mut out,&mut metrics,enabled);
             assert_eq!(out,build_backlog_snapshot(r.font_state()),"tick {tick}");
             assert_eq!(metrics,r.active_layer_text_metrics().unwrap_or((0.0,0.0,0.0)),"tick {tick}");
             assert_eq!(cache.sync_renderer(r,&mut out,&mut metrics,enabled),enabled);

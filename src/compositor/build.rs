@@ -154,6 +154,18 @@ fn visit(
     if layer.host_hidden || (layer.tweens.is_empty() && !layer.props.is_visible()) {
         return;
     }
+    let no_host_content = cache.as_deref().is_some_and(|c| !c.has_host_content(id))
+        || (content_for.is_none() && text_for.is_none());
+    // Menu/message pages remain in the scene after their text is cleared.
+    // An empty leaf cannot contribute pixels; check live resources each time
+    // so later text, image edits or children immediately restore rendering.
+    if no_host_content && layer.children.is_empty()
+        && layer.file.as_deref().is_none_or(str::is_empty)
+        && file_overrides.is_none_or(|overrides| !overrides.contains_key(id))
+        && layer.solid_color.is_none() && layer.mask.is_none()
+        && layer.props.shader.is_none() && layer.props.intermediate_render.unwrap_or(0) == 0 {
+        return;
+    }
     // Moving grouping chains cannot replay static fragments. They carry only
     // transforms/opacity, so bypass texture, material and host callback setup.
     // Keep the general path for masks, declared shaders, clips and host content.
@@ -168,8 +180,6 @@ fn visit(
         && layer.props.custom.is_empty()
         && layer.tweens.iter().all(|t| matches!(t.param.as_str(),
             "left"|"x"|"top"|"y"|"anchorx"|"anchory"|"xscale"|"yscale"|"zoom"|"rotate"|"alpha"|"visible"|"reversex"|"reversey"));
-    let no_host_content = cache.as_deref().is_some_and(|c| !c.has_host_content(id))
-        || (content_for.is_none() && text_for.is_none());
     if moving_chain && plain_container && no_host_content {
         let props = resolved_props(layer, now_ms);
         if !props.is_visible() { return; }
@@ -230,8 +240,14 @@ fn visit(
     let start=[frame.commands.len(),frame.mask_commands.len(),frame.shader_groups.len()];
     // A cached parent owns the complete fragment; avoid duplicating every child.
     let mut held=if remember {cache.take()} else {None};
-    visit_uncached(scene,layer,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
-        provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
+    if remember {
+        // Eligibility proves this entire branch has no injected content.
+        visit_uncached(scene,layer,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
+            provider,frame,record_command_keys,&mut None,&mut None,file_overrides,cache);
+    } else {
+        visit_uncached(scene,layer,now_ms,parent_transform,parent_opacity,parent_clip,inherited_shader,crop_allowed,
+            provider,frame,record_command_keys,content_for,text_for,file_overrides,cache);
+    }
     if let Some(c)=held.as_deref_mut(){let mark=c.profile_mark();c.store(scene,id,parent,file_overrides,frame,start);c.profile_add(2,mark);}
     if remember {*cache=held;}
 }
@@ -760,6 +776,34 @@ mod tests {
         let reference = build_frame_with_content(&scene, 500, &mut provider, None, Some(&mut no_text), Some(&edits));
         assert_eq!(optimized, reference);
         assert_eq!(optimized.commands.len(), 2);
+    }
+
+    #[test]
+    fn empty_message_leaves_skip_work_without_hiding_new_content() {
+        let mut scene = Scene::new();
+        for n in 0..230 { scene.create(&format!("1.{n}.empty"), None); }
+        scene.create("1.text", None);
+        let mut provider = MockProvider::new();
+        let mut image_scene = Scene::new();
+        image_scene.create("image", Some("fixture".into()));
+        let command = build_frame(&image_scene, 0, &mut provider, None).commands[0].clone();
+        let mut cache = super::super::build_cache::SceneBuildCache::default();
+        for tick in 0..3 {
+            if tick == 1 { scene.set_file("1.0.empty", Some("fixture".into())); }
+            if tick == 2 { scene.create("1.1.empty.child", Some("fixture".into())); }
+            let calls = std::cell::Cell::new(0);
+            let mut content = |id: &str| {
+                if id.ends_with(".empty") { calls.set(calls.get() + 1); }
+                if id == "1.text" { vec![command.clone()] } else { Vec::new() }
+            };
+            cache.begin(1, false, ["1.text".into()].into_iter());
+            let got = build_frame_reusing_cached(&scene, 0, &mut provider, None,
+                Some(&mut content), None, true, DrawList::new(), Some(&mut cache));
+            assert!(calls.get() <= tick, "empty UI callbacks: {}", calls.get());
+            let expected = build_frame(&scene, 0, &mut provider, Some(&mut content));
+            assert_eq!(got, expected);
+            cache.finish();
+        }
     }
 
     fn raw(pairs: &[(&str, &str)]) -> HashMap<String, String> {

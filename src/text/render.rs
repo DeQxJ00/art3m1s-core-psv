@@ -1066,6 +1066,10 @@ impl From<&str> for TextAlignment {
 // ---------------------------------------------------------------------------
 
 pub trait TextRenderer {
+    fn measurement_snapshot(&self) -> Option<crate::text::glyph::GlyphTextRenderer> { None }
+    fn sync_measurement_snapshot(&self, target: &mut crate::text::glyph::GlyphTextRenderer) {
+        if let Some(snapshot) = self.measurement_snapshot() { *target = snapshot; }
+    }
     /// Exact mutation stamp for backlog/metrics. None keeps conservative comparison.
     /// Implementations must invalidate all writes, including returned mutable borrows.
     fn snapshot_revision(&self) -> Option<(u64, u64)> { None }

@@ -60,7 +60,8 @@ impl GlyphTextRenderer {
     pub(super) fn prepare_outlines(&mut self) {
         #[cfg(feature = "gxm-text-epoch")]
         {
-            let token = self.snapshot_revision.token();
+            // Coverage is prepared for the full text, independent of reveal time.
+            let token = self.query_revision.token();
             if token.is_some() && token == self.outline_revision { return; }
             self.outline_revision = token;
         }

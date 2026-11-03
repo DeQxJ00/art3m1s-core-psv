@@ -73,7 +73,22 @@ impl CoreRuntime {
             .iter()
             .any(|runtime_event| self.event_invalidates_pointer_hit_test(&runtime_event.event));
         self.dispatch_events(&collected, profile);
-        if !collected.is_empty() { self.sync_toolbar_visibility(); }
+        if !collected.is_empty() {
+            let toolbar_started = std::time::Instant::now();
+            self.sync_toolbar_visibility();
+            let toolbar_us = toolbar_started.elapsed().as_micros();
+            if toolbar_us >= 10000 {
+                crate::core_info!("[text-toolbar-slow] us={} events={}", toolbar_us, collected.len());
+            }
+            if collected.iter().any(|e| matches!(e.event,
+                Event::ScenarioText { .. } | Event::FontSettings(_) | Event::FontDefault(_)
+                | Event::FontInit | Event::FontClose | Event::MessageLayerSwitch { .. }
+                | Event::MessageLayerPop | Event::LineBreak { .. } | Event::PageBreak { .. }
+                | Event::IndentConfig { .. } | Event::IndentModify { .. }
+                | Event::ProhibitConfig { .. } | Event::WordpartsConfig { .. })) {
+                self.sync_immediate_text();
+            }
+        }
         profile.events_ns += crate::profiler::FrameProfile::elapsed(started);
     }
 
@@ -1121,13 +1136,13 @@ impl CoreRuntime {
                 sound_info: Box::new(super::media::sound_info_snapshot),
                 // backlog / message-tags 从每帧刷新的进程级快照读取
                 // （text_renderer 非 Send+Sync，不能直接借入进程级钩子）。
-                backlog_size: Box::new(|| super::text::backlog_snapshot().backlog_size()),
+                backlog_size: Box::new(super::text::query_backlog_size),
                 backlog_tags: Box::new(|page, allfont| {
-                    super::text::backlog_snapshot().backlog_tags(page, allfont)
+                    super::text::query_backlog_tags(page, allfont)
                         .map(super::text::native_query_tags)
                 }),
                 message_tags: Box::new(|id, allfont| {
-                    super::text::backlog_snapshot().message_tags(id, allfont)
+                    super::text::query_message_tags(id, allfont)
                         .map(super::text::native_query_tags)
                 }),
                 message_layer_metrics: Box::new(super::text::text_metrics_snapshot),
