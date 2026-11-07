@@ -674,7 +674,9 @@ fn settle_inline_event_frame(
     let claimed_by_jump = active_frame
         .as_ref()
         .is_some_and(|frame| frame.claimed_by_jump);
-    if saw_queued_call && !claimed_by_jump {
+    // A jump followed by return/call can replace the marker with a real
+    // caller at the same PC. Do not delete that replacement on identity alone.
+    if saw_queued_call && !claimed_by_jump && !saw_queued_jump {
         let frame = active_frame.take().unwrap();
         interpreter.remove_call_frame(frame.stack.len());
         return Ok(());
@@ -968,6 +970,36 @@ mod tests {
             assert_eq!(drain.changed_position, changed);
             assert_eq!(interpreter.current_line(), return_line);
         }
+    }
+
+    #[test]
+    fn mixed_event_jump_return_call_keeps_replacement_story_return_frame() {
+        let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "[wait]").unwrap();
+        it.load_script("menu", "[stop]").unwrap();
+        it.load_script("history", "[return]").unwrap();
+        it.set_callback(|e| match e {
+            Event::Wait { .. } => CallbackResult::Pause,
+            _ => CallbackResult::Continue,
+        });
+        it.boot("story").unwrap();
+        it.run().unwrap();
+        let line = it.current_line();
+        it.push_inline_event_frame().unwrap();
+        let mut frame = Some(InlineEventFrame {
+            script: "story".into(), line, stack: Vec::new(), claimed_by_jump: false,
+        });
+        it.engine_context().lock().unwrap().tag_queue.extend([
+            ("jump".into(), HashMap::from([("file".into(), "menu".into())])),
+            ("return".into(), HashMap::new()),
+            ("call".into(), HashMap::from([("file".into(), "history".into())])),
+        ]);
+        let drain = it.drain_queued_tags_only().unwrap();
+        assert!(drain.saw_jump && drain.saw_call && drain.saw_return);
+        settle_inline_event_frame(&mut it, &mut frame, false, false, drain.saw_call, drain.saw_jump).unwrap();
+        assert_eq!(it.call_stack().len(), 1);
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(_)));
+        assert_eq!(it.current_script(), Some("story"));
     }
 
     #[test]

@@ -556,26 +556,20 @@ pub fn execute_var_system(
             let file = get_resolved("file")
                 .map(|v| v.as_string())
                 .unwrap_or_default();
-            // .exe 文件直接返回"期望 CRC"（从同名变量读取，去掉 .check 后缀）
-            // 例如：name="t.crc.exe.check" → 查找 "t.crc.exe" 的值
-            if file.to_ascii_lowercase().ends_with(".exe") {
+            let zerox = params.get("zerox").map(|s| s.as_str()) == Some("1");
+            let caps = params.get("caps").map(|s| s.as_str()) == Some("1");
+            // Query real file contents for every extension, including executables.
+            let actual = with_host_hooks(|h| (h.file_crc32)(&file)).flatten();
+            let crc = if let Some(crc) = actual {
+                format_crc32(crc, zerox, caps)
+            } else if file.to_ascii_lowercase().ends_with(".exe") {
+                // Preserve the existing missing-executable compatibility fallback.
                 let expected_name = name.strip_suffix(".check").unwrap_or(name);
-                let expected_crc = variables
-                    .get(expected_name)
-                    .map(|v| v.as_string())
-                    .unwrap_or_default();
-                variables.set(name, Value::String(expected_crc));
+                variables.get(expected_name).map(|v| v.as_string()).unwrap_or_default()
             } else {
-                // zerox=1 添加 0x 前缀；caps=1 十六进制大写（缺省小写）
-                let zerox = params.get("zerox").map(|s| s.as_str()) == Some("1");
-                let caps = params.get("caps").map(|s| s.as_str()) == Some("1");
-                let crc = with_host_hooks(|h| (h.file_crc32)(&file))
-                    .flatten()
-                    .map(|crc| format_crc32(crc, zerox, caps))
-                    // 无钩子或读不到文件：保持旧行为返回空串
-                    .unwrap_or_default();
-                variables.set(name, Value::String(crc));
-            }
+                String::new()
+            };
+            variables.set(name, Value::String(crc));
         }
 
         "implode" => {
@@ -1201,7 +1195,7 @@ mod tests {
         // 装一个返回固定历史的钩子，验证三个 backlog var system 落值。
         set_host_query_hooks(HostQueryHooks {
             file_exists: Box::new(|_, _| false),
-            file_crc32: Box::new(|_| None),
+            file_crc32: Box::new(|file| (file == "sample01.exe").then_some(0x89ab_cdef)),
             file_update_time: Box::new(|_| None),
             sound_info: Box::new(SoundInfoSnapshot::default),
             backlog_size: Box::new(|| 3),
@@ -1276,6 +1270,13 @@ mod tests {
         assert_eq!(h.get("t.h").and_then(Value::as_float), Some(48.0));
         let lw = run(&[("system", "get_message_layer_line_width"), ("name", "t.lw")]);
         assert_eq!(lw.get("t.lw").and_then(Value::as_float), Some(120.0));
+
+        // Executables must use their actual bytes, not a variable-name heuristic.
+        for (zerox, caps, expected) in [("0", "0", "89abcdef"), ("1", "1", "0x89ABCDEF")] {
+            let crc = run(&[("system", "file_crc"), ("name", "t.crc.exe.check"),
+                ("file", "sample01.exe"), ("zerox", zerox), ("caps", caps)]);
+            assert_eq!(crc.get("t.crc.exe.check").map(Value::as_string).as_deref(), Some(expected));
+        }
 
         // 清理进程级钩子，避免污染其它测试。
         *HOST_QUERY_HOOKS.write().unwrap() = None;

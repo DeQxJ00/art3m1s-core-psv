@@ -869,12 +869,6 @@ impl TextRenderer for GlyphTextRenderer {
     }
     fn switch_message_layer(&mut self, id: Option<&str>, stack: bool) {
         self.mark_active_snapshot_changed();
-        let prev_state = self.state.active_layer.as_ref().and_then(|aid| {
-            self.state
-                .layers
-                .get(aid)
-                .map(|l| (l.left, l.top, l.width, l.height, l.font.clone()))
-        });
         // stack=0（chgmsg）不压栈，避免存档中消息层堆栈膨胀。
         if stack {
             // The initial implicit page is a real return target too. Without
@@ -883,22 +877,9 @@ impl TextRenderer for GlyphTextRenderer {
                 .unwrap_or_else(|| DEFAULT_MESSAGE_LAYER.to_string()));
         }
         self.state.active_layer = id.map(|s| s.to_string());
-        let is_new = !self
-            .state
-            .layers
-            .contains_key(id.unwrap_or(DEFAULT_MESSAGE_LAYER));
-        let layer = self.state.active_layer_mut();
-        if let Some((left, top, width, height, font)) = prev_state {
-            // Zero is a valid local origin for UI text, not an unset marker.
-            // Only a newly created page inherits the previous page's layout.
-            if is_new {
-                layer.left = left;
-                layer.top = top;
-                layer.width = width;
-                layer.height = height;
-                layer.font = font;
-            }
-        }
+        // Each new page starts with fontdefault and its own local origin.
+        // The selected dialogue page is not a template for temporary UI pages.
+        self.state.active_layer_mut();
         // chgmsg selects an existing page; it does not start a new one. Games
         // reselect the dialogue layer to configure its click icon after reveal.
         // Preserve glyphs, page tags and animation progress until an explicit rp.
@@ -2449,8 +2430,8 @@ mod tests {
                 ("size".into(), "24".into()),
             ]));
             r.switch_message_layer(id, true);
-            // Preserve inheritance for newly created pages.
-            assert_eq!(r.state.active_layer_mut().top, 423.0);
+            // New pages start independently; reselection retains their own layout.
+            assert_eq!(r.state.active_layer_mut().top, 0.0);
             r.font_init();
             r.apply_font_settings(&HashMap::from([
                 ("left".into(), "0".into()),
@@ -2989,6 +2970,26 @@ mod tests {
         assert_eq!(l.font.size, Some(30.0), "fontinit 应恢复 fontdefault 默认");
         assert!(l.font_stack.is_empty(), "文档：字体堆栈将被初始化（清空）");
         assert_eq!(l.page_tags.last(), Some(&BacklogTag::FontInit));
+    }
+
+    #[test]
+    fn new_notice_page_does_not_inherit_dialogue_layout_or_font() {
+        let mut r = GlyphTextRenderer::new();
+        r.font_default(&HashMap::from([("size".into(), "18".into())]));
+        r.switch_message_layer(Some("body"), true);
+        r.apply_font_settings(&HashMap::from([
+            ("left".into(), "60".into()), ("top".into(), "440".into()),
+            ("width".into(), "800".into()), ("height".into(), "90".into()),
+            ("size".into(), "32".into()),
+        ]));
+        r.switch_message_layer(Some("notice"), true);
+        let layer = r.font_state_mut().active_layer_mut();
+        assert_eq!((layer.left, layer.top, layer.width, layer.height), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(layer.font.size, Some(18.0));
+        r.pop_message_layer();
+        let body = r.font_state_mut().active_layer_mut();
+        assert_eq!((body.left, body.top), (60.0, 440.0));
+        assert_eq!(body.font.size, Some(32.0));
     }
 
     #[test]

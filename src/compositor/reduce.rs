@@ -894,23 +894,29 @@ impl Compositor {
                 // the next tick restores an old expression (possibly from a
                 // different pose/canvas). Child layers keep their own animations.
                 self.anime_states.remove(id);
-                let replaced = !file.is_empty() && self.scene.get(id)
-                    .is_some_and(|layer| layer.file.as_deref().is_some_and(|old| old != file));
+                let replaced = self.scene.get(id).is_some_and(|layer| {
+                    layer.file.as_deref().filter(|old| !old.is_empty())
+                        .is_some_and(|old| old != file)
+                        || (layer.solid_color.is_some() && !file.is_empty())
+                });
                 self.scene.create(id, Some(file.clone()));
                 if replaced {
-                    // A new image must not resume the previous image's pan on
-                    // the next tick. Descendants retain independent motion.
+                    // Content replacement (including image -> solid -> image)
+                    // ends the old pan. Descendants retain independent motion.
                     self.scene.get_mut(id).unwrap().tweens.clear();
                 }
             }
             LayerEvent::Create2 { id, file, alpha } => {
                 self.anime_states.remove(id);
-                let replaced = !file.is_empty() && self.scene.get(id)
-                    .is_some_and(|layer| layer.file.as_deref().is_some_and(|old| old != file));
+                let replaced = self.scene.get(id).is_some_and(|layer| {
+                    layer.file.as_deref().filter(|old| !old.is_empty())
+                        .is_some_and(|old| old != file)
+                        || (layer.solid_color.is_some() && !file.is_empty())
+                });
                 self.scene.create(id, Some(file.clone()));
                 if replaced {
-                    // A new image must not resume the previous image's pan on
-                    // the next tick. Descendants retain independent motion.
+                    // Content replacement (including image -> solid -> image)
+                    // ends the old pan. Descendants retain independent motion.
                     self.scene.get_mut(id).unwrap().tweens.clear();
                 }
                 if let Some(alpha) = alpha {
@@ -1112,6 +1118,34 @@ mod tests {
         c.apply_event(&create("1", "normal"));
         assert!(c.scene().get("1").unwrap().tweens.is_empty());
         assert!(!c.scene().get("1.1").unwrap().tweens.is_empty());
+    }
+
+    #[test]
+    fn image_solid_image_replacement_does_not_keep_previous_pan() {
+        for use_create2 in [false, true] {
+            let mut c = Compositor::new();
+            c.apply_event(&create("1", "large"));
+            c.apply_event(&create("1.1", "overlay"));
+            c.apply_event(&set_tween("1", "left", "-280", "-680", 80000));
+            c.apply_event(&set_tween("1", "top", "-270", "-270", 80000));
+            c.apply_event(&set_tween("1.1", "left", "0", "20", 80000));
+            let replace = |file: &str| if use_create2 {
+                Event::Layer(LayerEvent::Create2 { id: "1".into(), file: file.into(), alpha: None })
+            } else { create("1", file) };
+            c.apply_event(&replace(""));
+            c.apply_event(&Event::Layer(LayerEvent::SetProperties {
+                id: "1".into(), properties: HashMap::from([
+                    ("color".into(), "FF000000".into()), ("left".into(), "0".into()), ("top".into(), "0".into())]),
+            }));
+            assert!(c.scene().get("1").unwrap().tweens.is_empty());
+            c.advance(1000);
+            assert_eq!(c.layer_offset("1"), Some((0.0, 0.0)));
+            c.apply_event(&replace("normal"));
+            c.advance(80000);
+            assert_eq!(c.layer_offset("1"), Some((0.0, 0.0)));
+            assert_eq!(c.scene().get("1").unwrap().file.as_deref(), Some("normal"));
+            assert_eq!(c.layer_offset("1.1"), Some((20.0, 0.0)));
+        }
     }
 
     #[test]

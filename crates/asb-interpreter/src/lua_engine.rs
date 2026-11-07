@@ -449,6 +449,41 @@ pub struct EngineContext {
 pub type FileReader = Arc<dyn Fn(&str) -> crate::error::Result<Vec<u8>> + Send + Sync>;
 
 impl EngineContext {
+    // e:tag is immediate from Lua's perspective. Keep stack queries in the
+    // same callback consistent with control tags awaiting interpreter drain.
+    // This is only the read mirror; the queued tags still execute exactly once.
+    fn observe_control_stack(&mut self, tag: &str, params: &HashMap<String, String>) {
+        if !matches!(tag, "jump" | "call" | "return") { return; }
+        if tag == "return" {
+            if self.script_stack.len() > 1 { self.script_stack.pop(); }
+            return;
+        }
+        let Some((current, _)) = self.script_stack.last().cloned() else { return; };
+        let resolve = |text: &str| -> Option<String> {
+            match &self.variables {
+                Some(vars) => crate::expression::ExpressionEvaluator::new(&vars.lock().unwrap())
+                    .resolve_param_str(text).ok(),
+                None => Some(text.to_owned()),
+            }
+        };
+        if tag == "jump" && let Some(cond) = params.get("cond") {
+            let Some(vars) = &self.variables else { return; };
+            if !crate::expression::ExpressionEvaluator::new(&vars.lock().unwrap())
+                .resolve_param(&format!("${cond}")).is_ok_and(|v| v.as_bool()) { return; }
+        }
+        let Some(label) = resolve(params.get("label").map(String::as_str).unwrap_or("")) else { return; };
+        let file = match params.get("file") {
+            Some(raw) => { let Some(value) = resolve(raw) else { return; }; value },
+            None => current.clone(),
+        };
+        if tag == "call" && label == "0" && (file == "0" || !params.contains_key("file")) { return; }
+        let file = if file.is_empty() || file == "0" { current } else { file };
+        let index = self.scripts_view.get(&file)
+            .and_then(|script| script.get_label_line(&label)).unwrap_or(0);
+        if tag == "jump" { self.script_stack.pop(); }
+        self.script_stack.push((file, index));
+    }
+
     pub fn new(callbacks: Box<dyn EngineCallbacks + Send + Sync>) -> Self {
         Self {
             frame_number: 0,
@@ -752,6 +787,7 @@ impl UserData for EngineApi {
                         }
                     }
                 } else {
+                    ctx.observe_control_stack(&tag_name, &params);
                     let insert_at = ctx.immediate_tag_count.min(ctx.tag_queue.len());
                     ctx.tag_queue.insert(insert_at, (tag_name, params));
                     ctx.immediate_tag_count += 1;
@@ -2392,6 +2428,28 @@ mod tests {
             .unwrap();
 
         assert_eq!((first, last), (0.1, 1.0));
+    }
+
+    #[test]
+    fn immediate_control_flow_updates_stack_seen_by_later_lua_queries() {
+        let lua = Lua::new();
+        let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(EmoteProbe::default()))));
+        ctx.lock().unwrap().script_stack = vec![("main".into(), 7), ("main".into(), 7)];
+        init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
+        lua.load(r#"
+            __engine:tag{'jump', file='menu', label='top'}
+            local stack = __engine:getScriptStack()
+            assert(stack[#stack].file == 'menu')
+            __engine:tag{'return'}
+            stack = __engine:getScriptStack()
+            assert(#stack == 1 and stack[1].file == 'main')
+            __engine:tag{'call', file='ui', label='history'}
+            stack = __engine:getScriptStack()
+            assert(#stack == 2 and stack[1].file == 'main' and stack[2].file == 'ui')
+            __engine:enqueueTag{'return'}
+            assert(#__engine:getScriptStack() == 2, 'queued returns must remain deferred')
+        "#).exec().unwrap();
+        assert_eq!(ctx.lock().unwrap().tag_queue.len(), 4);
     }
 
     #[test]
