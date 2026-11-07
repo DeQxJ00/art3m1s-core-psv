@@ -59,7 +59,7 @@ impl CoreRuntime {
         self.clear_pending_text_translation();
         self.clear_emote_state("project reload");
         #[cfg(all(target_os="vita",feature="gxm-backend"))]
-        super::surface_loader::shutdown();
+        {super::surface_loader::shutdown();self.hidden_surface_bindings.clear();self.staged_surface_bindings.clear();}
         #[cfg(all(target_os="vita",feature="gxm-backend"))]
         {let mut p=self.cpu_image_compression.clone();p.ignore_bg=self.ignore_background_alpha;crate::cpu_image_compression::set_policy(p);}
         super::emote_source_cache::reset();
@@ -188,7 +188,13 @@ impl CoreRuntime {
         let provider = {
             let paths = Arc::clone(&self.magic_paths);
             let image_paths=Arc::clone(&self.magic_paths);
-            let mut provider=GxmTextureProvider::new().with_image_path_resolver(move |name|magic_path::resolve_path(&image_paths,name));
+            let identity_paths=Arc::clone(&self.magic_paths);
+            let mut provider=GxmTextureProvider::new().with_image_path_resolver(move |name|magic_path::resolve_path(&image_paths,name))
+                .with_source_identity(move |name| {
+                    let resolved=magic_path::resolve_path(&identity_paths,name);
+                    crate::native_texture::candidates(&resolved)
+                        .find(|p|crate::ffi::query_asset_size(p).is_some()).map(|p|p.into_owned())
+                });
             provider.set_ignore_background_alpha(self.ignore_background_alpha);
             provider.with_cache_budget(crate::image_cache_budget::session_budget()).with_tracked_prefetch(move |name| {
                 let resolved = magic_path::resolve_path(&paths, name);

@@ -464,6 +464,10 @@ impl EmoteState {
         self.layers.retain(|id, _| scene.get(id).is_some());
     }
 
+    pub(super) fn scene_layer_ids(&self, scene: &crate::compositor::Scene) -> Vec<String> {
+        self.layers.keys().filter(|id| scene.get(id).is_some()).cloned().collect()
+    }
+
     pub fn clear(&mut self) -> usize {
         let count = self.layers.len();
         self.layers.clear();

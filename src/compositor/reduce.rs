@@ -890,10 +890,29 @@ impl Compositor {
     fn apply_layer_event(&mut self, event: &LayerEvent) {
         match event {
             LayerEvent::Create { id, file } => {
+                // Replacing the image ends its previous frame sequence. Otherwise
+                // the next tick restores an old expression (possibly from a
+                // different pose/canvas). Child layers keep their own animations.
+                self.anime_states.remove(id);
+                let replaced = !file.is_empty() && self.scene.get(id)
+                    .is_some_and(|layer| layer.file.as_deref().is_some_and(|old| old != file));
                 self.scene.create(id, Some(file.clone()));
+                if replaced {
+                    // A new image must not resume the previous image's pan on
+                    // the next tick. Descendants retain independent motion.
+                    self.scene.get_mut(id).unwrap().tweens.clear();
+                }
             }
             LayerEvent::Create2 { id, file, alpha } => {
+                self.anime_states.remove(id);
+                let replaced = !file.is_empty() && self.scene.get(id)
+                    .is_some_and(|layer| layer.file.as_deref().is_some_and(|old| old != file));
                 self.scene.create(id, Some(file.clone()));
+                if replaced {
+                    // A new image must not resume the previous image's pan on
+                    // the next tick. Descendants retain independent motion.
+                    self.scene.get_mut(id).unwrap().tweens.clear();
+                }
                 if let Some(alpha) = alpha {
                     let mut raw = HashMap::new();
                     raw.insert("alpha".to_string(), alpha.to_string());
@@ -1081,6 +1100,18 @@ mod tests {
 
         c.apply_event(&Event::Layer(LayerEvent::Delete { id: "1".into() }));
         assert!(c.scene().is_empty());
+    }
+
+    #[test]
+    fn replacing_image_stops_its_pan_but_keeps_child_motion() {
+        let mut c=Compositor::new();
+        c.apply_event(&create("1", "large"));
+        c.apply_event(&create("1.1", "overlay"));
+        c.apply_event(&set_tween("1", "left", "-100", "-200", 30000));
+        c.apply_event(&set_tween("1.1", "left", "0", "20", 30000));
+        c.apply_event(&create("1", "normal"));
+        assert!(c.scene().get("1").unwrap().tweens.is_empty());
+        assert!(!c.scene().get("1.1").unwrap().tweens.is_empty());
     }
 
     #[test]
@@ -1760,6 +1791,47 @@ mod tests {
         c.advance(100);
         assert_eq!(c.scene().get("90").unwrap().file.as_deref(), Some("g1"));
         assert!(c.anime_states.is_empty());
+    }
+
+    #[test]
+    fn replacing_animated_image_stops_old_frames_without_stopping_children() {
+        for create2 in [false, true] {
+            let mut c = Compositor::new();
+            for id in ["1.2", "1.2.0", "1.20"] {
+                for (mode, file, time) in [
+                    ("init", Some("old_open"), None),
+                    ("add", Some("old_closed"), Some(50)),
+                    ("end", None, Some(100)),
+                ] {
+                    c.apply_event(&Event::Anime {
+                        id: id.into(), mode: mode.into(), file: file.map(str::to_string),
+                        mask: None, time, loop_count: Some(-1), props: HashMap::new(),
+                    });
+                }
+            }
+            let replacement = if create2 {
+                Event::Layer(LayerEvent::Create2 {
+                    id: "1.2".into(), file: "new_expression".into(), alpha: Some(128),
+                })
+            } else { create("1.2", "new_expression") };
+            c.apply_event(&replacement);
+            for elapsed in [75, 100, 1000] {
+                c.advance(elapsed);
+                assert_eq!(c.scene().get("1.2").unwrap().file.as_deref(), Some("new_expression"));
+            }
+            assert!(!c.anime_states.contains_key("1.2"));
+            assert!(c.anime_states.contains_key("1.2.0"));
+            assert!(c.anime_states.contains_key("1.20"));
+            // A new animation explicitly attached after replacement still plays.
+            for (mode, file, time) in [("init", Some("new_open"), None),
+                ("add", Some("new_closed"), Some(50)), ("end", None, Some(100))] {
+                c.apply_event(&Event::Anime { id: "1.2".into(), mode: mode.into(),
+                    file: file.map(str::to_string), mask: None, time,
+                    loop_count: Some(-1), props: HashMap::new() });
+            }
+            c.advance(75);
+            assert_eq!(c.scene().get("1.2").unwrap().file.as_deref(), Some("new_closed"));
+        }
     }
 
     #[test]

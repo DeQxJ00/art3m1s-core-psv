@@ -57,6 +57,20 @@ impl CoreRuntime {
             crate::core_info!("[surface-timeline] paths={} scan_us={} total_us={}",future.len(),scan_us,timeline_started.elapsed().as_micros());
         }
         let timeline_us = prepare_started.elapsed().as_micros() as u64;
+        // Lua has already selected these images and staged them for image_loop.
+        // Complete that cache request without scanning unexecuted story tags.
+        let staged=self.interpreter.query_staged_images();
+        let staged_order:Vec<_>=staged.iter()
+            .filter(|p|crate::native_texture::file_image_reference(p))
+            .map(|p|self.texture_provider.canonical_image_name(p))
+            .map(|p|super::magic_path::resolve_path(&self.magic_paths,&p)).collect();
+        let staged:std::collections::HashSet<_>=staged_order.iter().cloned().collect();
+        // Aliases can resolve to one canonical asset; acquire exactly one reference.
+        let newly_staged:Vec<_>=staged_order.into_iter().filter(|p|self.staged_surface_bindings.insert(p.clone())).collect();
+        for path in &newly_staged {
+            super::surface_loader::bind(path,true,self.png_comments.clone());
+        }
+        if !newly_staged.is_empty(){crate::core_info!("[staged-image-prefetch] added={} pending={} lookahead_required=0",newly_staged.len(),staged.len());}
         let mut paths_us = 0;
         let mut images_us = 0;
         if self.frame_visual_dirty || self.last_submitted_frame.is_none() || self.texture_provider.needs_upload_retry() {
@@ -65,7 +79,27 @@ impl CoreRuntime {
             // Existing bindings own all jobs; generated/unknown names are ignored.
             let mut files=self.compositor.scene().collect_files();
             files.extend(RenderPipeline::new(&self.compositor).retained_files());
-            let paths=self.scene_paths.resolve(&self.magic_paths,&files);
+            let hidden=self.compositor.scene().hidden_image_files();
+            let visible:std::collections::HashSet<_>=files.difference(&hidden)
+                .map(|p|self.texture_provider.canonical_image_name(p)).collect();
+            let mut deferred:std::collections::HashSet<_>=hidden.iter()
+                .filter(|p|crate::native_texture::file_image_reference(p))
+                .map(|p|self.texture_provider.canonical_image_name(p)).collect();
+            deferred.retain(|p|!visible.contains(p));
+            let current:std::collections::HashSet<_>=files.iter()
+                .map(|p|self.texture_provider.canonical_image_name(p))
+                .map(|p|super::magic_path::resolve_path(&self.magic_paths,&p)).collect();
+            let stale:Vec<_>=self.hidden_surface_bindings.difference(&current).cloned().collect();
+            for p in stale {super::surface_loader::unbind(&p);self.hidden_surface_bindings.remove(&p);}
+            for p in &deferred {
+                let path=super::magic_path::resolve_path(&self.magic_paths,p);
+                if self.hidden_surface_bindings.insert(path.clone()) {
+                    super::surface_loader::bind(&path,true,self.png_comments.clone());
+                }
+            }
+            // Hidden cache layers must not outrank the currently visible face.
+            let visible_files=files.difference(&hidden).cloned().collect();
+            let paths=self.scene_paths.resolve(&self.magic_paths,&visible_files);
             super::surface_loader::prioritize_scene(paths);
             let mut previous=std::collections::HashSet::new();
             if (RenderPipeline::new(&self.compositor).needs_trans_capture()
@@ -78,7 +112,7 @@ impl CoreRuntime {
                 for group in &frame.shader_groups{previous.extend(group.effect.mask_texture);previous.extend(group.effect.user_texture);}
             }
             paths_us = prepare_started.elapsed().as_micros() as u64 - timeline_us;
-            self.texture_provider.prepare_image_files(&files,&previous);
+            self.texture_provider.prepare_image_files_except(&files,&previous,&deferred);
             images_us = prepare_started.elapsed().as_micros() as u64 - timeline_us - paths_us;
         }
         let can_warm = matches!(self.wait_reason, Some(WaitReason::Generic | WaitReason::Generic0))
@@ -100,6 +134,10 @@ impl CoreRuntime {
             renderer.prepare_textures(&mut self.texture_provider);
         }
         let text_done_us = prepare_started.elapsed().as_micros() as u64;
+        // Release only after this frame's visible consumers have taken their
+        // payloads. A queued -> visible handoff must not cancel its own IO.
+        let retired:Vec<_>=self.staged_surface_bindings.difference(&staged).cloned().collect();
+        for p in retired {super::surface_loader::unbind(&p);self.staged_surface_bindings.remove(&p);}
         #[cfg(feature="emote-recovery")]
         self.prepare_recovered_scene();
         let total_us = prepare_started.elapsed().as_micros() as u64;

@@ -886,6 +886,25 @@ mod tests {
 
     #[cfg(feature = "gxm-menu-key-alias")]
     #[test]
+    fn dispatched_lua_actions_resolve_live_keyboard_bindings() {
+        let interpreter = Interpreter::default();
+        let mut compositor = Compositor::new();
+        compositor.apply_event(&Event::SetEventHandler {
+            event_name: "push".into(), file: None, label: None, call: true,
+            handler: Some("calllua".into()), extra_params: HashMap::from([
+                ("key".into(), "113".into()),
+                ("function".into(), "setonpush_call".into()),
+                ("lua".into(), "adv_automode".into()),
+            ]),
+        });
+        assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "AUTO"), 113);
+        assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "MENU"), 0);
+        compositor.apply_event(&Event::DelEventHandler { event_name: "push".into(), key: Some("113".into()) });
+        assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "AUTO"), 0);
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
     fn legacy_function_keys_require_live_handlers() {
         let mut interpreter = Interpreter::default();
         let mut compositor = Compositor::new();
@@ -1010,6 +1029,37 @@ mod tests {
         assert!(!dispatch.queued && !dispatch.needs_return_frame);
         interpreter.flush_pending_tags().unwrap();
         assert_eq!(interpreter.lua().globals().get::<String>("action").unwrap(), "");
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
+    fn legacy_adv_state_keeps_modal_menu_guards() {
+        let interpreter = Interpreter::default();
+        let lua = interpreter.lua();
+        lua.load("scr={adv={}}").exec().unwrap();
+        assert!(!super::has_host_mode_api(&interpreter));
+        lua.load("scr={adv={mode=true,level=0},mw={msg=true}}; adv={}").exec().unwrap();
+        assert!(super::has_host_mode_api(&interpreter));
+        assert!(super::host_menu_context_available(&interpreter));
+        for blocked in ["scr.adv.level=-1", "scr.dlg=true", "scr.trans=true", "adv.ui_system='backlog'", "scr.adv.menu=true", "scr.mw.msg=false"] {
+            lua.load("scr={adv={mode=true,level=0},mw={msg=true}}; adv={}").exec().unwrap();
+            lua.load(blocked).exec().unwrap();
+            assert!(!super::host_menu_context_available(&interpreter), "{blocked}");
+        }
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
+    fn legacy_menu_returns_after_dialog_metadata_is_retained() {
+        let interpreter = Interpreter::default();
+        let lua = interpreter.lua();
+        lua.load("scr={adv={mode=true,level=0},mw={msg=true},dlg={name='load'}}; adv={}; dlg=true").exec().unwrap();
+        assert!(!super::host_menu_context_available(&interpreter));
+        // Closing a scripted dialog clears the live flag, not its descriptor.
+        lua.load("dlg=nil").exec().unwrap();
+        assert!(super::host_menu_context_available(&interpreter));
+        lua.load("scr.adv.level=-1").exec().unwrap();
+        assert!(!super::host_menu_context_available(&interpreter));
     }
 
     #[cfg(feature = "gxm-menu-key-alias")]
@@ -2021,19 +2071,48 @@ fn host_menu_context_available(interpreter: &asb_interpreter::Interpreter) -> bo
         local mode = rawget(_G, 'getGameMode')
         if type(mode) == 'function' then return mode() == 'adv' end
         local allowed = rawget(_G, 'get_gamemode')
-        if type(allowed) ~= 'function' then return false end
-        return allowed('adv') == true
+        if type(allowed) == 'function' then return allowed('adv') == true end
+        local function field(t, k) return type(t)=='table' and rawget(t,k) end
+        local s = rawget(_G,'scr')
+        local a = field(s,'adv')
+        return field(a,'mode') == true and field(a,'level') == 0
+            and not field(a,'menu') and not field(a,'menuflag')
+            -- dlg tables retain the last dialog's parameters after closing.
+            -- The live global flag and input level track the modal lifetime.
+            and field(s,'dlg') ~= true and not rawget(_G,'dlg') and not field(s,'trans')
+            and not field(s,'textmode') and tostring(field(s,'busystatus')) ~= '1'
+            and field(field(s,'mw'),'msg') ~= false
+            and not field(rawget(_G,'adv'),'ui_system')
     "#).eval::<bool>().unwrap_or(false)
 }
 
 #[cfg(feature = "gxm-menu-key-alias")]
 fn has_host_mode_api(interpreter: &asb_interpreter::Interpreter) -> bool {
-    interpreter.lua().load("return type(rawget(_G, 'getGameMode')) == 'function' or type(rawget(_G, 'get_gamemode')) == 'function'")
+    interpreter.lua().load("return type(rawget(_G, 'getGameMode')) == 'function' or type(rawget(_G, 'get_gamemode')) == 'function' or (type(rawget(_G,'scr')) == 'table' and type(rawget(rawget(_G,'scr'),'adv')) == 'table' and type(rawget(rawget(rawget(_G,'scr'),'adv'),'mode')) == 'boolean' and type(rawget(rawget(rawget(_G,'scr'),'adv'),'level')) == 'number')")
         .eval::<bool>().unwrap_or(true)
 }
 
 #[cfg(feature = "gxm-menu-key-alias")]
 fn legacy_host_action_key(interpreter: &asb_interpreter::Interpreter, compositor: &Compositor, action: &str) -> u32 {
+    // Older dispatchers describe the action in the live Lua handler rather
+    // than in a separate key map. Never synthesize an unregistered F-key.
+    let lua_action = match action {
+        "MENU" => "adv_menu", "AUTO" => "adv_automode",
+        "SAVE" => "adv_save", "LOAD" => "adv_load",
+        "QSAVE" => "adv_qsave", "QLOAD" => "adv_qload",
+        "CONFIG" => "adv_config", "BACKLOG" => "adv_backlog",
+        _ => "",
+    };
+    if !lua_action.is_empty() {
+        for key in 8..=226 {
+            if compositor.get_input_handler("push", &key.to_string()).is_some_and(|h|
+                h.handler.as_deref() == Some("calllua")
+                && h.params.get("function").is_some_and(|f| f == "setonpush_call")
+                && h.params.get("lua").is_some_and(|f| f == lua_action)) {
+                return key;
+            }
+        }
+    }
     let primary = format!("g.function.{}", action.to_ascii_lowercase());
     let alternate = match action {
         "BACKLOG" => "g.key.backlog.start",

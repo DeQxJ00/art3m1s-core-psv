@@ -126,6 +126,10 @@ pub struct CoreRuntime {
     scene_build_cache: crate::compositor::build_cache::SceneBuildCache,
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     scene_paths: magic_path::ScenePaths,
+    #[cfg(all(target_os="vita",feature="gxm-backend"))]
+    hidden_surface_bindings: std::collections::HashSet<String>,
+    #[cfg(all(target_os="vita",feature="gxm-backend"))]
+    staged_surface_bindings: std::collections::HashSet<String>,
     text_renderer: Option<Box<dyn TextRenderer>>,
     /// core 内部文本注入链。宿主 FFI 注入在该链之前执行。
     text_inject: crate::text::InjectionChain,
@@ -317,6 +321,10 @@ impl CoreRuntime {
             scene_build_cache: Default::default(),
             #[cfg(all(target_os="vita",feature="gxm-backend"))]
             scene_paths: Default::default(),
+            #[cfg(all(target_os="vita",feature="gxm-backend"))]
+            hidden_surface_bindings: Default::default(),
+            #[cfg(all(target_os="vita",feature="gxm-backend"))]
+            staged_surface_bindings: Default::default(),
             text_renderer: None,
             text_inject: crate::text::InjectionChain::new(),
             pending_text_translations: HashMap::new(),
@@ -771,6 +779,22 @@ impl CoreRuntime {
     pub fn profiler_snapshot_json(&self) -> String {
         let json = self.profiler.snapshot_json();
         let Ok(mut snapshot) = serde_json::from_str::<serde_json::Value>(&json) else { return json; };
+        #[cfg(feature = "gxm-menu-key-alias")]
+        {
+            snapshot["host_input"] = serde_json::json!({
+                "allowed": self.host_menu_context(),
+                "menu_key": self.host_action_key("MENU"),
+                "native_menu": self.has_native_host_menu(),
+                "legacy_state": self.interpreter.lua().load(r#"
+                    local function f(t,k) return type(t)=='table' and rawget(t,k) end
+                    local s=rawget(_G,'scr'); local a=f(s,'adv')
+                    return string.format('mode=%s level=%s menu=%s menuflag=%s dlg=%s trans=%s textmode=%s busy=%s msg=%s ui=%s',
+                        tostring(f(a,'mode')),tostring(f(a,'level')),tostring(f(a,'menu')),tostring(f(a,'menuflag')),
+                        tostring(f(s,'dlg')),tostring(f(s,'trans')),tostring(f(s,'textmode')),tostring(f(s,'busystatus')),
+                        tostring(f(f(s,'mw'),'msg')),tostring(f(rawget(_G,'adv'),'ui_system')))
+                "#).eval::<String>().unwrap_or_default(),
+            });
+        }
         // Captured only on explicit diagnostic requests, never in the frame loop.
         snapshot["execution"] = serde_json::json!({
             "script": self.interpreter.current_script(),

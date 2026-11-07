@@ -619,6 +619,20 @@ impl UserData for EmoteLayerApi {
     }
 }
 
+// Native tag conversion accepts either a command name or a parameter table.
+// Normalize only the call shape; both methods retain their own dispatch order.
+fn tag_argument_table(lua: &Lua, args: mlua::MultiValue) -> mlua::Result<Option<mlua::Table>> {
+    match args.into_iter().next() {
+        Some(Value::Table(table)) => Ok(Some(table)),
+        Some(Value::String(name)) => {
+            let table = lua.create_table()?;
+            table.set(1, name)?;
+            Ok(Some(table))
+        }
+        _ => Ok(None),
+    }
+}
+
 impl UserData for EngineApi {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         // e:debug{level=0, data="foo", raw=false} 或 e:debug("foo")
@@ -645,9 +659,36 @@ impl UserData for EngineApi {
         });
 
         // e:tag{"lyc", id="0", file="bg"}
-        methods.add_method("tag", |_lua, this, args: mlua::MultiValue| {
-            if let Some(Value::Table(t)) = args.into_iter().next() {
+        methods.add_method("tag", |lua, this, args: mlua::MultiValue| {
+            if let Some(t) = tag_argument_table(lua, args)? {
                 let tag_name: String = t.get(1).unwrap_or_default();
+                // Immediate callbacks can consume temporary Lua state which the
+                // caller clears before returning. Do not defer them or hold the
+                // context mutex across re-entry. enqueueTag remains deferred.
+                if tag_name == "calllua" {
+                    let function: String = t.get("function").unwrap_or_default();
+                    let params=lua.create_table()?;
+                    for pair in t.pairs::<Value,Value>() {
+                        let (k,v)=pair?;
+                        if k == Value::Integer(1) || k.as_string().is_some_and(|s|s.as_bytes().as_ref()==b"function") {continue;}
+                        // Immediate execution must use the same numeric tag
+                        // representation as queued/ASB calllua. Scripts compare
+                        // time with "0" to defer changes until the next scene.
+                        // Preserve nested Lua payloads and their identity.
+                        let key = match k {
+                            Value::Integer(n) => Value::String(lua.create_string(n.to_string())?),
+                            other => other,
+                        };
+                        let value = match v {
+                            Value::Integer(n) => Value::String(lua.create_string(n.to_string())?),
+                            Value::Number(n) => Value::String(lua.create_string(n.to_string())?),
+                            other => other,
+                        };
+                        params.set(key,value)?;
+                    }
+                    return crate::tags::lua::call_lua_function_with_table(lua,&function,params)
+                        .map_err(mlua::Error::external);
+                }
                 let mut params = HashMap::new();
                 // 用 Value 迭代，再手动转 String。mlua 的 `pairs::<String,String>()`
                 // 一旦遇到非字符串值（如 boolean）就会终止迭代，后面的键全部丢失。
@@ -660,6 +701,10 @@ impl UserData for EngineApi {
                             _ => None,
                         };
                         let val_str = match v {
+                            // Preserve the supported Lua boolean extension while
+                            // the renderer uses native literal-string visibility.
+                            Value::Boolean(b) if matches!(key_str.as_deref(), Some("visible" | "reversex" | "reversey" | "grayscale" | "negative")) =>
+                                Some(if b { "1" } else { "0" }.to_string()),
                             // Native UI scripts use `isFile(...) and path` for an
                             // optional image/frame mask. Boolean false means no mask,
                             // not a resource literally named "false".
@@ -717,7 +762,7 @@ impl UserData for EngineApi {
 
         // e:enqueueTag{"tagname", param1="val1"}
         methods.add_method("enqueueTag", |_lua, this, args: mlua::MultiValue| {
-            if let Some(Value::Table(t)) = args.into_iter().next() {
+            if let Some(t) = tag_argument_table(_lua, args)? {
                 let tag_name: String = t
                     .get::<Value>(1)
                     .ok()
@@ -740,6 +785,8 @@ impl UserData for EngineApi {
                                 Value::Table(_) => {} // 其他表值跳过
                                 _ => {
                                     let val_str = match v {
+                                        Value::Boolean(b) if matches!(ks.as_str(), "visible" | "reversex" | "reversey" | "grayscale" | "negative") =>
+                                            Some(if b { "1" } else { "0" }.to_string()),
                                         Value::Boolean(false)
                                             if matches!(tag_name.as_str(), "lyc" | "anime") && ks == "mask" => None,
                                         Value::Boolean(false)
@@ -893,6 +940,15 @@ impl UserData for EngineApi {
             let source = startup.as_deref().unwrap_or(source);
             let delay = crate::delay_alias::repair_source(&path, source);
             let source=delay.as_deref().unwrap_or(source);
+            let flash = crate::zero_flash::repair_source(&path, source);
+            if flash.is_some() { this.ctx.lock().unwrap().callbacks.debug(1, "[zero-flash] guarded missing deferred flash target", true); }
+            let source = flash.as_deref().unwrap_or(source);
+            let deleted_cg = crate::deleted_cg::repair_source(&path, source);
+            if deleted_cg.is_some() { this.ctx.lock().unwrap().callbacks.debug(1, "[deleted-cg] guarded shake after image deletion", true); }
+            let source = deleted_cg.as_deref().unwrap_or(source);
+            let language = crate::layer_language::repair_source(&path, source);
+            if language.is_some() { this.ctx.lock().unwrap().callbacks.debug(1, "[layer-language] guarded optional startup filename substitution", true); }
+            let source = language.as_deref().unwrap_or(source);
             let warmup=hints.then(||crate::emote_cache_warmup::repair_source(&path,source)).flatten();
             if warmup.is_some(){this.ctx.lock().unwrap().callbacks.debug(1,"[emote-warmup] disposable desktop players replaced with bounded PSB prefetch",true);}
             lua.load(warmup.as_deref().unwrap_or(source))
@@ -900,7 +956,11 @@ impl UserData for EngineApi {
                 .exec()
                 .map_err(|e| mlua::Error::external(format!("include 执行 {path} 失败: {e}")))?;
 
+            let columns = crate::platform_resources::apply(lua, &path, source)?;
+            if columns > 0 { this.ctx.lock().unwrap().callbacks.debug(1, &format!("[platform-resources] inherited {columns} source asset columns for {path}"), true); }
+
             if hints{
+                crate::staged_images::recognize(lua, source);
                 if let Some(data)=crate::preload_hints::data_table(lua,&path){
                     // Only a newly assigned data table belongs to this include.
                     if old.as_ref().is_none_or(|t|t.to_pointer()!=data.to_pointer()){
@@ -1443,9 +1503,10 @@ impl UserData for EngineApi {
         });
 
         // e:bindSurface(key)
-        methods.add_method("bindSurface", |_lua, this, key: mlua::Value| {
+        methods.add_method("bindSurface", |lua, this, key: mlua::Value| {
             let key = lua_value_to_key(&key);
             let ctx = this.ctx.lock().unwrap();
+            let key = crate::surface_bindings::bind(lua, &key, |p| ctx.callbacks.is_file_exists(p))?;
             ctx.callbacks.bind_surface(&key);
             Ok(())
         });
@@ -1456,17 +1517,19 @@ impl UserData for EngineApi {
             crate::portrait_preload::preload(lua, &tag)
         });
 
-        methods.add_method("bindSurfaceAsync", |_lua, this, key: mlua::Value| {
+        methods.add_method("bindSurfaceAsync", |lua, this, key: mlua::Value| {
             let key = lua_value_to_key(&key);
             let ctx = this.ctx.lock().unwrap();
+            let key = crate::surface_bindings::bind(lua, &key, |p| ctx.callbacks.is_file_exists(p))?;
             ctx.callbacks.bind_surface_async(&key);
             Ok(())
         });
 
         // e:unbindSurface(key)
-        methods.add_method("unbindSurface", |_lua, this, key: mlua::Value| {
+        methods.add_method("unbindSurface", |lua, this, key: mlua::Value| {
             let key = lua_value_to_key(&key);
             let ctx = this.ctx.lock().unwrap();
+            let key = crate::surface_bindings::lookup(lua, &key, true)?;
             ctx.callbacks.unbind_surface(&key);
             Ok(())
         });
@@ -1480,12 +1543,13 @@ impl UserData for EngineApi {
 
         // e:isLoadingSurface(path|nil) -> bool
         // 指定路径查该图是否在加载/排队中；nil 检查整个加载队列。
-        methods.add_method("isLoadingSurface", |_lua, this, arg: mlua::Value| {
+        methods.add_method("isLoadingSurface", |lua, this, arg: mlua::Value| {
             let path = match &arg {
                 mlua::Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                 _ => None,
             };
             let ctx = this.ctx.lock().unwrap();
+            let path = path.map(|p| crate::surface_bindings::lookup(lua, &p, false)).transpose()?;
             Ok(ctx.callbacks.is_loading_surface_path(path.as_deref()))
         });
 
@@ -1518,7 +1582,7 @@ impl UserData for EngineApi {
                 .sequence_values::<String>()
                 .collect::<LuaResult<Vec<_>>>()?;
             let next = {
-                let ctx = this.ctx.lock().unwrap();
+                let mut ctx = this.ctx.lock().unwrap();
                 let next = ctx.callbacks
                     .create_emote_layer(&id, &files, width, height)
                     .map_err(mlua::Error::external)?;
@@ -1526,6 +1590,14 @@ impl UserData for EngineApi {
                     ctx.callbacks.set_emote_auto_progress(&id, next, enabled)
                         .map_err(mlua::Error::external)?;
                 }
+                // Model APIs execute immediately, but scene edits are queued.
+                // Attach at this call's position so an earlier parent deletion
+                // cannot remove the newly created model after a load/rebuild.
+                // Empty lyprop ensures the node without resetting its properties.
+                let insert_at = ctx.immediate_tag_count.min(ctx.tag_queue.len());
+                ctx.tag_queue.insert(insert_at, ("lyprop".into(),
+                    HashMap::from([("id".into(), id.clone())])));
+                ctx.immediate_tag_count += 1;
                 next
             };
             Ok(EmoteLayerApi {
@@ -2323,6 +2395,30 @@ mod tests {
     }
 
     #[test]
+    fn emote_scene_attachment_preserves_delete_create_order() {
+        for delete_after in [false, true] {
+            let lua = Lua::new();
+            let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(EmoteProbe::default()))));
+            init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
+            lua.load(r#"
+                __engine:enqueueTag{'wait', time=1}
+                __engine:tag{'lydel', id='1'}
+                __engine:createEmoteLayer{id='1.0', files={'model.psb'}, width=960, height=540}
+                __engine:tag{'lyprop', id='1', left=20}
+            "#).exec().unwrap();
+            if delete_after { lua.load("__engine:tag{'lydel', id='1'}").exec().unwrap(); }
+            let ctx = ctx.lock().unwrap();
+            let commands: Vec<_> = ctx.tag_queue.iter().map(|(name, p)|
+                (name.as_str(), p.get("id").map(String::as_str))).collect();
+            let mut expected = vec![("lydel", Some("1")), ("lyprop", Some("1.0")), ("lyprop", Some("1"))];
+            if delete_after { expected.push(("lydel", Some("1"))); }
+            expected.push(("wait", None));
+            assert_eq!(commands, expected);
+            assert_eq!(ctx.immediate_tag_count, expected.len() - 1);
+        }
+    }
+
+    #[test]
     fn emote_manual_progress_forwards_zero_and_fractional_frames() {
         let probe = EmoteProbe::default();
         let observed = probe.clone();
@@ -2468,6 +2564,76 @@ mod tests {
     }
 
     #[test]
+    fn string_tag_calls_preserve_immediate_and_deferred_order() {
+        let lua = Lua::new();
+        let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(ShellProbe::default()))));
+        init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
+        lua.load(r#"
+            __engine:enqueueTag("wait")
+            __engine:tag("sync")
+            __engine:tag{"lyprop", id="sprite", left=20}
+            __engine:enqueueTag("stop")
+        "#).exec().unwrap();
+        let ctx = ctx.lock().unwrap();
+        let names: Vec<_> = ctx.tag_queue.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["sync", "lyprop", "wait", "stop"]);
+        assert!(ctx.tag_queue[0].1.is_empty());
+        assert!(ctx.tag_queue[2].1.is_empty());
+        assert_eq!(ctx.tag_queue[1].1.get("left").map(String::as_str), Some("20"));
+    }
+
+    #[test]
+    fn immediate_numeric_tag_parameters_defer_background_resize_until_scene_switch() {
+        let lua = Lua::new();
+        let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(ShellProbe::default()))));
+        init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
+        lua.load(r#"
+            scale=150; offset=-240; deferred=nil
+            function resize(e,p)
+                assert(type(p.w)=='string')
+                if p.time=='0' then deferred=p; return end
+                scale=tonumber(p.w)
+            end
+            local nested={keep=7}
+            function typed(e,p)
+                assert(p.fraction=='1.25' and p['2']=='9')
+                assert(p.nested==nested and p.nested.keep==7)
+            end
+            __engine:tag{'calllua', ['function']='typed', fraction=1.25, [2]=9, nested=nested}
+            __engine:tag{'calllua', ['function']='resize',time=0,w=125}
+            -- While the message window fades, the previous scene is intact.
+            assert(scale==150 and deferred~=nil)
+            assert(offset-32+512+(1024-512)*scale/100 >= 960)
+            offset=-120; deferred.time='1'; resize(__engine,deferred)
+            assert(scale==125)
+            assert(offset-32+512+(1024-512)*scale/100 >= 960)
+        "#).exec().unwrap();
+        assert!(ctx.lock().unwrap().tag_queue.is_empty());
+    }
+
+    #[test]
+    fn immediate_calllua_observes_temporary_state_before_cleanup() {
+        let lua=Lua::new();
+        let ctx=Arc::new(Mutex::new(EngineContext::new(Box::new(ShellProbe::default()))));
+        init_lua_engine_api(&lua,Arc::clone(&ctx)).unwrap();
+        lua.load(r#"
+            scratch={value=37}
+            function consume(e,p)
+                observed=scratch.value+p.extra
+                e:tag{"lyprop",id="sprite",left=observed}
+            end
+            __engine:tag{"calllua",["function"]="consume",extra=5}
+            scratch=nil
+            assert(observed==42)
+            __engine:enqueueTag{"calllua",["function"]="consume",extra=6}
+        "#).exec().unwrap();
+        let q=ctx.lock().unwrap();
+        assert_eq!(q.tag_queue.len(),2);
+        assert_eq!(q.tag_queue[0].0,"lyprop");
+        assert_eq!(q.tag_queue[1].0,"calllua");
+    }
+
+    #[test]
     fn optional_anime_mask_false_is_absent_in_frame_events() {
         use crate::event::Event;
         use crate::script::Instruction;
@@ -2507,7 +2673,7 @@ mod tests {
                 match id.as_str() {
                     "plain" => {
                         assert_eq!(mask, None, "{method}");
-                        assert_eq!(props.get("visible").map(String::as_str), Some("false"));
+                        assert_eq!(props.get("visible").map(String::as_str), Some("0"));
                     }
                     "masked" => assert_eq!(mask.as_deref(), Some("frame-mask.png")),
                     "literal" => assert_eq!(mask.as_deref(), Some("false")),
@@ -2544,7 +2710,7 @@ mod tests {
             assert_eq!(queue[2].1.get("mask").map(String::as_str), Some("ui/mask.png"));
             assert_eq!(queue[3].1.get("mask").map(String::as_str), Some(""));
             assert_eq!(queue[4].1.get("mask").map(String::as_str), Some("false"));
-            assert_eq!(queue[4].1.get("visible").map(String::as_str), Some("false"));
+            assert_eq!(queue[4].1.get("visible").map(String::as_str), Some("0"));
         }
     }
 
@@ -2569,7 +2735,7 @@ mod tests {
             assert!(!params("thumb").contains_key("mask"), "{method}");
             assert_eq!(params("masked").get("mask").map(String::as_str), Some("ui/mask.png"));
             assert_eq!(params("literal").get("mask").map(String::as_str), Some("false"));
-            assert_eq!(ctx.tag_queue.iter().find(|(tag, _)| tag == "lyprop").unwrap().1.get("visible").map(String::as_str), Some("false"));
+            assert_eq!(ctx.tag_queue.iter().find(|(tag, _)| tag == "lyprop").unwrap().1.get("visible").map(String::as_str), Some("0"));
         }
     }
 

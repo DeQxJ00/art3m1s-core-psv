@@ -282,6 +282,52 @@ impl From<CallFrameSnapshot> for CallFrame {
 }
 
 impl SaveData {
+    /// Reconcile serialized CSV-button UI with a gameplay scene snapshot.
+    /// onSave can serialize a still-open menu after the PC has been rewound to
+    /// the gameplay checkpoint. Only recognize the matching script schema and
+    /// remove its active save/load group when its entire layer subtree is absent.
+    /// This also repairs existing saves, without changing files on disk on load.
+    pub(crate) fn reconcile_checkpoint_menu(&mut self) -> bool {
+        if self.waiting_for_input != Some(true) { return false; }
+        let Some(scene) = &self.scene else { return false; };
+        let read_table = |key: &str| -> Option<serde_json::Map<String, serde_json::Value>> {
+            let asb_interpreter::Value::String(raw) = self.variables.get(key)? else { return None; };
+            serde_json::from_str(raw).ok()
+        };
+        let (Some(mut btn), Some(mut scr)) = (read_table("btn"), read_table("scr")) else { return false; };
+        if scr.get("select").is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(false)) {
+            return false;
+        }
+        let Some(name) = btn.get("name").and_then(|v| v.as_str()).map(str::to_owned) else { return false; };
+        if scr.get("savecom").and_then(|v| v.as_str()) != Some(name.as_str())
+            || scr.get("uifunc").and_then(|v| v.as_str()) != Some(name.as_str()) {
+            return false;
+        }
+        let Some(group) = btn.get(&name).and_then(|v| v.as_object()) else { return false; };
+        if !group.get("p").is_some_and(|v| v.is_object()) { return false; }
+        let Some(prefix) = group.get("id").and_then(|v| v.as_str()) else { return false; };
+        let Some(root) = prefix.strip_suffix('.').filter(|v| !v.is_empty()) else { return false; };
+        if scene.iter_ids().iter().any(|id| id.starts_with(prefix)) { return false; }
+        // Deleting a menu's children can leave its empty grouping root behind.
+        // Only the inert default container is equivalent to an absent menu.
+        if scene.get(root).is_some_and(|layer| layer.file.is_some()
+            || layer.solid_color.is_some() || layer.mask.is_some()
+            || !layer.children.is_empty() || !layer.event_handlers.is_empty()
+            || !layer.tweens.is_empty() || layer.props != Default::default()) {
+            return false;
+        }
+        btn.remove(&name);
+        for key in ["name", "group", "cursor", "rep", "renew"] { btn.remove(key); }
+        if let Some(callbacks) = scr.get_mut("btnfunc").and_then(|v| v.as_object_mut()) {
+            let prefix = format!("{name}|");
+            callbacks.retain(|key, _| !key.starts_with(&prefix));
+        }
+        for key in ["menu", "uifunc", "savecom"] { scr.remove(key); }
+        self.variables.set("btn", serde_json::Value::Object(btn).to_string().into());
+        self.variables.set("scr", serde_json::Value::Object(scr).to_string().into());
+        true
+    }
+
     /// 从解释器当前状态构建存档数据。
     pub fn from_interpreter(interpreter: &asb_interpreter::Interpreter) -> Self {
         Self {
@@ -423,6 +469,81 @@ mod tests {
         assert!(restored.audio.is_none());
         assert!(restored.waiting_for_input.is_none());
         assert!(restored.message_text.is_none());
+    }
+
+    fn stale_menu_save() -> SaveData {
+        let it = asb_interpreter::Interpreter::new(asb_interpreter::InterpreterConfig::default());
+        let mut data = SaveData::from_interpreter(&it);
+        data.waiting_for_input = Some(true);
+        data.scene = Some(crate::compositor::Scene::new());
+        data.variables.set("btn", serde_json::json!({
+            "name":"save", "cursor":"slot1", "group":"save",
+            "save":{"id":"500.","p":{"slot1":{"exec":"save_click"}}},
+            "toolbar":{"id":"20.","p":{}}
+        }).to_string().into());
+        data.variables.set("scr", serde_json::json!({
+            "savecom":"save","uifunc":"save","menu":{"bt":"open"},
+            "ip":{"line":31},"btnfunc":{"save|slot1":"btn_click","toolbar|log":"open_log"}
+        }).to_string().into());
+        data
+    }
+
+    #[test]
+    fn gameplay_save_drops_orphan_menu_but_keeps_story_and_other_buttons() {
+        let mut data = stale_menu_save();
+        assert!(data.reconcile_checkpoint_menu());
+        let read = |key| -> serde_json::Value {
+            let asb_interpreter::Value::String(raw) = data.variables.get(key).unwrap() else { panic!() };
+            serde_json::from_str(raw).unwrap()
+        };
+        assert!(read("btn").get("name").is_none());
+        assert!(read("btn").get("save").is_none());
+        assert!(read("btn").get("toolbar").is_some());
+        assert_eq!(read("scr")["ip"]["line"], 31);
+        assert!(read("scr")["btnfunc"].get("save|slot1").is_none());
+        assert_eq!(read("scr")["btnfunc"]["toolbar|log"], "open_log");
+        assert!(!data.reconcile_checkpoint_menu());
+    }
+
+    #[test]
+    fn gameplay_save_drops_orphan_menu_with_empty_root() {
+        let mut data = stale_menu_save();
+        data.scene.as_mut().unwrap().create("500", None);
+        assert!(data.reconcile_checkpoint_menu());
+        let asb_interpreter::Value::String(raw) = data.variables.get("btn").unwrap() else { panic!() };
+        let btn: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(btn.get("save").is_none());
+        assert!(btn.get("toolbar").is_some());
+    }
+
+    #[test]
+    fn menu_repair_preserves_choices_present_menus_and_unknown_schemas() {
+        for mode in 0..8 {
+            let mut data = stale_menu_save();
+            match mode {
+                0 => data.scene.as_mut().unwrap().create("500.1", None),
+                1 => data.variables.set("scr", r#"{"select":{},"savecom":"save","uifunc":"save"}"#.into()),
+                2 => data.scene = None,
+                3 => data.waiting_for_input = Some(false),
+                4 => data.variables.set("btn", "unrecognized serialization".into()),
+                5 => {
+                    data.scene.as_mut().unwrap().create("500", None);
+                    data.scene.as_mut().unwrap().get_mut("500").unwrap().file = Some("menu.png".into());
+                }
+                6 => {
+                    data.scene.as_mut().unwrap().create("500", None);
+                    data.scene.as_mut().unwrap().get_mut("500").unwrap().props.width = Some(960.0);
+                }
+                _ => {
+                    data.scene.as_mut().unwrap().create("500", None);
+                    data.scene.as_mut().unwrap().get_mut("500").unwrap().event_handlers.insert(
+                        "click".into(), Default::default());
+                }
+            }
+            let before = serde_json::to_string(&data).unwrap();
+            assert!(!data.reconcile_checkpoint_menu());
+            assert_eq!(serde_json::to_string(&data).unwrap(), before);
+        }
     }
 
     fn wait_checkpoint() -> GameplayCheckpoint {

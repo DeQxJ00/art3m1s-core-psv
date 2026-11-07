@@ -818,11 +818,8 @@ impl CoreRuntime {
     }
 
     fn restore_message_text_snapshot(&mut self, snapshot: &crate::save::MessageTextSnapshot) {
-        // Reconstruction may disable skip while replaying the scene. Restore
-        // the saved permission with the final dialogue, never the held state.
-        if let Some(config) = &snapshot.skip_config {
-            self.apply_skip_config(Some(config.allow), Some(config.unread));
-        }
+        // Skip permission is restored before onLoad in save_io. Do not replay
+        // it here: scene reconstruction may have explicitly changed the gate.
         if let Some(entries) = &snapshot.input_handlers {
             self.compositor.restore_input_snapshot(entries);
         }

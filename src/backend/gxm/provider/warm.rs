@@ -58,6 +58,7 @@ impl GxmTextureProvider {
         self.warm.prefetch = Some(Box::new(source)); self
     }
     pub fn set_warm_plan(&mut self, paths: &[String]) {
+        let paths:Vec<_>=paths.iter().take(24).map(|p|self.canonical_image_name(p)).collect();
         self.warm.plan = paths.iter().filter(|p| !crate::ui_image_lifetime::transient_menu_image(p))
             .take(24).cloned().collect();
         self.warm.cursor = 0; self.warm.admitted = 0;

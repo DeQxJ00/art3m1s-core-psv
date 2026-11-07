@@ -588,6 +588,26 @@ impl Interpreter {
         &self.engine_ctx
     }
 
+    /// Literal image commands already emitted by Lua retain their sources
+    /// across waits/calls. Do not execute callbacks or scan future script code.
+    pub(crate) fn queued_image_files(&self) -> Vec<String> {
+        let ctx=self.engine_ctx.lock().unwrap();
+        let queues=ctx.tag_queue.iter()
+            .chain(self.queued_wait_checkpoints.iter().rev().flat_map(|w|w.deferred.iter()))
+            .chain(self.queued_call_barriers.iter().rev().flat_map(|b|b.deferred.iter()));
+        let mut paths=Vec::new();
+        for (tag,params) in queues.take(4096) {
+            if tag!="lyc"{continue;}
+            if let Some(p)=params.get("file") {
+                if !p.is_empty()&&p.len()<=1024&&!p.contains(['$','%','{','}','\0'])&&!paths.contains(p) {
+                    paths.push(p.clone());
+                    if paths.len()==32{break;}
+                }
+            }
+        }
+        paths
+    }
+
     /// 运行 e:setEventFilter 设置的事件过滤器（docs/lua/engine/setEventFilter.txt）。
     ///
     /// 宿主在把一个已命中的事件（lyevent/aevent/输入事件…）派发给其处理器之前调用：
@@ -2750,6 +2770,31 @@ impl Default for Interpreter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn staged_image_ownership_survives_lua_queue_handoff_and_call_barriers() {
+        let mut it=super::Interpreter::new(Default::default());
+        it.lua().load(r#"
+            scr={img={buff=nil}};
+            __engine:enqueueTag{'wait',time=200};
+            __engine:enqueueTag{'lyc',id='bg',file='queued/background.dds'};
+            __engine:enqueueTag{'calllua',['function']='later',file='not-an-image'};
+        "#).exec().unwrap();
+        it.queued_call_barriers.push(super::QueuedCallBarrier {
+            stack_depth:1,
+            deferred:vec![("lyc".into(),std::collections::HashMap::from([
+                ("file".into(),"queued/expression.png".into())]))],
+        });
+        assert_eq!(it.query_staged_images(),["queued/background.dds","queued/expression.png"]);
+        assert_eq!(it.engine_context().lock().unwrap().tag_queue.len(),3);
+        it.current_script=Some("sample.asb".into());
+        it.record_queued_wait_checkpoint(&Event::Wait{reason:WaitReason::Generic});
+        assert!(it.engine_context().lock().unwrap().tag_queue.is_empty());
+        assert_eq!(it.query_staged_images(),["queued/background.dds","queued/expression.png"]);
+        it.queued_wait_checkpoints.clear();
+        assert_eq!(it.query_staged_images(),["queued/expression.png"]);
+        it.queued_call_barriers.clear();
+        assert!(it.query_staged_images().is_empty());
+    }
     use super::Interpreter;
     use crate::event::WaitReason;
     use crate::lua_engine::EngineCallbacks;

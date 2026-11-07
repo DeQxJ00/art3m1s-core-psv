@@ -486,6 +486,20 @@ impl Scene {
         files
     }
 
+    /// File sources used exclusively by script-hidden layers. A shared visible
+    /// reference must still be ready for the current frame.
+    pub fn hidden_image_files(&self) -> std::collections::HashSet<String> {
+        let mut hidden=std::collections::HashSet::new();
+        let mut visible=std::collections::HashSet::new();
+        for (id,layer) in &self.nodes {
+            let target=if self.existing_path_is_visible(id){&mut visible}else{&mut hidden};
+            for name in layer.file.iter().chain(layer.mask.iter()) {
+                if !name.is_empty(){target.insert(name.clone());}
+            }
+        }
+        hidden.retain(|n|!visible.contains(n));hidden
+    }
+
     /// 确保某 ID 的节点存在（含祖先链接），不改动已有属性。
     pub fn ensure(&mut self, id: &str) {
         self.ensure_path(id);
@@ -682,6 +696,17 @@ fn parent_id(id: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hidden_sources_follow_ancestors_and_keep_shared_visible_files_ready() {
+        let mut scene=super::Scene::default();
+        scene.create("cache.body",Some("body.dds".into()));
+        scene.set_props("cache",&std::collections::HashMap::from([("visible".into(),"0".into())]));
+        assert!(scene.hidden_image_files().contains("body.dds"));
+        scene.create("figure",Some("body.dds".into()));
+        assert!(!scene.hidden_image_files().contains("body.dds"));
+        scene.delete("figure");assert!(scene.hidden_image_files().contains("body.dds"));
+        scene.delete("cache");assert!(scene.hidden_image_files().is_empty());
+    }
     use super::*;
 
     #[test]

@@ -144,6 +144,9 @@ impl Drop for PrivateSurface{fn drop(&mut self){if self.handle!=0{unsafe{art3m1s
 pub struct GxmTextureProvider {
     source: Option<Source>,
     image_path_resolver: Option<Box<dyn Fn(&str)->String>>,
+    source_identity: Option<Box<dyn Fn(&str)->Option<String>>>,
+    source_owners: HashMap<String,String>,
+    source_aliases: HashMap<String,String>,
     prefetch: Option<PrefetchSource>,
     entries: HashMap<String, Entry>,
     decoded: HashMap<String, DecodedEntry>,
@@ -181,16 +184,19 @@ impl GxmTextureProvider {
     /// Run before BeginScene. Pin all incoming/retained sources before resolving
     /// any file, so allocation admission cannot evict a later draw's texture.
     pub fn prepare_image_files(&mut self,names:&HashSet<String>,previous:&HashSet<TextureId>){
+        self.prepare_image_files_except(names,previous,&HashSet::new());
+    }
+    pub fn prepare_image_files_except(&mut self,names:&HashSet<String>,previous:&HashSet<TextureId>,deferred:&HashSet<String>){
+        let names:HashSet<_>=names.iter().map(|n|self.canonical_image_name(n)).collect();
         let mut pinned=names.clone();
         for id in previous {if let Some(name)=self.ids.get(id){pinned.insert(sparse::source_name(name).into());}}
         for (name,e) in &mut self.entries {
             e.reclaimable=e.cacheable&&!pinned.contains(sparse::source_name(name));
         }
         self.preflight_names=Some(pinned);
-        let mut files:Vec<_>=names.iter().filter(|name|{
-            let lower=name.to_ascii_lowercase();
-            lower.ends_with(".png")||lower.ends_with(".jpg")||lower.ends_with(".jpeg")
-        }).cloned().collect();
+        let mut files:Vec<_>=names.iter().filter(|name|
+            crate::native_texture::file_image_reference(name)&&!deferred.contains(*name)
+        ).cloned().collect();
         files.sort_unstable();
         for name in files {self.resolve(&name);}
         self.preflight_names=None;
@@ -362,6 +368,9 @@ impl GxmTextureProvider {
         Self {
             source: None,
             image_path_resolver: None,
+            source_identity: None,
+            source_owners: HashMap::new(),
+            source_aliases: HashMap::new(),
             prefetch: None,
             entries: HashMap::new(),
             decoded: HashMap::new(), decoded_hits: 0, gpu_demotions: 0,
@@ -395,6 +404,22 @@ impl GxmTextureProvider {
 
     pub fn with_image_path_resolver(mut self,resolve:impl Fn(&str)->String+'static)->Self{
         self.image_path_resolver=Some(Box::new(resolve));self
+    }
+    pub fn with_source_identity(mut self,resolve:impl Fn(&str)->Option<String>+'static)->Self{
+        self.source_identity=Some(Box::new(resolve));self
+    }
+    pub fn canonical_image_name(&mut self,name:&str)->String{
+        if let Some(owner)=self.source_aliases.get(name){return owner.clone();}
+        if !crate::native_texture::file_image_reference(name)||self.entries.contains_key(name){return name.into();}
+        let Some(identity)=self.source_identity.as_ref().and_then(|f|f(name)) else{return name.into();};
+        let owner=self.source_owners.entry(identity).or_insert_with(||name.into()).clone();
+        if owner!=name{crate::core_info!("GXM resource-alias name={} owner={}",name,owner);}
+        self.source_aliases.insert(name.into(),owner.clone());owner
+    }
+    fn expanded_names(&self,names:&HashSet<String>)->HashSet<String>{
+        let mut out=names.clone();
+        for name in names {if let Some(owner)=self.source_aliases.get(name){out.insert(owner.clone());}}
+        out
     }
     pub fn with_source<F>(mut self, source: F) -> Self
     where
@@ -444,12 +469,18 @@ impl GxmTextureProvider {
     }
 
     pub fn evict_prefix(&mut self, prefix: &str) -> usize {
+        let owners:HashSet<_>=self.source_aliases.iter().filter(|(n,_)|n.starts_with(prefix)).map(|(_,o)|o.clone()).collect();
+        let owner_count=owners.iter().filter(|o|self.entries.contains_key(*o)||self.decoded.contains_key(*o)||self.encoded.contains_key(*o)).count();
+        if self.warm.job.as_ref().is_some_and(|j|owners.contains(&j.name)){self.cancel_warm_upload();}
+        for owner in &owners {self.remove(owner);self.decoded.remove(owner);self.encoded.remove(owner);}
+        self.source_aliases.retain(|n,o|!n.starts_with(prefix)&&!owners.contains(o)&&!o.starts_with(prefix));
+        self.source_owners.retain(|_,o|!owners.contains(o)&&!o.starts_with(prefix));
         self.decode_failures.retain(|name,_| !sparse::source_name(name).starts_with(prefix));
         if self.warm.job.as_ref().is_some_and(|j|j.name.starts_with(prefix)){self.cancel_warm_upload();}
         let names=self.entries.keys().chain(self.decoded.keys()).chain(self.encoded.keys())
             .filter(|name|sparse::source_name(name).starts_with(prefix)).cloned().collect::<HashSet<_>>();
         for name in &names {self.remove(name);self.decoded.remove(name);self.encoded.remove(name);}
-        names.len()
+        names.len()+owner_count
     }
 
     pub fn set_profile_enabled(&self, _enabled: bool) {}
@@ -766,7 +797,7 @@ impl GxmTextureProvider {
     /// unused counterpart return to IDLE. During transitions retain both, since
     /// saved draw lists may still own a texture not sampled on this frame.
     pub(crate) fn retain_frame(&mut self,names:&HashSet<String>,frame:&crate::render_pipeline::draw::DrawList,transition:bool){
-        if transition||!self.entries.values().any(|e|e.sprite_crop.is_some()){self.retain(names);return;}
+        if transition||(!self.upload_retry_pending&&!self.entries.values().any(|e|e.sprite_crop.is_some())){self.retain(names);return;}
         let mut used=HashSet::new();
         for command in frame.commands.iter().chain(&frame.mask_commands){
             used.insert(command.texture);
@@ -776,6 +807,7 @@ impl GxmTextureProvider {
         self.retain_internal(names,Some(&used));
     }
     fn retain_internal(&mut self,names:&HashSet<String>,used_textures:Option<&HashSet<TextureId>>){
+        let expanded=self.expanded_names(names);let names=&expanded;
         let used_sources:HashSet<_>=used_textures.into_iter().flatten().filter_map(|id|self.ids.get(id))
             .map(|n|sparse::source_name(n).to_owned()).collect();
         // Keep admission serialized with loader publication. No loader calls
@@ -803,10 +835,16 @@ impl GxmTextureProvider {
             for name in &menu_stale{self.remove(name);self.decoded.remove(name);self.encoded.remove(name);}
             crate::core_info!("[menu-image-release] stage=provider entries={} idle_bytes={}",menu_stale.len(),before.saturating_sub(self.idle_parts().total()));
         }
+        // A script binding is not proof of GPU use. Under allocation pressure,
+        // hidden/static bindings may yield their GPU copy after the complete
+        // draw list is known. Transitions never enable this sampled-only path.
+        let pressured=self.upload_retry_pending;
         let stale = self.entries.iter_mut().filter_map(|(name,entry)|{
             let source=sparse::source_name(name);
             let unused_variant=used_sources.contains(source)&&used_textures.is_some_and(|ids|!ids.contains(&entry.id));
-            let stale=unused_variant||(!names.contains(source)&&!name.starts_with("__solid_"));
+            let unused_under_pressure=pressured&&entry.cacheable
+                &&used_textures.is_some_and(|ids|!ids.contains(&entry.id));
+            let stale=unused_variant||unused_under_pressure||(!names.contains(source)&&!name.starts_with("__solid_"));
             entry.reclaimable=entry.cacheable&&stale;
             stale.then(||name.clone())
         }).collect::<Vec<_>>();
@@ -945,6 +983,7 @@ impl GxmTextureProvider {
 
 impl TextureProvider for GxmTextureProvider {
     fn resolve_sprite(&mut self,name:&str)->Option<(TextureId,TextureInfo,Option<[u32;4]>)>{
+        let canonical=self.canonical_image_name(name);let name=canonical.as_str();
         let key=sparse::sprite_key(name);
         if self.entries.contains_key(&key){
             let (id,_)=self.resolve(&key)?;
@@ -960,6 +999,7 @@ impl TextureProvider for GxmTextureProvider {
         Some(crop.map_or((id,info,None),|(logical,rect)|(id,logical,Some(rect))))
     }
     fn resolve(&mut self, name: &str) -> Option<(TextureId, TextureInfo)> {
+        let canonical=self.canonical_image_name(name);let name=canonical.as_str();
         if self.warm.job.as_ref().is_some_and(|job|job.name==name){self.cancel_warm_upload();}
         self.cache_clock = self.cache_clock.saturating_add(1);
         if let Some(entry) = self.entries.get_mut(name) {
@@ -1115,16 +1155,23 @@ impl TextureProvider for GxmTextureProvider {
             return result;
         }
         let logical=u64::from(width)*u64::from(height)*4;
-        // PNG filtering reads previously decoded rows. Transparent sprites use
-        // cached CPU memory, then one sequential GPU copy; decoding them into
-        // uncached GPU memory also made alpha bounds preparation very costly.
+        // PNG filtering and RGB expansion read already written pixels. Stage
+        // in cached CPU memory, including opaque RGB backgrounds, then perform
+        // one sequential copy into the private GPU surface.
         if self.shared_surfaces&&unsafe{art3m1s_gxm_large_image_allowed(width,height)}<=0&&color==image::ColorType::Rgb8&&logical>=256*256*4&&logical<=16*1024*1024&&decoder.total_bytes()<=logical{
             if let Some(mut surface)=PrivateSurface::new(width,height){
-                if let Err(error)=crate::image_decode::rgba_into(decoder,surface.bytes(),16*1024*1024){
-                    self.record_decode_failure(name);self.timing.decode_us+=elapsed_us(started);
-                    self.timing.decode_errors+=1;crate::core_warn!("GXM shared-surface decode failure: {name}: {error}");return None;
-                }
+                let pixels=match crate::resource_ledger::decode_rgba(decoder,16*1024*1024){
+                    Ok(pixels)=>pixels,
+                    Err(error)=>{
+                        self.record_decode_failure(name);self.timing.decode_us+=elapsed_us(started);
+                        self.timing.decode_errors+=1;crate::core_warn!("GXM shared-surface decode failure: {name}: {error}");return None;
+                    }
+                };
                 let decode_us=elapsed_us(started);self.timing.decoded+=1;self.timing.decode_us+=decode_us;
+                let copy_started=Instant::now();
+                surface.bytes()[..logical as usize].copy_from_slice(pixels.as_raw());
+                let copy_us=elapsed_us(copy_started);drop(pixels);
+                self.timing.upload_bytes+=logical;
                 if proof.is_none(){proof=TileProof::for_rgb24(width,height,color);}
                 let opaque=proof.as_ref().and_then(|p|p.opaque_for_size(width,height))
                     .unwrap_or_else(||surface.bytes()[..logical as usize].chunks_exact(4).all(|p|p[3]==255));
@@ -1139,9 +1186,9 @@ impl TextureProvider for GxmTextureProvider {
                 self.entries.insert(name.into(),Entry { sprite_crop:None, native_bytes:0,bc3:false, alpha_only:false, gray:false, id,info,rgba:Tracked::bytes(Vec::new(),Owner::Provider),opaque,
                     revision:self.revision,last_used:self.cache_clock,cacheable:true,reclaimable:false,shared:true});
                 self.ids.insert(id,name.into());self.keep_encoded(name,bytes,proof);
-                let publish_us=elapsed_us(upload_started);self.timing.uploads+=1;self.timing.upload_us+=publish_us;
-                self.timing.upload_max_us=self.timing.upload_max_us.max(publish_us);
-                crate::core_info!("GXM shared-surface-decode name={} size={}x{} decode_us={} publish_us={} upload_copy_bytes=0",name,width,height,decode_us,publish_us);
+                let publish_us=elapsed_us(upload_started);self.timing.uploads+=1;self.timing.upload_us+=copy_us+publish_us;
+                self.timing.upload_max_us=self.timing.upload_max_us.max(copy_us+publish_us);
+                crate::core_info!("GXM shared-surface-decode name={} size={}x{} decode_us={} copy_us={} publish_us={} upload_copy_bytes={}",name,width,height,decode_us,copy_us,publish_us,logical);
                 return Some((id,info));
             }
         }
@@ -1356,6 +1403,7 @@ impl TextureProvider for GxmTextureProvider {
     }
 
     fn pixels_of(&mut self, name: &str) -> Option<(u32, u32, Vec<u8>)> {
+        let canonical=self.canonical_image_name(name);let name=canonical.as_str();
         self.resolve(name)?;
         let entry = self.entries.get(name)?;
         Some((entry.info.width, entry.info.height, self.entry_pixels(entry)?))
@@ -1553,6 +1601,28 @@ mod tests {
         assert!(p.upload_dxt5_render_only("emote-atlas",12,8,&data).is_some());
         assert!(!p.needs_upload_retry());p.retain(&live);
         assert_eq!(p.entries.len(),2);
+    }
+    #[test] fn pressure_reclaims_script_bound_but_unsampled_images_only(){
+        let _guard=LOCK.lock().unwrap();
+        for transition in [false,true]{
+            let mut p=GxmTextureProvider::new();p.idle_budget=1024*1024;
+            let pixels=vec![255;8*8*4];
+            let visible=p.upload("visible",8,8,&pixels).unwrap().0;
+            p.upload("hidden",8,8,&pixels).unwrap();
+            for e in p.entries.values_mut(){e.cacheable=true;}
+            let names=HashSet::from(["visible".into(),"hidden".into()]);
+            p.retain(&names);
+            assert_eq!(p.entries.len(),2);
+            p.defer_upload(256);
+            if transition{
+                p.retain_frame(&names,&crate::render_pipeline::draw::DrawList::default(),true);
+            }else{
+                p.retain_internal(&names,Some(&HashSet::from([visible])));
+            }
+            assert!(p.entries.contains_key("visible"));
+            assert_eq!(p.entries.contains_key("hidden"),transition);
+            if !transition{assert!(p.decoded.contains_key("hidden"));}
+        }
     }
     #[test] fn s3tc_explicit_layout_flags_and_pressure_do_not_expand_pixels(){
         let _guard=LOCK.lock().unwrap();
@@ -2277,6 +2347,18 @@ mod tests {
     }
 
     #[test]
+    fn rgb_shared_decode_stages_pixels_and_copies_once() {
+        let _guard=LOCK.lock().unwrap();
+        let image=image::RgbImage::from_fn(513,512,|x,y|image::Rgb([x as u8,y as u8,43]));
+        let mut png=Cursor::new(Vec::new());image.write_to(&mut png,image::ImageFormat::Png).unwrap();let bytes=png.into_inner();
+        let mut p=GxmTextureProvider::new().with_source(move |_|Some(bytes.clone()));p.shared_surfaces=true;
+        p.resolve("background").unwrap();
+        assert_eq!(p.timing.upload_bytes,513*512*4);
+        assert_eq!(p.entries["background"].rgba.capacity(),0);
+        assert_eq!(p.pixels_of("background").unwrap().2,image::DynamicImage::ImageRgb8(image).into_rgba8().into_raw());
+    }
+
+    #[test]
     fn cached_sprite_decode_preserves_odd_width_reads_alpha_and_eviction(){
         let _guard=LOCK.lock().unwrap();
         let mut image=image::RgbaImage::new(513,512);
@@ -2486,6 +2568,70 @@ mod tests {
         assert!(p.upload_rgba("deferred",4,4,&pixels).is_none());
         assert!(!p.entries.contains_key("deferred"));
         LARGE_IMAGE_RESULT.with(|v|v.set(-1));
+    }
+
+    #[test]
+    fn resource_identity_reuses_texture_and_preserves_candidate_collisions() {
+        let _guard=LOCK.lock().unwrap();
+        let reads=Rc::new(Cell::new(0));let count=reads.clone();
+        let mut p=GxmTextureProvider::new().with_source(move |_|{
+            count.set(count.get()+1);Some(crate::native_texture::tests::pvr(11,0,4,4))
+        }).with_source_identity(|name|Some(match name {
+            "body"|"body.png"=>"image/body.png", "other"=>"image/other.png",
+            "other.png"=>"image/other.png.png", _=>return None,
+        }.into()));
+        let first=p.resolve("body").unwrap();
+        assert_eq!(p.resolve("body.png"),Some(first));
+        assert_eq!(reads.get(),1);
+        p.retain(&HashSet::from(["body.png".into()]));
+        assert!(!p.entries["body"].reclaimable);
+        assert!(p.pixels_of("body.png").is_some());
+        assert_eq!(p.evict_prefix("body.png"),1);
+        assert!(!p.entries.contains_key("body"));
+        assert_ne!(p.resolve("other").unwrap().0,p.resolve("other.png").unwrap().0);
+        assert_eq!(reads.get(),3);
+    }
+
+    #[test]
+    fn hidden_image_preflight_does_not_read_until_visible() {
+        let _guard=LOCK.lock().unwrap();
+        let reads=Rc::new(Cell::new(0));let count=reads.clone();
+        let mut p=GxmTextureProvider::new().with_source(move |_|{
+            count.set(count.get()+1);Some(crate::native_texture::tests::pvr(11,0,4,4))
+        });
+        let names=HashSet::from(["hidden.dds".into()]);
+        p.prepare_image_files_except(&names,&HashSet::new(),&names);
+        assert_eq!(reads.get(),0);assert!(p.entries.is_empty());
+        p.prepare_image_files_except(&names,&HashSet::new(),&HashSet::new());
+        assert_eq!(reads.get(),1);assert_eq!(p.timing.decoded,0);
+    }
+
+    #[test]
+    fn image_preparation_handles_native_and_extensionless_sources_without_rgba_decode() {
+        let _guard=LOCK.lock().unwrap();
+        let mut dds=vec![0u8;128+8];
+        dds[..4].copy_from_slice(b"DDS ");
+        for (at,value) in [(4,124u32),(12,4),(16,4),(76,32),(80,4)] {
+            dds[at..at+4].copy_from_slice(&value.to_le_bytes());
+        }
+        dds[84..88].copy_from_slice(b"DXT1");
+        let mut p=GxmTextureProvider::new().with_source(move |name| {
+            match name {
+                "body.dds" | ":fg/body" => Some(dds.clone()),
+                "body.pvr" => Some(crate::native_texture::tests::pvr(11,0,4,4)),
+                _ => panic!("not a file image: {name}"),
+            }
+        });
+        let names=HashSet::from(["body.dds",":fg/body","body.pvr","__solid_ffffffff__","body\u{1f}mask\u{1f}mask","movie.ogv"].map(str::to_owned));
+        p.prepare_image_files(&names,&HashSet::new());
+        for name in ["body.dds",":fg/body","body.pvr"] {
+            assert!(p.entries.contains_key(name),"{name} was not prepared");
+            assert_eq!(p.entries[name].rgba.capacity(),0);
+        }
+        assert_eq!(p.timing.decoded,0);
+        let reads=p.timing.reads;
+        p.prepare_image_files(&names,&HashSet::new());
+        assert_eq!(p.timing.reads,reads);
     }
 
     #[test]

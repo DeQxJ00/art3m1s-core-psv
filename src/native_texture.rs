@@ -137,6 +137,18 @@ pub(crate) fn parse(b:&[u8])->Result<Texture<'_>,&'static str>{
 // are absent. Explicit .dds/.pvr paths also reach the same parser by magic.
 pub(crate) const SUFFIXES:[&str;6]=[".png","",".jpg",".jpeg",".dds",".pvr"];
 
+// Scene references also include synthetic render targets and compound mask
+// keys. Only file images participate in preflight; contents choose the decoder.
+pub(crate) fn file_image_reference(path:&str)->bool {
+    if path.is_empty() || path.starts_with("__") || path.chars().any(char::is_control) {return false;}
+    let leaf=path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if leaf.is_empty(){return false;}
+    match leaf.rsplit_once('.') {
+        None=>true,
+        Some((_,ext))=>SUFFIXES.iter().filter_map(|s|s.strip_prefix('.')).any(|s|ext.eq_ignore_ascii_case(s)),
+    }
+}
+
 pub(crate) fn candidates(path:&str)->impl Iterator<Item=std::borrow::Cow<'_,str>>{
     use std::borrow::Cow;
     let stem=path.rsplit_once('.').filter(|(_,ext)|["png","jpg","jpeg"].iter().any(|e|ext.eq_ignore_ascii_case(e))).map(|(stem,_)|stem);

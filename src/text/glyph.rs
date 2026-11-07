@@ -876,8 +876,11 @@ impl TextRenderer for GlyphTextRenderer {
                 .map(|l| (l.left, l.top, l.width, l.height, l.font.clone()))
         });
         // stack=0（chgmsg）不压栈，避免存档中消息层堆栈膨胀。
-        if stack && let Some(ref prev_id) = self.state.active_layer {
-            self.state.layer_stack.push(prev_id.clone());
+        if stack {
+            // The initial implicit page is a real return target too. Without
+            // it, a temporary UI page receives the following fontinit/reset.
+            self.state.layer_stack.push(self.state.active_layer.clone()
+                .unwrap_or_else(|| DEFAULT_MESSAGE_LAYER.to_string()));
         }
         self.state.active_layer = id.map(|s| s.to_string());
         let is_new = !self
@@ -2363,6 +2366,22 @@ mod tests {
             .map(|glyph| glyph.character.as_str())
             .collect();
         assert_eq!(text, "new");
+    }
+
+    #[test]
+    fn first_temporary_message_layer_returns_to_default_before_font_init() {
+        let mut renderer = GlyphTextRenderer::new();
+        renderer.switch_message_layer(Some("history.1"), true);
+        renderer.apply_font_settings(&HashMap::from([
+            ("face".into(), "font/history.ttf".into()),
+            ("size".into(), "24".into()), ("stack".into(), "0".into()),
+        ]));
+        renderer.pop_message_layer();
+        renderer.font_init();
+        assert_eq!(renderer.font_state().active_layer.as_deref(), Some(super::DEFAULT_MESSAGE_LAYER));
+        let history = &renderer.font_state().layers["history.1"];
+        assert_eq!(history.font.size, Some(24.0));
+        assert_eq!(history.font.face.as_deref(), Some("font/history.ttf"));
     }
 
     #[test]

@@ -10,6 +10,34 @@ pub(super) struct RuntimeEvent {
     pub text_source: Option<(String, usize)>,
 }
 
+#[cfg(any(test, all(target_os="vita", feature="gxm-backend")))]
+fn animation_frame_hints(event: &Event) -> Vec<String> {
+    let Event::Anime { mode, file, mask, .. } = event else { return Vec::new(); };
+    if !matches!(mode.as_str(), "init" | "add") { return Vec::new(); }
+    let mut paths = Vec::new();
+    for name in [file.as_deref(), mask.as_deref()].into_iter().flatten() {
+        if !name.is_empty() && name.len() <= 1024 && !name.contains('\0')
+            && !paths.iter().any(|p| p == name) { paths.push(name.to_owned()); }
+    }
+    paths
+}
+
+#[cfg(test)]
+mod animation_prefetch_tests {
+    use super::*;
+    fn frame(mode: &str, file: &str, mask: Option<&str>) -> Event {
+        Event::Anime { id: "figure.face".into(), mode: mode.into(), file: Some(file.into()),
+            mask: mask.map(str::to_string), time: Some(1040), loop_count: None, props: HashMap::new() }
+    }
+    #[test]
+    fn queued_frames_and_masks_are_hinted_before_playback() {
+        assert_eq!(animation_frame_hints(&frame("add", ":fg/faceD", Some(":fg/maskD"))), vec![":fg/faceD", ":fg/maskD"]);
+        assert_eq!(animation_frame_hints(&frame("init", "first.png", Some("first.png"))), vec!["first.png"]);
+        assert!(animation_frame_hints(&frame("end", "unused", None)).is_empty());
+        assert!(animation_frame_hints(&frame("add", "", None)).is_empty());
+    }
+}
+
 pub(super) fn event_requires_state_sync(event: &Event) -> bool {
     // Scripts may inspect s.current_message_layer immediately after chgmsg,
     // including to conditionally pop the name layer before printing dialogue.
@@ -600,8 +628,29 @@ impl CoreRuntime {
             }
 
             let compositor_started = profile.mark();
-            if let Some(event) = CompositorEvent::from_interpreter(event) {
-                self.compositor.apply_event(event);
+            // Explicit frame registrations are dependencies too: a later blink
+            // must not first decode its image inside the render submission.
+            #[cfg(all(target_os="vita", feature="gxm-backend"))]
+            {
+                let paths: Vec<_> = animation_frame_hints(event).into_iter()
+                    .map(|p| super::magic_path::resolve_path(&self.magic_paths, &p)).collect();
+                if !paths.is_empty() {
+                    super::surface_loader::preload(&paths, super::surface_loader::Kind::Animation,
+                        None, self.png_comments.clone());
+                }
+            }
+            if let Some(compositor_event) = CompositorEvent::from_interpreter(event) {
+                let model_layers: Vec<String> = if matches!(event,
+                    Event::Layer(LayerEvent::Delete { .. }) | Event::AllDelete { .. } | Event::LayerRename { .. }) {
+                    self.emote.lock().unwrap().scene_layer_ids(self.compositor.scene())
+                } else { Vec::new() };
+                self.compositor.apply_event(compositor_event);
+                for id in model_layers {
+                    if self.compositor.scene().get(&id).is_none() {
+                        crate::core_info!("[emote-scene-remove] id={} event={} script={:?}:{}", id,
+                            event_summary(event), self.interpreter.current_script(), self.interpreter.current_line());
+                    }
+                }
                 self.layer_info_dirty = true;
             }
             profile.event_compositor_ns = profile

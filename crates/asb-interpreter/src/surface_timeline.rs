@@ -7,9 +7,28 @@ use std::collections::{HashMap, HashSet};
 const MAX_BLOCKS: usize = 1024;
 const MAX_TAGS: usize = 16384;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum BlockKey { Label(String), Index(mlua::Integer) }
+impl BlockKey {
+    fn read(t: &Table, key: &str) -> Option<Self> {
+        match t.raw_get::<Value>(key).ok()? {
+            Value::Integer(n) if n > 0 => Some(Self::Index(n)),
+            Value::Number(n) if n > 0.0 && n < mlua::Integer::MAX as f64 && n.fract() == 0.0 => Some(Self::Index(n as mlua::Integer)),
+            Value::String(_) => text(t,key).map(Self::Label),
+            _ => None,
+        }
+    }
+    fn tags(&self, ast: &Table) -> Option<Table> {
+        match self { Self::Label(s) => ast.raw_get(s.as_str()).ok(), Self::Index(n) => ast.raw_get(*n).ok() }
+    }
+    fn successor(&self) -> Option<Self> {
+        match self { Self::Index(n) => n.checked_add(1).map(Self::Index), _ => None }
+    }
+}
+
 struct BlockImages {
     paths: Vec<String>,
-    next: Option<String>,
+    next: Option<BlockKey>,
 }
 
 #[derive(Default)]
@@ -17,10 +36,10 @@ pub struct SurfaceTimelineCursor {
     // Holding these tables prevents pointer reuse across chapters/cache resets.
     ast: Option<Table>,
     bindings: Option<Table>,
-    position: Option<(String, String)>,
+    position: Option<(String, BlockKey)>,
     // AST commands are immutable within a chapter. Parse each block only once,
     // then walk these small lists when the dialogue block changes.
-    blocks: HashMap<String, Option<BlockImages>>,
+    blocks: HashMap<BlockKey, Option<BlockImages>>,
     tags_left: usize,
     portrait_epoch: u64,
 }
@@ -44,6 +63,29 @@ fn read_block(lua: &Lua,
     let mut visit = |tag: Table| {
         let mut candidates = Vec::new();
         match tag.raw_get::<String>(1).ok().as_deref() {
+            Some(kind @ ("BG" | "EV" | "EV_C" | "CG" | "CGS")) => {
+                if let Some(mut file) = text(&tag, "file") {
+                    let csv = table(&lua.globals(), "csv");
+                    if let Some(alias) = csv.as_ref().and_then(|c| table(c,"cgname")).and_then(|t| text(&t,&file)) { file = alias; }
+                    let mode = text(&tag,"mode").unwrap_or_else(|| {
+                        if kind == "EV_C" { "ev".to_owned() } else { kind.to_ascii_lowercase() }
+                    });
+                    if matches!(mode.as_str(), "bg"|"ev"|"cg"|"cgs") && !file.contains("**") {
+                        let cut = csv.and_then(|c| table(&c,"cgsize")).and_then(|t| table(&t,&file))
+                            .is_some_and(|t| !matches!(t.raw_get::<Value>("cut"), Ok(Value::Nil|Value::Boolean(false))|Err(_)));
+                        if cut { candidates.extend([format!(":{mode}/{file}_a"),format!(":{mode}/{file}_b")]); }
+                        else { candidates.push(format!(":{mode}/{file}")); }
+                    }
+                }
+            }
+            Some("ST" | "ST0") => {
+                if let (Some(name),Some(body),Some(fg)) = (text(&tag,"name"),text(&tag,"body"),table(&lua.globals(),"csv").and_then(|c| table(&c,"fg"))) {
+                    if let Some(path) = table(&fg,&body).or_else(|| table(&fg,&name)).and_then(|t| text(&t,"path")) {
+                        candidates.push(format!(":fg/{path}{body}.png"));
+                        if let Some(face) = text(&tag,"face") { candidates.push(format!(":fg/{path}{face}.png")); }
+                    }
+                }
+            }
             Some("bg") => {
                 if let (Some(p), Some(f)) = (text(&tag, "path"), text(&tag, "file")) {
                     candidates.push(format!("{p}{f}"));
@@ -94,7 +136,7 @@ fn read_block(lua: &Lua,
             sequence(&items, budget)?;
         }
     }
-    Some(BlockImages { paths, next: text(tags, "linknext") })
+    Some(BlockImages { paths, next: BlockKey::read(tags, "linknext") })
 }
 
 impl Interpreter {
@@ -103,7 +145,7 @@ impl Interpreter {
         let ast = table(&g, "ast")?;
         let ip = table(&table(&g, "scr")?, "ip")?;
         let bound = table(&table(&g, "cachebuff")?, "img")?;
-        let position = (text(&ip, "file")?, text(&ip, "block")?);
+        let position = (text(&ip, "file")?, BlockKey::read(&ip, "block")?);
         let portrait_epoch = crate::portrait_preload::epoch(self.lua());
         let same_tables = cursor.ast.as_ref().is_some_and(|a| a.to_pointer() == ast.to_pointer())
             && cursor.bindings.as_ref().is_some_and(|a| a.to_pointer() == bound.to_pointer())
@@ -137,7 +179,7 @@ impl Interpreter {
             if !visited.insert(block.clone()) || visited.len() > MAX_BLOCKS { return None; }
             if !cursor.blocks.contains_key(&block) {
                 if cursor.blocks.len() >= MAX_BLOCKS { return None; }
-                let images = ast.raw_get::<Table>(block.as_str()).ok().and_then(|tags|
+                let images = block.tags(&ast).and_then(|tags|
                     read_block(self.lua(), &tags, Some(&bound), ext.as_deref(), &fields, &mut cursor.tags_left));
                 cursor.blocks.insert(block.clone(), images);
             }
@@ -160,7 +202,7 @@ impl Interpreter {
         let input = (|| {
             let ast = table(&g, "ast")?;
             let ip = table(&table(&g, "scr")?, "ip")?;
-            Some((ast, (text(&ip, "file")?, text(&ip, "block")?)))
+            Some((ast, (text(&ip, "file")?, BlockKey::read(&ip, "block")?)))
         })();
         let Some((ast, position)) = input else {
             return cursor.position.take().map(|_| Vec::new());
@@ -184,7 +226,7 @@ impl Interpreter {
         let mut budget = 512;
         for _ in 0..4 {
             if !visited.insert(block.clone()) { break; }
-            let Ok(tags) = ast.raw_get::<Table>(block.as_str()) else { break; };
+            let Some(tags) = block.tags(&ast) else { break; };
             // A branch can have arbitrary conditions and side effects. Stop at
             // the entire block rather than guessing a destination or evaluating it.
             let mut safe = true;
@@ -194,7 +236,7 @@ impl Interpreter {
                     Value::Nil => break,
                     Value::Table(t) => {
                         if matches!(t.raw_get::<String>(1).ok().as_deref(),
-                            Some("select"|"sel"|"jump"|"call"|"return"|"if"|"elseif"|"else"|"lua"|"eval")) {
+                            Some("select"|"sel"|"jump"|"call"|"return"|"if"|"elseif"|"else"|"lua"|"eval"|"SELECT"|"goto"|"gosub"|"end"|"RM_E"|"XM_E"|"TL")) {
                             safe = false; break;
                         }
                     }
@@ -208,7 +250,7 @@ impl Interpreter {
                 if seen.insert(path.clone()) { out.push(path); }
                 if out.len() == 32 { return Some(out); }
             }
-            match images.next { Some(next) => block = next, None => break }
+            match images.next.or_else(|| block.successor()) { Some(next) => block = next, None => break }
         }
         Some(out)
     }
@@ -216,6 +258,34 @@ impl Interpreter {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]
+    fn difference_cg_uses_ev_directory_before_transition() {
+        let it=Interpreter::new(Default::default());
+        it.lua().load(r#"
+            scr={ip={file='chapter',block=1}};
+            ast={{{'EV_C',file='scene_variant',time=500}},{{'EV',file='next_scene'}}};
+        "#).exec().unwrap();
+        let mut cursor=SurfaceTimelineCursor::default();
+        assert_eq!(it.query_surface_lookahead(&mut cursor).unwrap(),[":ev/scene_variant",":ev/next_scene"]);
+    }
+    #[test]
+    fn numeric_story_blocks_preload_images_and_stop_at_uppercase_branch() {
+        let it=Interpreter::new(Default::default());
+        it.lua().load(r#"
+            scr={ip={file='chapter',block=1}};
+            csv={cgname={alias='actual'},cgsize={},fg={hero={path='hero/'}}};
+            ast={
+              {{'BG',file='alias'}},
+              {{'ST',name='hero',body='body',face='face'}},
+              {{'SELECT'},{'EV',file='wrong-route'}},
+              {{'BG',file='later'}}}
+        "#).exec().unwrap();
+        let mut c=SurfaceTimelineCursor::default();
+        assert_eq!(it.query_surface_lookahead(&mut c).unwrap(),
+            [":bg/actual",":fg/hero/body.png",":fg/hero/face.png"]);
+        it.lua().load("scr.ip.block=4").exec().unwrap();
+        assert_eq!(it.query_surface_lookahead(&mut c).unwrap(),[":bg/later"]);
+    }
     #[test]
     fn lookahead_without_lua_bindings_is_bounded_and_replans() {
         let it=Interpreter::new(Default::default());

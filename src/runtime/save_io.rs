@@ -151,6 +151,7 @@ impl CoreRuntime {
                 self.wait_reason.as_ref(),
             ));
         }
+        data.reconcile_checkpoint_menu();
         data = data.with_audio(AudioSnapshot::from_audio(self.audio.as_ref()));
         let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
         let path = self.save_path_for(file)?;
@@ -340,8 +341,11 @@ impl CoreRuntime {
             path,
             bytes.len()
         );
-        let data: crate::save::SaveData =
+        let mut data: crate::save::SaveData =
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if data.reconcile_checkpoint_menu() {
+            crate::core_info!("[runtime] repaired stale checkpoint menu state");
+        }
         self.gameplay_save_checkpoint = None;
         self.pending_load_resume = None;
         self.pending_message_text = None;
@@ -349,6 +353,12 @@ impl CoreRuntime {
         self.compositor.reset_for_load();
         self.stop_all_media();
         self.reset_control_modes_for_load();
+        // Seed permissions before onLoad/reconstruction. Subsequent script
+        // commands take precedence; deferred dialogue restore must not replay
+        // a stale menu-era skip gate over those commands.
+        if let Some(config) = take_loaded_skip_config(&mut data.message_text) {
+            self.apply_skip_config(Some(config.allow), Some(config.unread));
+        }
         self.clear_scene_text();
         self.hovered_layers.clear();
         self.wait_reason = None;
@@ -607,6 +617,10 @@ impl CoreRuntime {
 /// 文档：type 0..2 与 trans 标签 type 同值（0=瞬切、1=交叉淡化、2=规则图转场，
 /// load 无 rule 参数故 2 退化为淡化）；缺省不执行转场。时长/输入用 trans 的
 /// 缺省值（time 缺省由合成器决定，input=1 允许输入跳过）。
+fn take_loaded_skip_config(text: &mut Option<crate::save::MessageTextSnapshot>) -> Option<crate::save::SkipConfigSnapshot> {
+    text.as_mut().and_then(|text| text.skip_config.take())
+}
+
 fn prepare_loaded_wait(interpreter: &mut asb_interpreter::Interpreter, data: &crate::save::SaveData) -> bool {
     let waiting = data.waiting_for_input.unwrap_or_else(||saved_position_resumes_input_wait(interpreter));
     if waiting {
@@ -770,6 +784,25 @@ fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Stri
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loaded_skip_permission_is_consumed_before_scene_rebuild() {
+        for allow in [false, true] {
+            let mut text = Some(crate::save::MessageTextSnapshot {
+                active_layer: Some("message".into()),
+                skip_config: Some(crate::save::SkipConfigSnapshot { allow, unread: true }),
+                ..Default::default()
+            });
+            let initial = super::take_loaded_skip_config(&mut text).unwrap();
+            assert_eq!(initial.allow, allow);
+            assert!(initial.unread);
+            // Rebuild scripts may enable OR disable skip. Delayed text restore
+            // must not overwrite either decision with the pre-rebuild value.
+            assert!(super::take_loaded_skip_config(&mut text).is_none());
+            assert_eq!(text.unwrap().active_layer.as_deref(), Some("message"));
+        }
+        assert!(super::take_loaded_skip_config(&mut None).is_none());
+        assert!(super::take_loaded_skip_config(&mut Some(Default::default())).is_none());
+    }
     use super::{
         ScreenshotBuffer, encode_png_rgba, is_persistent_system_variable, load_transition_event,
         persistent_system_snapshot, qualify_save_path, resize_screenshot_rgba, sanitize_savepath,

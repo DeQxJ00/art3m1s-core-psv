@@ -54,6 +54,7 @@ pub mod lua_engine;
 mod preload_hints;
 mod portrait_preload;
 mod surface_timeline;
+mod staged_images;
 mod emote_timeline;
 mod ogv_timeline;
 pub use ogv_timeline::OgvTimelineCursor;
@@ -64,6 +65,9 @@ mod emote_restore;
 mod emote_cache_warmup;
 mod optional_startup;
 mod delay_alias;
+mod zero_flash;
+mod layer_language;
+mod platform_resources;
 mod toolbar_roles;
 pub use message_roles::MessageLayerIds;
 #[cfg(feature = "backend-luau")]
@@ -98,3 +102,5 @@ pub use variable::{Value, VariableStore};
 
 /// 库版本
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+mod surface_bindings;
+mod deleted_cg;

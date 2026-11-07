@@ -96,11 +96,12 @@ impl LayerProps {
             }
             "rotate" => self.rotate = parse_f32(v).or(self.rotate),
             "alpha" => self.alpha = parse_u8(v).or(self.alpha),
-            "visible" => self.visible = parse_bool(v).or(self.visible),
-            "reversex" => self.reverse_x = parse_bool(v).or(self.reverse_x),
-            "reversey" => self.reverse_y = parse_bool(v).or(self.reverse_y),
-            "grayscale" => self.grayscale = parse_bool(v).or(self.grayscale),
-            "negative" => self.negative = parse_bool(v).or(self.negative),
+            // This flag uses a literal comparison, unlike numeric properties.
+            "visible" => self.visible = Some(value != "0"),
+            "reversex" => self.reverse_x = Some(value != "0"),
+            "reversey" => self.reverse_y = Some(value != "0"),
+            "grayscale" => self.grayscale = Some(value != "0"),
+            "negative" => self.negative = Some(value != "0"),
             "colormultiply" => self.color_multiply = parse_rgb(v).or(self.color_multiply),
             "layermode" => self.layer_mode = Some(v.to_string()),
             "clip" => self.clip = parse_clip(v).or(self.clip),
@@ -139,14 +140,15 @@ impl LayerProps {
             "zoom" => { self.x_scale = Some(value); self.y_scale = Some(value); }
             "rotate" => self.rotate = Some(value),
             "alpha" if value.is_finite() && (0.0..=255.0).contains(&value) => self.alpha = Some(value.round() as u8),
-            "visible" | "reversex" | "reversey" | "grayscale" | "negative" => {
+            "visible" => self.visible = Some((value.round() as i64) != 0),
+            "reversex" | "reversey" | "grayscale" | "negative" => {
                 let rounded = value.round() as i64;
                 let target = match key {
-                    "visible" => &mut self.visible, "reversex" => &mut self.reverse_x,
+                    "reversex" => &mut self.reverse_x,
                     "reversey" => &mut self.reverse_y, "grayscale" => &mut self.grayscale,
                     _ => &mut self.negative,
                 };
-                if rounded == 0 || rounded == 1 { *target = Some(rounded == 1); }
+                *target = Some(rounded != 0);
             }
             _ => self.set_raw(key, &Self::format_value(key, value)),
         }
@@ -255,15 +257,6 @@ fn parse_u8(value: &str) -> Option<u8> {
         .or_else(|| value.parse::<f32>().ok().map(|f| f.clamp(0.0, 255.0) as u8))
 }
 
-/// Artemis 的布尔属性用 `"1"` / `"0"`，也兼容 `on`/`off`/`true`/`false`。
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "on" | "true" | "yes" => Some(true),
-        "0" | "off" | "false" | "no" => Some(false),
-        _ => None,
-    }
-}
-
 /// 解析 colormultiply 的两种写法为归一化 RGB：
 /// - 文档格式 `RRGGBB` 十六进制（`FFFFFF` = 禁用 = 单位乘算）；
 /// - 兼容旧脚本的 `"r,g,b"`（0-255）逗号格式。
@@ -323,6 +316,40 @@ fn parse_name_list(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_layer_flags_accept_nonzero_values_and_reset_to_zero() {
+        for key in ["reversex", "reversey", "grayscale", "negative"] {
+            for value in ["255", "-1", "00", "0.0", "false", ""] {
+                let mut p = super::LayerProps::from_raw(&raw(&[(key, value)]));
+                let flag = |p: &super::LayerProps| match key {
+                    "reversex" => p.reverse_x,
+                    "reversey" => p.reverse_y,
+                    "grayscale" => p.grayscale,
+                    _ => p.negative,
+                };
+                assert_eq!(flag(&p), Some(true), "{key}={value:?}");
+                p.merge_raw(&raw(&[(key, "0")]));
+                assert_eq!(flag(&p), Some(false));
+                p.set_tween_value(key, 255.0);
+                assert_eq!(flag(&p), Some(true), "tween {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_visibility_restores_hidden_indicator() {
+        let mut p=super::LayerProps::from_raw(&raw(&[("visible","0")]));
+        assert!(!p.is_visible());
+        p.merge_raw(&raw(&[("visible","255")]));
+        assert!(p.is_visible());
+        p.merge_raw(&raw(&[("visible","0")]));
+        // Native visibility compares the original string with exactly "0";
+        // it does not parse a floating-point or a textual boolean value.
+        for value in ["00", "0.0", " 0", "false", "", "nan", "inf", "invalid"] {
+            p.merge_raw(&raw(&[("visible",value)]));
+            assert!(p.is_visible(), "{value:?}");
+        }
+    }
     #[test]
     fn image_anchor_defaults_match_native_transform_probe() {
         use glam::Vec2;
