@@ -1093,6 +1093,9 @@ impl TextRenderer for GlyphTextRenderer {
             // 换页清缓冲，同时清 link/ruby 区间与页内标签，
             // 并以当前字体重置页首快照
             l.clear_page();
+            // sceout animates the discarded page, not future text. Repainting
+            // a checkpoint with rp + print must start in the entrance state.
+            l.text_hidden = false;
             l.indent_initial = (*final_indent).clone();
             if !l.indent_initial.stack.is_empty() {
                 if let Ok(data) = serde_json::to_string(&l.indent_initial) {
@@ -2347,6 +2350,25 @@ mod tests {
             .map(|glyph| glyph.character.as_str())
             .collect();
         assert_eq!(text, "new");
+    }
+
+    #[test]
+    fn page_break_discards_previous_page_exit_state() {
+        let mut r = GlyphTextRenderer::new();
+        r.switch_message_layer(Some("adv"), false);
+        r.font_state_mut().active_layer_mut().text_buffer = glyphs("old");
+        r.hide_text();
+        assert!(r.font_state().layers["adv"].text_hidden);
+        // Merely selecting the layer must not undo an explicit hide.
+        r.switch_message_layer(Some("adv"), false);
+        assert!(r.font_state().layers["adv"].text_hidden);
+        // QuickJump repaints its target with rp + print, without scein.
+        r.push_page_break(Some(0));
+        let page = &r.font_state().layers["adv"];
+        assert!(!page.text_hidden, "a new page must not inherit the old page's exit tween");
+        assert_eq!(page.reveal_clock_ms, 0);
+        assert!(!page.reveal_pending);
+        assert!(page.text_buffer.is_empty());
     }
 
     #[test]
