@@ -379,6 +379,17 @@ impl CoreRuntime {
         self.interpreter
             .fire_load_handler_with_params(&HashMap::from([("file".into(), file.into())]))
             .map_err(|e| format!("onLoad 处理器失败: {e:?}"))?;
+        if data.reconcile_checkpoint_menu_after_load(|name| {
+            // The callback may queue visual cleanup behind a text command that
+            // pauses the interpreter. Lua has already closed the button group.
+            self.interpreter.lua().load(r#"
+                local name = ...
+                return type(scr) == 'table' and scr.uifunc ~= name
+                    and type(btn) == 'table' and btn[name] == nil
+            "#).call::<bool>(name).unwrap_or(false)
+        }) {
+            crate::core_info!("[runtime] omitted saved menu layers closed by onLoad");
+        }
         self.sync_control_status_variables();
         // Immediate e:tag commands cover the outgoing scene. Deferred
         // enqueueTag commands belong on the restored scene.
@@ -627,7 +638,7 @@ impl CoreRuntime {
 /// 文档：type 0..2 与 trans 标签 type 同值（0=瞬切、1=交叉淡化、2=规则图转场，
 /// load 无 rule 参数故 2 退化为淡化）；缺省不执行转场。时长/输入用 trans 的
 /// 缺省值（time 缺省由合成器决定，input=1 允许输入跳过）。
-fn take_loaded_skip_config(text: &mut Option<crate::save::MessageTextSnapshot>) -> Option<crate::save::SkipConfigSnapshot> {
+pub(super) fn take_loaded_skip_config(text: &mut Option<crate::save::MessageTextSnapshot>) -> Option<crate::save::SkipConfigSnapshot> {
     text.as_mut().and_then(|text| text.skip_config.take())
 }
 

@@ -10,12 +10,22 @@ use crate::compositor::{Compositor, TextureInfo};
 #[derive(Default)]
 pub(super) struct LayerQueryState {
     scene: Compositor,
+    pub(super) memory_audio: crate::save::AudioSnapshot,
+    pub(super) memory_text: Option<crate::save::MessageTextSnapshot>,
     accepted_revisions: HashMap<String, (u64, u64)>,
     sync_reports: usize,
     dimensions: HashMap<String, Option<(u32, u32)>>,
 }
 
 impl LayerQueryState {
+    pub fn memory_scene(&self) -> crate::save::MemoryScene {
+        crate::save::MemoryScene {
+            scene: self.scene.scene_snapshot(),
+            audio: self.memory_audio.clone(),
+            message_text: self.memory_text.clone(),
+        }
+    }
+
     pub fn observe_tag(&mut self, tag: &str, params: &HashMap<String, String>) {
         use asb_interpreter::event::LayerEvent;
         let Some(id) = params.get("id") else { return };
@@ -85,6 +95,7 @@ impl LayerQueryState {
         matches!(
             event,
             Event::Layer(_)
+                | Event::AllDelete { .. }
                 | Event::LayerRename { .. }
                 | Event::LayerTween { .. }
                 | Event::LayerTweenDelete { .. }

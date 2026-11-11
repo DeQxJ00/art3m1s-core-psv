@@ -41,7 +41,7 @@ mod animation_prefetch_tests {
 pub(super) fn event_requires_state_sync(event: &Event) -> bool {
     // Scripts may inspect s.current_message_layer immediately after chgmsg,
     // including to conditionally pop the name layer before printing dialogue.
-    matches!(event, Event::Exec { .. } | Event::SaveGame { .. }
+    matches!(event, Event::Exec { .. } | Event::SaveGame { .. } | Event::RestoreMemoryScene(_)
         | Event::MessageLayerSwitch { .. } | Event::MessageLayerPop)
 }
 
@@ -189,6 +189,36 @@ impl CoreRuntime {
 
             // 存档 / 读档 / 文件删除——通过宿主回调真正落盘（方案 B + A1）
             match event {
+                Event::RestoreMemoryScene(scene) => {
+                    match serde_json::from_value::<crate::save::MemoryScene>(scene.clone()) {
+                        Ok(mut snapshot) => {
+                            self.gameplay_save_checkpoint = None;
+                            self.pending_load_resume = None;
+                            self.pending_message_text = None;
+                            self.active_inline_event_frame = None;
+                            self.wait_reason = None;
+                            self.script_forced_stop = false;
+                            self.clear_emote_state("memory load");
+                            self.compositor.reset_for_load();
+                            self.stop_all_media();
+                            self.clear_scene_text();
+                            self.hovered_layers.clear();
+                            self.surface_timeline_cursor = Default::default();
+                            self.compositor.restore_scene(snapshot.scene);
+                            if let Some(config) = super::save_io::take_loaded_skip_config(&mut snapshot.message_text) {
+                                self.apply_skip_config(Some(config.allow), Some(config.unread));
+                            }
+                            self.pending_message_text = snapshot.message_text;
+                            self.restore_pending_message_text();
+                            self.restore_audio_snapshot(&snapshot.audio);
+                            self.sync_layer_info_all();
+                            self.sync_immediate_text();
+                        }
+                        Err(error) => {
+                            crate::core_error!("[runtime] invalid memory scene: {error}");
+                        }
+                    }
+                }
                 Event::SaveGame { file } => {
                     crate::core_info!("[runtime] Event::SaveGame file={:?}", file);
                     if file.is_empty() {
@@ -589,15 +619,7 @@ impl CoreRuntime {
                 Event::MessageLayerSwitch { .. } | Event::MessageLayerPop
             ) {
                 self.control.active_message_layer = self.active_message_layer_id();
-                self.interpreter.set_variable(
-                    "s.current_message_layer",
-                    asb_interpreter::Value::String(
-                        self.control
-                            .active_message_layer
-                            .clone()
-                            .unwrap_or_default(),
-                    ),
-                );
+                self.sync_script_message_layer();
             }
             // 只有真正送入文本渲染器后才算本帧展示过剧情文本。
             if matches!(event, Event::ScenarioText { .. }) {

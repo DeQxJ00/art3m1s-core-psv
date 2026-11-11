@@ -8,6 +8,8 @@ use std::collections::HashMap;
 /// 解释器事件
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// Restore the host portion of a Lua in-memory checkpoint.
+    RestoreMemoryScene(serde_json::Value),
     /// UI 转场效果
     UiTransition(TransitionEvent),
 

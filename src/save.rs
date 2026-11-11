@@ -149,6 +149,14 @@ pub struct SaveData {
     pub message_text: Option<MessageTextSnapshot>,
 }
 
+/// Host state saved alongside the interpreter's Lua memory checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MemoryScene {
+    pub scene: crate::compositor::Scene,
+    pub audio: AudioSnapshot,
+    pub message_text: Option<MessageTextSnapshot>,
+}
+
 /// Only user-input waits are resumable checkpoints, never media/timer waits.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum InputWaitSnapshot {
@@ -186,6 +194,8 @@ pub struct MessageTextSnapshot {
     #[serde(default)]
     pub active_layer: Option<String>,
     #[serde(default)]
+    pub layer_stack: Option<Vec<String>>,
+    #[serde(default)]
     pub layers: Vec<MessageLayerTextSnapshot>,
     #[serde(default)]
     pub input_handlers: Option<Vec<(String, String, crate::compositor::reduce::InputHandler)>>,
@@ -213,6 +223,10 @@ pub struct SkipConfigSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MessageLayerTextSnapshot {
     pub id: String,
+    #[serde(default)]
+    pub layered: Option<bool>,
+    #[serde(default)]
+    pub text_hidden: Option<bool>,
     #[serde(default)]
     pub page_font: std::collections::HashMap<String, String>,
     #[serde(default)]
@@ -286,12 +300,18 @@ impl From<CallFrameSnapshot> for CallFrame {
 impl SaveData {
     /// Reconcile serialized CSV-button UI with a gameplay scene snapshot.
     /// onSave can serialize a still-open menu after the PC has been rewound to
-    /// the gameplay checkpoint. Only recognize the matching script schema and
-    /// remove its active save/load group when its entire layer subtree is absent.
-    /// This also repairs existing saves, without changing files on disk on load.
+    /// the gameplay checkpoint, even when the menu is absent from the scene.
     pub(crate) fn reconcile_checkpoint_menu(&mut self) -> bool {
+        self.reconcile_checkpoint_menu_after_load(|_| false)
+    }
+
+    /// onLoad can explicitly close a menu that was present in the saved scene.
+    /// Discard that group's saved layers and text so replay cannot recreate it.
+    pub(crate) fn reconcile_checkpoint_menu_after_load(
+        &mut self,
+        menu_was_closed: impl FnOnce(&str) -> bool,
+    ) -> bool {
         if self.waiting_for_input != Some(true) { return false; }
-        let Some(scene) = &self.scene else { return false; };
         let read_table = |key: &str| -> Option<serde_json::Map<String, serde_json::Value>> {
             let asb_interpreter::Value::String(raw) = self.variables.get(key)? else { return None; };
             serde_json::from_str(raw).ok()
@@ -309,14 +329,27 @@ impl SaveData {
         if !group.get("p").is_some_and(|v| v.is_object()) { return false; }
         let Some(prefix) = group.get("id").and_then(|v| v.as_str()) else { return false; };
         let Some(root) = prefix.strip_suffix('.').filter(|v| !v.is_empty()) else { return false; };
-        if scene.iter_ids().iter().any(|id| id.starts_with(prefix)) { return false; }
-        // Deleting a menu's children can leave its empty grouping root behind.
-        // Only the inert default container is equivalent to an absent menu.
-        if scene.get(root).is_some_and(|layer| layer.file.is_some()
-            || layer.solid_color.is_some() || layer.mask.is_some()
-            || !layer.children.is_empty() || !layer.event_handlers.is_empty()
-            || !layer.tweens.is_empty() || layer.props != Default::default()) {
+        let Some(scene) = &mut self.scene else { return false; };
+        if menu_was_closed(&name) {
+            scene.delete(root);
+        } else if scene.iter_ids().iter().any(|id| id.starts_with(prefix))
+            || scene.get(root).is_some_and(|layer| layer.file.is_some()
+                || layer.solid_color.is_some() || layer.mask.is_some()
+                || !layer.children.is_empty() || !layer.event_handlers.is_empty()
+                || !layer.tweens.is_empty() || layer.props != Default::default())
+        {
+            // Only an inert default container is equivalent to an absent menu.
             return false;
+        }
+        if let Some(text) = &mut self.message_text {
+            let belongs_to_menu = |id: &str| id == root || id.starts_with(prefix);
+            text.layers.retain(|layer| !belongs_to_menu(&layer.id));
+            if text.active_layer.as_deref().is_some_and(belongs_to_menu) {
+                text.active_layer = None;
+            }
+            if let Some(stack) = &mut text.layer_stack {
+                stack.retain(|id| !belongs_to_menu(id));
+            }
         }
         btn.remove(&name);
         for key in ["name", "group", "cursor", "rep", "renew"] { btn.remove(key); }
@@ -518,6 +551,34 @@ mod tests {
         let btn: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert!(btn.get("save").is_none());
         assert!(btn.get("toolbar").is_some());
+    }
+
+    #[test]
+    fn load_cleanup_does_not_restore_deleted_menu_layers_or_text() {
+        let mut data = stale_menu_save();
+        let scene = data.scene.as_mut().unwrap();
+        scene.create("500.menu.page", None);
+        scene.create("5000.story", None);
+        data.message_text = Some(MessageTextSnapshot {
+            active_layer: Some("5000.story".into()),
+            layers: ["500.menu.page", "5000.story"].map(|id| MessageLayerTextSnapshot {
+                id: id.into(),
+                ..Default::default()
+            }).to_vec(),
+            ..Default::default()
+        });
+
+        assert!(!data.reconcile_checkpoint_menu());
+        assert!(!data.reconcile_checkpoint_menu_after_load(|name| name == "load"));
+        assert!(data.reconcile_checkpoint_menu_after_load(|name| name == "save"));
+
+        let scene = data.scene.as_ref().unwrap();
+        assert!(scene.get("500").is_none());
+        assert!(scene.get("5000.story").is_some());
+        let text = data.message_text.as_ref().unwrap();
+        assert_eq!(text.active_layer.as_deref(), Some("5000.story"));
+        assert_eq!(text.layers.len(), 1);
+        assert_eq!(text.layers[0].id, "5000.story");
     }
 
     #[test]
@@ -840,7 +901,9 @@ mod tests {
                 tags: vec![crate::text::BacklogTag::Text("Earlier dialogue".into())], ..Default::default()
             }], settings: Default::default(), write_mode: true, max_pages: 100 }),
             active_layer: Some("dialogue".into()),
+            layer_stack: Some(vec!["0".into()]),
             layers: vec![MessageLayerTextSnapshot { id: "dialogue".into(), page_font: Default::default(),
+                layered: Some(true), text_hidden: Some(true),
                 tags: vec![crate::text::BacklogTag::IndentModify(1), crate::text::BacklogTag::Text("Restored text".into())] }],
         });
         let mut json = serde_json::to_value(&data).unwrap();

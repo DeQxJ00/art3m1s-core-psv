@@ -210,6 +210,8 @@ impl CoreRuntime {
         let mut se: Vec<SoundChannelInfo> = state.se_channels.values().map(&to_info).collect();
         se.sort_by(|a, b| a.id.cmp(&b.id));
         *SOUND_INFO.lock().unwrap() = SoundInfoSnapshot { bgm, se };
+        self.layer_info.lock().unwrap().memory_audio =
+            crate::save::AudioSnapshot::from_audio(self.audio.as_ref());
     }
 
     pub(super) fn advance_media_and_enqueue_finish_handlers(&mut self, delta_ms: u64) {

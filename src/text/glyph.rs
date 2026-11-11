@@ -859,7 +859,13 @@ impl TextRenderer for GlyphTextRenderer {
             l.font = v;
             // 再现记录：font_close 无法直接重放（重放流不建栈），
             // 记录弹栈后的字体快照等效重现
-            let snapshot = l.font.to_raw();
+            let mut snapshot = l.font.to_raw();
+            // A font pop restores the style while keeping the current box.
+            // Replaying its style in a nameplate or history card must do the same.
+            for key in ["left", "top", "width", "height"] {
+                snapshot.remove(key);
+            }
+            snapshot.insert("stack".into(), "0".into());
             l.page_tags.push(BacklogTag::Font(snapshot));
         }
     }
@@ -1914,6 +1920,31 @@ mod tests {
         TextLayoutConfig, TextRenderer, TextSpanToken,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn font_pop_replay_preserves_the_target_box() {
+        let mut renderer = GlyphTextRenderer::new();
+        let base = HashMap::from([
+            ("left".into(), "50".into()),
+            ("size".into(), "18".into()),
+            ("stack".into(), "0".into()),
+        ]);
+        renderer.apply_font_settings(&base);
+        renderer.apply_font_settings(&HashMap::from([("left".into(), "177".into())]));
+        renderer.font_pop();
+        let BacklogTag::Font(style) = renderer.state.active_layer_mut().page_tags.last().unwrap() else {
+            panic!("font pop must record the restored style");
+        };
+        let style = style.clone();
+
+        renderer.switch_message_layer(Some("card"), false);
+        renderer.apply_font_settings(&HashMap::from([("left".into(), "28".into())]));
+        renderer.apply_font_settings(&style);
+        let card = renderer.state.active_layer_mut();
+        assert_eq!(card.left, 28.0);
+        assert_eq!(card.font.size, Some(18.0));
+        assert_eq!(card.font_stack.len(), 1);
+    }
 
     #[test]
     fn entire_scale_keeps_page_origin_at_authored_left_top() {

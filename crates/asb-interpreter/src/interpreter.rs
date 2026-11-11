@@ -1003,7 +1003,7 @@ impl Interpreter {
             }
 
             // 执行标签
-            let tag_result = self.execute_tag(&instruction, true)?;
+            let tag_result = self.execute_tag(&instruction, true, true)?;
 
             match tag_result {
                 TagResult::Continue => {
@@ -1116,7 +1116,7 @@ impl Interpreter {
                 TagResult::Dynamic(inner_instruction) => {
                     // [tag] invokes a script tag; its expanded instruction must
                     // enter the tag-filter boundary just like a direct script tag.
-                    let inner_result = self.execute_tag(&inner_instruction, true)?;
+                    let inner_result = self.execute_tag(&inner_instruction, true, true)?;
                     // 处理内部指令的结果（不增加行号，因为外层会处理）
                     match inner_result {
                         TagResult::Continue => {
@@ -1271,6 +1271,34 @@ impl Interpreter {
                 return Ok(None);
             };
 
+            if tag == crate::lua_engine::RESTORE_MEMORY_TAG {
+                let position: Vec<(String, usize)> =
+                    serde_json::from_str(params.get("position").map_or("", String::as_str))?;
+                let ((file, line), frames) = position.split_last().ok_or_else(|| Error::RuntimeError {
+                    line: self.current_line,
+                    message: "missing memory save position".into(),
+                })?;
+                let stack = frames.iter().map(|(script, return_line)| CallFrame {
+                    script: script.clone(),
+                    return_line: *return_line,
+                }).collect();
+                self.restore_position_inner(file, *line, stack, true)?;
+                self.last_flush_saw_jump = true;
+                self.arm_debug_skip_after_rewind();
+                if let Some(scene) = params.get("scene") {
+                    let event = Event::RestoreMemoryScene(serde_json::from_str(scene)?);
+                    match self.emit_event(event.clone()) {
+                        CallbackResult::Continue => {}
+                        CallbackResult::Pause => {
+                            self.last_wait_from_queue = true;
+                            return Ok(Some(ExecutionResult::Wait(event)));
+                        }
+                        CallbackResult::Abort => return Err(Error::Aborted),
+                    }
+                }
+                continue;
+            }
+
             let instruction = Instruction {
                 tag,
                 params,
@@ -1291,9 +1319,9 @@ impl Interpreter {
             // expanded instruction enters the filter boundary. Direct tags
             // queued by a filter still use the low-level path above and do not
             // recursively re-enter the filter.
-            let mut result = self.execute_tag(&instruction, false)?;
+            let mut result = self.execute_tag(&instruction, false, false)?;
             if let TagResult::Dynamic(inner) = result {
-                result = self.execute_tag(&inner, true)?;
+                result = self.execute_tag(&inner, true, false)?;
             }
 
             match result {
@@ -1533,20 +1561,29 @@ impl Interpreter {
     /// 之前**刷新（calllua、tag filter、onEnterFrame/onSave/onLoad 等），因为
     /// Lua 绑定拿不到解释器自身的引用。末项为当前执行位置。
     fn sync_script_state_to_engine(&self) {
+        self.sync_lua_position(false);
+    }
+
+    fn sync_lua_position(&self, from_scenario: bool) {
         let mut stack: Vec<(String, usize)> = self
             .call_stack
             .iter()
             .map(|frame| (frame.script.clone(), frame.return_line))
             .collect();
+        let mut memory_anonymous_script = None;
         if let Some(current) = &self.current_script {
             // Native input callbacks expose an anonymous script frame. Lua
             // uses it to unwind only the callback before jumping out of a UI.
             let anonymous = self.inline_event_depths.contains(&self.call_stack.len())
                 && self.call_stack.last().is_some_and(|frame|
                     frame.script == *current && frame.return_line == self.current_line);
+            if anonymous { memory_anonymous_script = Some(current.clone()); }
             stack.push((if anonymous { String::new() } else { current.clone() }, self.current_line));
         }
-        self.engine_ctx.lock().unwrap().script_stack = stack;
+        let mut ctx = self.engine_ctx.lock().unwrap();
+        ctx.script_stack = stack;
+        ctx.memory_anonymous_script = memory_anonymous_script;
+        ctx.memory_resume_after_current = from_scenario;
     }
 
     /// 落实 `e:setScriptStack` 的调用栈重写请求（docs/lua/engine/setScriptStack.txt）。
@@ -1768,6 +1805,7 @@ impl Interpreter {
         &mut self,
         instruction: &Instruction,
         apply_tag_filter: bool,
+        from_scenario: bool,
     ) -> Result<TagResult> {
         let script_name = self.current_script.clone().unwrap_or_default();
         let current_line = self.current_line;
@@ -1793,7 +1831,7 @@ impl Interpreter {
             // e:enqueueTag 生成的低层标签属于引擎直接调用，不能再次过滤，否则
             // tags.wait -> enqueueTag{"wait"} 会无限递归。
             // filter 是 Lua 函数，可能调用 e:getScriptStack——先刷新栈镜像。
-            self.sync_script_state_to_engine();
+            self.sync_lua_position(from_scenario);
             let filter_decision =
                 self.dispatch_lua_tag_filter(&instruction.tag, &instruction.params)?;
             // A pass-through filter can decorate a registered macro as well
@@ -1848,7 +1886,7 @@ impl Interpreter {
             // 关键：不持 variables 锁。call_lua_function 同步执行的 Lua 可能回调
             // e:var（经共享句柄再次锁 variables），持锁会在非可重入 Mutex 上自锁死。
             // Lua 内可能调用 e:getScriptStack / e:getScriptBlock，先刷新栈镜像。
-            self.sync_script_state_to_engine();
+            self.sync_lua_position(from_scenario);
             crate::tags::call_lua_function(&self.lua, &function_name, &extra_params)?;
             return Ok(TagResult::Continue);
         }
@@ -2075,6 +2113,11 @@ impl Interpreter {
 
         // 构造 param 表
         let param_table = self.lua.create_table()?;
+        // Match the native print handler's empty default for a control-only
+        // print reconstructed by a menu or a message-layer callback.
+        if tag == "print" && !params.contains_key("data") {
+            param_table.set("data", "")?;
+        }
         {
             let variables = self.variables.lock().unwrap();
             let evaluator = ExpressionEvaluator::new(&variables);
@@ -2550,6 +2593,16 @@ impl Interpreter {
         line: usize,
         stack: Vec<CallFrame>,
     ) -> Result<()> {
+        self.restore_position_inner(script, line, stack, false)
+    }
+
+    fn restore_position_inner(
+        &mut self,
+        script: &str,
+        line: usize,
+        stack: Vec<CallFrame>,
+        preserve_queue: bool,
+    ) -> Result<()> {
         // Lua's getScriptBlock can inspect any restored caller immediately,
         // before control returns to it. Load the entire saved stack first.
         self.load_external_script(script)?;
@@ -2570,8 +2623,10 @@ impl Interpreter {
         self.last_flush_saw_jump = false;
         {
             let mut ctx = self.engine_ctx.lock().unwrap();
-            ctx.tag_queue.clear();
-            ctx.immediate_tag_count = 0;
+            if !preserve_queue {
+                ctx.tag_queue.clear();
+                ctx.immediate_tag_count = 0;
+            }
             ctx.pending_stack_override = None;
             ctx.wait_reason_info = None;
         }
@@ -3776,6 +3831,55 @@ mod tests {
             interpreter.get_variable("caller_resumed"),
             Some(Value::Int(1))
         );
+    }
+
+    #[test]
+    fn memory_save_restores_variables_and_resumes_after_the_saved_instruction() {
+        let mut interpreter = filtered_interpreter(
+            r#"
+                function capture(e)
+                    assert(e:var("score") == "7")
+                    e:tag{"var", name="binary_checkpoint", data=string.char(0, 255)}
+                    if checkpoint == nil then
+                        checkpoint = e:saveToMemory()
+                        assert(type(checkpoint) == "string" and #checkpoint > 0)
+                    else
+                        error("restored at the save instruction")
+                    end
+                end
+                function rewind(e)
+                    assert(e:var("score") == "99")
+                    e:loadFromMemory(checkpoint)
+                    assert(e:var("score") == "7")
+                    assert(e:var("binary_checkpoint") == string.char(0, 255))
+                    e:tag{"var", name="after_load", data="1"}
+                end
+            "#,
+            concat!(
+                "*main\n[var name=score data=7]\n[call label=capture]\n",
+                "[if estimate=\"$after_load == '1'\"]\n[stop]\n[/if]\n",
+                "[var name=score data=99]\n[calllua function=rewind]\n[return]\n",
+                "*capture\n[calllua function=capture]\n[return]\n",
+            ),
+        );
+        assert!(matches!(interpreter.run().unwrap(), ExecutionResult::Wait(Event::Wait { .. })));
+        assert_eq!(interpreter.get_variable("score").unwrap().as_string(), "7");
+        assert_eq!(interpreter.get_variable("after_load").unwrap().as_string(), "1");
+        assert!(interpreter.call_stack().is_empty());
+    }
+
+    #[test]
+    fn print_filter_can_handle_a_reconstructed_empty_print() {
+        let mut interpreter = filtered_interpreter(
+            r#"
+                __engine:setTagFilter({print = function(e, p)
+                    assert(string.find(p.data, "x", 1, true) == nil)
+                    return 0
+                end})
+            "#,
+            "*main\n[print]\n[stop]\n",
+        );
+        assert!(matches!(interpreter.run().unwrap(), ExecutionResult::Wait(Event::Wait { .. })));
     }
 
     #[test]

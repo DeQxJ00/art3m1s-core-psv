@@ -378,14 +378,19 @@ impl InputSnapshot {
 }
 
 impl EngineCallbacks for FfiCallbacks {
+    fn capture_memory_scene(&self) -> Result<Option<serde_json::Value>, String> {
+        let scene = self.layer_info.lock().unwrap().memory_scene();
+        serde_json::to_value(scene).map(Some).map_err(|error| error.to_string())
+    }
+
     fn debug(&self, _level: i32, data: &str, _raw: bool) {
         crate::core_info!("{data}");
     }
 
     fn enqueue_tag(&self, _tag: String, _params: HashMap<String, String>) {}
-    fn observe_immediate_tag(&self, tag: &str, params: &HashMap<String, String>) {
+    fn observe_immediate_tag(&self, tag: &str, params: &HashMap<String, String>) -> Option<String> {
         self.layer_info.lock().unwrap().observe_tag(tag, params);
-        super::text::observe_immediate_text(tag, params);
+        super::text::observe_immediate_text(tag, params)
     }
     fn set_event_handler(&self, _handlers: HashMap<String, String>) {}
 

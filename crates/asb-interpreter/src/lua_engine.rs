@@ -71,9 +71,15 @@ pub trait EngineCallbacks: Send + Sync {
     /// 执行标签（返回标签名和参数）
     fn enqueue_tag(&self, tag: String, params: HashMap<String, String>);
 
-    /// Make immediate layer mutations visible to synchronous Lua queries.
-    /// Deferred enqueueTag calls must not use this hook.
-    fn observe_immediate_tag(&self, _tag: &str, _params: &HashMap<String, String>) {}
+    /// Mirror immediate mutations for synchronous Lua queries. A message
+    /// switch/pop returns the new value of s.current_message_layer.
+    fn observe_immediate_tag(&self, _tag: &str, _params: &HashMap<String, String>) -> Option<String> {
+        None
+    }
+
+    fn capture_memory_scene(&self) -> Result<Option<serde_json::Value>, String> {
+        Ok(None)
+    }
 
     /// 设置事件处理器
     fn set_event_handler(&self, handlers: HashMap<String, String>);
@@ -430,6 +436,8 @@ pub struct EngineContext {
     /// `(脚本名, 内部索引)`。每次进入 Lua 前由解释器刷新，供 e:getScriptStack
     /// / e:getScriptBlock 读取真实调用栈。
     pub script_stack: Vec<(String, usize)>,
+    pub(crate) memory_anonymous_script: Option<String>,
+    pub(crate) memory_resume_after_current: bool,
     /// Source of the ScenarioText currently being delivered to the host.
     pub scenario_text_source: Option<(String, usize)>,
     /// `e:setScriptStack` 请求的调用栈强制重写（与 `script_stack` 同构），
@@ -501,6 +509,8 @@ impl EngineContext {
             file_reader: None,
             variables: None,
             script_stack: Vec::new(),
+            memory_anonymous_script: None,
+            memory_resume_after_current: false,
             scenario_text_source: None,
             pending_stack_override: None,
             debug_skip_target: None,
@@ -514,6 +524,16 @@ impl EngineContext {
 /// Engine API 对象（注入到 Lua 的第一个参数）
 pub struct EngineApi {
     ctx: Arc<Mutex<EngineContext>>,
+}
+
+pub(crate) const RESTORE_MEMORY_TAG: &str = "\u{b}restore_memory";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MemorySave {
+    format: u32,
+    variables: crate::VariableStore,
+    position: Vec<(String, usize)>,
+    scene: Option<serde_json::Value>,
 }
 
 impl EngineApi {
@@ -676,6 +696,52 @@ fn tag_argument_table(lua: &Lua, args: mlua::MultiValue) -> mlua::Result<Option<
 
 impl UserData for EngineApi {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("saveToMemory", |lua, this, ()| {
+            let ctx = this.ctx.lock().unwrap();
+            let Some(variables) = &ctx.variables else { return Ok(None); };
+            let mut position = ctx.script_stack.clone();
+            let Some((file, line)) = position.last_mut() else { return Ok(None); };
+            if let Some(anonymous_file) = &ctx.memory_anonymous_script {
+                if file.is_empty() { file.clone_from(anonymous_file); }
+            }
+            if ctx.memory_resume_after_current { *line += 1; }
+            let snapshot = MemorySave {
+                format: 1,
+                variables: variables.lock().unwrap().local_snapshot(),
+                position,
+                scene: ctx.callbacks.capture_memory_scene().map_err(mlua::Error::external)?,
+            };
+            let bytes = serde_json::to_vec(&snapshot).map_err(mlua::Error::external)?;
+            Ok(Some(lua.create_string(bytes)?))
+        });
+        methods.add_method("loadFromMemory", |_lua, this, bytes: mlua::String| {
+            let snapshot: MemorySave = serde_json::from_slice(bytes.as_bytes().as_ref())
+                .map_err(mlua::Error::external)?;
+            if snapshot.format != 1 || snapshot.position.is_empty()
+                || snapshot.position.iter().any(|(file, _)| file.is_empty())
+            {
+                return Err(mlua::Error::external("invalid memory save position or format"));
+            }
+            let mut params = HashMap::from([("position".into(),
+                serde_json::to_string(&snapshot.position).map_err(mlua::Error::external)?)]);
+            if let Some(scene) = snapshot.scene {
+                params.insert("scene".into(), scene.to_string());
+            }
+            let mut ctx = this.ctx.lock().unwrap();
+            if let Some(variables) = &ctx.variables {
+                variables.lock().unwrap().restore_local_snapshot(&snapshot.variables);
+            }
+            // The rest of this Lua callback must see restored variables and
+            // stack. Commit the host state before running its queued commands.
+            ctx.script_stack = snapshot.position;
+            ctx.memory_anonymous_script = None;
+            ctx.memory_resume_after_current = false;
+            let at = ctx.immediate_tag_count.min(ctx.tag_queue.len());
+            ctx.tag_queue.insert(at, (RESTORE_MEMORY_TAG.into(), params));
+            ctx.immediate_tag_count = at + 1;
+            Ok(())
+        });
+
         // e:debug{level=0, data="foo", raw=false} 或 e:debug("foo")
         methods.add_method("debug", |_lua, this, args: mlua::MultiValue| {
             let ctx = this.ctx.lock().unwrap();
@@ -731,6 +797,7 @@ impl UserData for EngineApi {
                         .map_err(mlua::Error::external);
                 }
                 let mut params = HashMap::new();
+                let mut binary_data = None;
                 // 用 Value 迭代，再手动转 String。mlua 的 `pairs::<String,String>()`
                 // 一旦遇到非字符串值（如 boolean）就会终止迭代，后面的键全部丢失。
                 // Lua 脚本传参经常带布尔字段（se=false 等），必须跳过而非中断。
@@ -755,7 +822,15 @@ impl UserData for EngineApi {
                             // through lyprop. Preserve an explicit clear there.
                             Value::Boolean(false)
                                 if tag_name == "lyprop" && key_str.as_deref() == Some("mask") => Some(String::new()),
-                            Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
+                            Value::String(s) => match s.to_str() {
+                                Ok(text) => Some(text.to_string()),
+                                Err(_) => {
+                                    if tag_name == "var" && key_str.as_deref() == Some("data") {
+                                        binary_data = Some(s.as_bytes().to_vec());
+                                    }
+                                    None
+                                }
+                            },
                             Value::Integer(i) => Some(i.to_string()),
                             Value::Number(n) => Some(n.to_string()),
                             Value::Boolean(b) => Some(b.to_string()),
@@ -769,7 +844,26 @@ impl UserData for EngineApi {
                 // 移除数字键 1 (tag name)
                 params.remove("1");
                 let mut ctx = this.ctx.lock().unwrap();
-                ctx.callbacks.observe_immediate_tag(&tag_name, &params);
+                if tag_name == "chgmsg" {
+                    if let Some(variables) = &ctx.variables {
+                        let variables = variables.lock().unwrap();
+                        let evaluator = crate::expression::ExpressionEvaluator::new(&variables);
+                        if let Some(raw) = params.get("id") {
+                            let id = evaluator.resolve_param_str(raw).map_err(mlua::Error::external)?;
+                            params.insert("id".into(), id);
+                        }
+                    }
+                    if params.get("id").is_none_or(String::is_empty) {
+                        params.insert("id".into(), crate::tags::next_anonymous_message_layer());
+                    }
+                }
+                if let Some(layer) = ctx.callbacks.observe_immediate_tag(&tag_name, &params) {
+                    if let Some(variables) = &ctx.variables {
+                        variables.lock().unwrap().set(
+                            "s.current_message_layer", crate::variable::Value::String(layer),
+                        );
+                    }
+                }
                 ctx.callbacks.enqueue_tag(tag_name.clone(), params.clone());
 
                 // var 标签不产出事件，且脚本常在同一 Lua 函数内紧接着用 e:var 读回
@@ -779,6 +873,16 @@ impl UserData for EngineApi {
                 if tag_name == "var" {
                     if let Some(vars) = &ctx.variables {
                         let mut store = vars.lock().unwrap();
+                        if let Some(bytes) = binary_data.filter(|_| !params.contains_key("system")) {
+                            let name = params.get("name").map_or("", String::as_str);
+                            let name = crate::expression::ExpressionEvaluator::new(&store)
+                                .resolve_param_str(name).map_err(mlua::Error::external)?;
+                            store.with_local_writes(
+                                crate::tags::var_handler::param_is_on(params.get("writelocal")),
+                                |store| store.set(&name, crate::variable::Value::Bytes(bytes)),
+                            );
+                            return Ok(());
+                        }
                         // 需要宿主回调的 system 查询（get_layer_info / get_font /
                         // fullscreen / minimize）在此拦截；未命中则落回通用 var 处理。
                         let handled =
@@ -1041,6 +1145,7 @@ impl UserData for EngineApi {
             let store = vars.lock().unwrap();
             match store.get(&name) {
                 Some(V::Null) | None => Ok(mlua::Value::String(lua.create_string("0")?)),
+                Some(V::Bytes(bytes)) => Ok(mlua::Value::String(lua.create_string(bytes)?)),
                 Some(value) => Ok(mlua::Value::String(lua.create_string(value.as_string())?)),
             }
         });

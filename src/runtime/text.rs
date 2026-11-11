@@ -182,10 +182,33 @@ static TEXT_METRICS: Mutex<(f32, f32, f32)> = Mutex::new((0.0, 0.0, 0.0));
 struct ImmediateText {
     renderer: crate::text::glyph::GlyphTextRenderer,
     pending: Vec<(String, HashMap<String, String>)>,
+    active: Option<String>,
+    layer_stack: Vec<String>,
 }
 impl ImmediateText {
     fn new(renderer: crate::text::glyph::GlyphTextRenderer) -> Self {
-        Self { renderer, pending: Vec::new() }
+        let active = renderer.font_state().active_layer.clone();
+        let layer_stack = renderer.font_state().layer_stack.clone();
+        Self { renderer, pending: Vec::new(), active, layer_stack }
+    }
+
+    fn observe_layer(&mut self, tag: &str, params: &HashMap<String, String>) -> Option<String> {
+        match tag {
+            "chgmsg" => {
+                if params.get("stack").and_then(|v| v.parse::<i32>().ok()).unwrap_or(1) != 0 {
+                    self.layer_stack.push(self.active.take()
+                        .unwrap_or_else(|| crate::text::glyph::DEFAULT_MESSAGE_LAYER.to_string()));
+                }
+                self.active = params.get("id").cloned();
+            }
+            "/chgmsg" => {
+                if let Some(previous) = self.layer_stack.pop() {
+                    self.active = Some(previous);
+                }
+            }
+            _ => return None,
+        }
+        Some(script_message_layer(self.active.as_deref(), &self.layer_stack).into())
     }
     fn metrics(&mut self) -> (f32, f32, f32) {
         for (tag, params) in self.pending.drain(..) {
@@ -193,6 +216,25 @@ impl ImmediateText {
         }
         self.renderer.active_layer_text_metrics().unwrap_or((0.0, 0.0, 0.0))
     }
+}
+
+fn script_message_layer<'a>(active: Option<&'a str>, stack: &[String]) -> &'a str {
+    match active {
+        Some(id) if id != crate::text::glyph::DEFAULT_MESSAGE_LAYER || !stack.is_empty() => id,
+        _ => "",
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn immediate_pops_reach_the_script_visible_root_in_one_callback() {
+    let mut renderer = crate::text::glyph::GlyphTextRenderer::new();
+    renderer.switch_message_layer(Some("dialogue"), true);
+    renderer.switch_message_layer(Some("temporary"), true);
+    let mut preview = ImmediateText::new(renderer.measurement_snapshot().unwrap());
+    assert_eq!(preview.observe_layer("/chgmsg", &HashMap::new()).as_deref(), Some("dialogue"));
+    assert_eq!(preview.observe_layer("/chgmsg", &HashMap::new()).as_deref(), Some(""));
+    assert_eq!(preview.renderer.font_state().active_layer.as_deref(), Some("temporary"));
 }
 
 #[cfg(test)]
@@ -212,15 +254,17 @@ fn immediate_measurement_defers_work_until_query_and_consumes_it_once() {
 }
 static IMMEDIATE_TEXT: Mutex<Option<ImmediateText>> = Mutex::new(None);
 
-pub(super) fn observe_immediate_text(tag: &str, params: &HashMap<String, String>) {
+pub(super) fn observe_immediate_text(tag: &str, params: &HashMap<String, String>) -> Option<String> {
     if !matches!(tag, "chgmsg" | "/chgmsg" | "font" | "fontinit" | "/font"
         | "fontdefault" | "print" | "rp" | "rt" | "prohibit" | "wordparts"
-        | "indent" | "indentmodify") { return; }
+        | "indent" | "indentmodify") { return None; }
     if let Some(renderer) = IMMEDIATE_TEXT.lock().unwrap().as_mut() {
         // Most printed dialogue never asks for dimensions. Defer layout until
         // a synchronous query, discarding this queue when real events catch up.
         renderer.pending.push((tag.to_owned(), params.clone()));
+        return renderer.observe_layer(tag, params);
     }
+    None
 }
 
 /// 读取当前文本度量快照。消费方是解释器宿主查询钩子。
@@ -341,6 +385,15 @@ impl CoreRuntime {
             .and_then(|renderer| renderer.font_state().active_layer.clone())
     }
 
+    pub(super) fn sync_script_message_layer(&mut self) {
+        let id = self.text_renderer.as_ref().map_or("", |renderer| {
+            let state = renderer.font_state();
+            script_message_layer(state.active_layer.as_deref(), &state.layer_stack)
+        });
+        self.interpreter.set_variable("s.current_message_layer",
+            asb_interpreter::Value::String(id.into()));
+    }
+
     pub(super) fn set_text_renderer(&mut self, renderer: Box<dyn TextRenderer>) {
         self.text_renderer = Some(renderer);
     }
@@ -369,12 +422,16 @@ impl CoreRuntime {
     }
 
     pub(super) fn sync_immediate_text(&self) {
+        let message_text = self.capture_message_text(false);
+        self.layer_info.lock().unwrap().memory_text = message_text;
         if let Some(renderer) = self.text_renderer.as_ref() {
             let started = std::time::Instant::now();
             let mut mirror = IMMEDIATE_TEXT.lock().unwrap();
             if let Some(mirror) = mirror.as_mut() {
                 renderer.sync_measurement_snapshot(&mut mirror.renderer);
                 mirror.pending.clear();
+                mirror.active.clone_from(&renderer.font_state().active_layer);
+                mirror.layer_stack.clone_from(&renderer.font_state().layer_stack);
             } else {
                 *mirror = renderer.measurement_snapshot().map(ImmediateText::new);
             }
@@ -777,10 +834,17 @@ impl CoreRuntime {
         self.clear_pending_text_translation();
         if let Some(renderer) = self.text_renderer.as_mut() {
             renderer.clear_scene_text();
+            renderer.font_state_mut().active_layer = None;
         }
+        self.sync_script_message_layer();
+        self.sync_immediate_text();
     }
 
     pub(super) fn capture_message_text_snapshot(&self) -> Option<crate::save::MessageTextSnapshot> {
+        self.capture_message_text(true)
+    }
+
+    fn capture_message_text(&self, include_history: bool) -> Option<crate::save::MessageTextSnapshot> {
         let renderer = self.text_renderer.as_ref()?;
         let state = renderer.font_state();
         let mut layers = Vec::new();
@@ -789,6 +853,8 @@ impl CoreRuntime {
             // line after a narration save. Preserve their font and coordinates.
             layers.push(crate::save::MessageLayerTextSnapshot {
                 id: id.clone(),
+                layered: Some(layer.layered),
+                text_hidden: Some(layer.text_hidden),
                 page_font: layer.page_font.clone(),
                 tags: layer.page_tags.clone(),
             });
@@ -800,9 +866,10 @@ impl CoreRuntime {
         Some(crate::save::MessageTextSnapshot {
             skip_config: Some(self.capture_skip_config()),
             active_layer: state.active_layer.clone(),
+            layer_stack: Some(state.layer_stack.clone()),
             layers,
             input_handlers: Some(self.compositor.input_snapshot()),
-            history: Some(crate::save::HistorySnapshot {
+            history: include_history.then(|| crate::save::HistorySnapshot {
                 pages: state.backlog.snapshot_pages().map(|page| page.as_ref().clone()).collect(),
                 settings: state.backlog.settings.clone(), write_mode: state.backlog.write_mode,
                 max_pages: state.backlog.max_pages,
@@ -850,7 +917,12 @@ impl CoreRuntime {
             }
             if let Some(renderer) = self.text_renderer.as_mut() {
                 renderer.switch_message_layer(Some(&layer.id), false);
+                let mut hidden = layer.text_hidden.unwrap_or(false);
                 if let Some(state_layer) = renderer.font_state_mut().layers.get_mut(&layer.id) {
+                    hidden = layer.text_hidden.unwrap_or(state_layer.text_hidden);
+                    if let Some(layered) = layer.layered {
+                        state_layer.layered = layered;
+                    }
                     state_layer.page_font.clone_from(&layer.page_font);
                     state_layer.page_tags.clear();
                     state_layer.text_buffer.clear();
@@ -875,8 +947,16 @@ impl CoreRuntime {
                         crate::text::BacklogTag::IndentState(data) => renderer.restore_indent_state(data),
                     }
                 }
+                // Applying the page's baseline font also records a font tag.
+                // Keep that baseline separate so Backlog replay does not use
+                // the dialogue's stage coordinates inside a history card.
+                renderer.font_state_mut().active_layer_mut().page_tags.clone_from(&layer.tags);
+                if hidden {
+                    renderer.hide_text();
+                } else {
+                    renderer.show_text();
+                }
                 renderer.reveal_all();
-                renderer.show_text();
             }
             self.sync_message_layer_binding(true);
         }
@@ -886,6 +966,19 @@ impl CoreRuntime {
             }
             self.sync_message_layer_binding(true);
         }
+        if let Some(renderer) = self.text_renderer.as_mut() {
+            let state = renderer.font_state_mut();
+            if let Some(stack) = &snapshot.layer_stack {
+                state.layer_stack.clone_from(stack);
+            } else if state.layer_stack.is_empty()
+                && state.active_layer.as_deref().is_some_and(|id|
+                    !matches!(id, "" | "0" | crate::text::glyph::DEFAULT_MESSAGE_LAYER))
+            {
+                state.layer_stack.push(crate::text::glyph::DEFAULT_MESSAGE_LAYER.into());
+            }
+        }
+        self.sync_script_message_layer();
+        self.sync_immediate_text();
     }
 
     /// 把当前活动消息层登记为合成器的默认消息层，并建立「消息层 ID → 场景图层

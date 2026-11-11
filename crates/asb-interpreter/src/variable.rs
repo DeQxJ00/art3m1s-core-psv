@@ -20,6 +20,8 @@ pub enum Value {
     Float(f64),
     /// 字符串值
     String(String),
+    /// Lua strings can hold compressed save data which is not UTF-8.
+    Bytes(Vec<u8>),
     /// 布尔值
     Bool(bool),
     /// 空值
@@ -34,6 +36,7 @@ impl Value {
             Value::Float(n) => Some(*n as i64),
             Value::Bool(b) => Some(if *b { 1 } else { 0 }),
             Value::String(s) => s.parse().ok(),
+            Value::Bytes(_) => None,
             Value::Null => Some(0),
         }
     }
@@ -45,6 +48,7 @@ impl Value {
             Value::Float(n) => Some(*n),
             Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
             Value::String(s) => s.parse().ok(),
+            Value::Bytes(_) => None,
             Value::Null => Some(0.0),
         }
     }
@@ -56,6 +60,7 @@ impl Value {
             Value::Float(n) => *n != 0.0,
             Value::Bool(b) => *b,
             Value::String(s) => !s.is_empty(),
+            Value::Bytes(bytes) => !bytes.is_empty(),
             Value::Null => false,
         }
     }
@@ -67,6 +72,7 @@ impl Value {
             Value::Float(n) => n.to_string(),
             Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
             Value::String(s) => s.clone(),
+            Value::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
             Value::Null => String::new(),
         }
     }
@@ -84,6 +90,7 @@ impl fmt::Display for Value {
             Value::Float(n) => write!(f, "{}", n),
             Value::Bool(b) => write!(f, "{}", if *b { 1 } else { 0 }),
             Value::String(s) => write!(f, "{}", s),
+            Value::Bytes(bytes) => f.write_str(&String::from_utf8_lossy(bytes)),
             Value::Null => Ok(()),
         }
     }
