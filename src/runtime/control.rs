@@ -189,7 +189,7 @@ impl RuntimeControlState {
     }
 
     pub(super) fn automode_active(&self) -> bool {
-        self.automode_active && self.automode_allowed
+        self.automode_active
     }
 
     /// syncse 列表（为空表示不等待声音）。
@@ -323,6 +323,12 @@ impl CoreRuntime {
         if enabled && !self.control.automode_allowed {
             return;
         }
+        self.set_automode_from_script(enabled);
+    }
+
+    // Native exec automode explicitly bypasses default input permission.
+    // Games can disable the built-in key while managing Auto in Lua.
+    fn set_automode_from_script(&mut self, enabled: bool) {
         let next = enabled;
         if next && self.control.skip_active {
             self.set_skip_mode(false);
@@ -471,7 +477,7 @@ impl CoreRuntime {
         match command {
             "automode" => {
                 let enabled = mode.unwrap_or(1) != 0;
-                self.set_automode_mode(enabled);
+                self.set_automode_from_script(enabled);
             }
             "skip" => {
                 let enabled = mode
@@ -981,6 +987,16 @@ mod tests {
         exec_input_route, parse_keyconfig, role_triggered_by_bits,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn script_enabled_automode_runs_without_default_input_permission() {
+        let control = RuntimeControlState {
+            automode_allowed: false,
+            automode_active: true,
+            ..RuntimeControlState::default()
+        };
+        assert!(control.automode_active());
+    }
 
     #[test]
     fn load_reset_disables_transient_advance_modes() {
