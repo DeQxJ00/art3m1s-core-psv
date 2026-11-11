@@ -424,6 +424,7 @@ pub struct EngineContext {
     /// 日志输出前调用此函数：返回 0 输出原始日志，返回 1 抑制原始日志
     /// （docs/lua/engine/setLogFilter.txt）。core 侧日志路径经另一代理消费。
     pub log_filter: Option<mlua::RegistryKey>,
+    pub(crate) debug_http_response: Vec<u8>,
     /// 项目文件读取器，供 `e:include` 读取 Lua/数据文件。
     ///
     /// `e:include(path)` 的语义是”读取文件并在当前 Lua VM 中执行”，因此 include
@@ -509,6 +510,7 @@ impl EngineContext {
             event_handlers: HashMap::new(),
             event_filter: None,
             log_filter: None,
+            debug_http_response: Vec::new(),
             file_reader: None,
             variables: None,
             script_stack: Vec::new(),
@@ -699,6 +701,20 @@ fn tag_argument_table(lua: &Lua, args: mlua::MultiValue) -> mlua::Result<Option<
 
 impl UserData for EngineApi {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("setHttpResponse", |_lua, this, body: mlua::Value| {
+            let mut ctx = this.ctx.lock().unwrap();
+            if let mlua::Value::String(body) = body {
+                let bytes = body.as_bytes();
+                // The native setter assigns from a C string.
+                let response = bytes.split(|byte| *byte == 0).next().unwrap_or_default();
+                ctx.debug_http_response.clear();
+                ctx.debug_http_response.extend_from_slice(response);
+            } else {
+                ctx.callbacks.debug(1, "setHttpResponse requires a string", false);
+            }
+            Ok(())
+        });
+
         methods.add_method("saveToMemory", |lua, this, ()| {
             let ctx = this.ctx.lock().unwrap();
             let Some(variables) = &ctx.variables else { return Ok(None); };
@@ -2184,6 +2200,18 @@ mod tests {
         init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
         lua.load("assert(__engine:dumpMemoryStatus() == nil)").exec().unwrap();
         assert_eq!(*logs.lock().unwrap(), ["memory status"]);
+    }
+
+    #[test]
+    fn lua_sets_the_debug_http_response_body() {
+        let interpreter = crate::Interpreter::new(crate::InterpreterConfig::default());
+        interpreter.lua().load(r#"
+            assert(select('#', __engine:setHttpResponse('first')) == 0)
+            __engine:setHttpResponse(string.char(255, 0, 65))
+            __engine:setHttpResponse(42)
+        "#).exec().unwrap();
+        assert_eq!(interpreter.take_debug_http_response(), [255]);
+        assert!(interpreter.take_debug_http_response().is_empty());
     }
 
     #[test]

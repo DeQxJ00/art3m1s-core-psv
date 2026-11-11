@@ -2771,6 +2771,12 @@ impl Interpreter {
         &mut self.lua
     }
 
+    /// Consume the response body set by a Lua debug command. Debug adapters
+    /// can also call this before running a command to discard a previous reply.
+    pub fn take_debug_http_response(&self) -> Vec<u8> {
+        std::mem::take(&mut self.engine_ctx.lock().unwrap().debug_http_response)
+    }
+
     /// 注册自定义标签处理器
     pub fn register_tag<H: crate::tags::TagHandler + 'static>(&mut self, name: &str, handler: H) {
         self.tag_registry.register(name, handler);
