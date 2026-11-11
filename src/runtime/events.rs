@@ -42,7 +42,8 @@ pub(super) fn event_requires_state_sync(event: &Event) -> bool {
     // Scripts may inspect s.current_message_layer immediately after chgmsg,
     // including to conditionally pop the name layer before printing dialogue.
     matches!(event, Event::Exec { .. } | Event::SaveGame { .. } | Event::RestoreMemoryScene(_)
-        | Event::MessageLayerSwitch { .. } | Event::MessageLayerPop | Event::MessageIndentQuery { .. })
+        | Event::MessageLayerSwitch { .. } | Event::MessageLayerPop | Event::MessageIndentQuery { .. }
+        | Event::SaveLayerImage { .. })
 }
 
 // Count only the actual events being dispatched, including invalid requests
@@ -393,6 +394,11 @@ impl CoreRuntime {
                     );
                     if let Err(e) = self.handle_save_screenshot(file, *width, *height) {
                         crate::core_error!("[runtime] 保存缩略图失败 {}: {}", file, e);
+                    }
+                }
+                Event::SaveLayerImage { id, file } => {
+                    if let Err(error) = self.handle_save_layer_image(id, file) {
+                        crate::core_warn!("[lysave] {error}");
                     }
                 }
                 Event::Custom { tag, params } if tag == "lyshader" => {

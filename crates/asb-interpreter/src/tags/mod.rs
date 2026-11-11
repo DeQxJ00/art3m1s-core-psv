@@ -458,6 +458,7 @@ impl TagRegistry {
         registry.register("lyevent", LyeventHandler);
         registry.register("lyrename", LyrenameHandler);
         registry.register("lyedit", LyeditHandler);
+        registry.register("lysave", LysaveHandler);
         registry.register("lydrag", LydragHandler);
         registry.register("anime", AnimeHandler);
         registry.register("video", VideoHandler);
@@ -1002,6 +1003,11 @@ mod tests {
             interpreter.run().unwrap(),
             ExecutionResult::Completed
         ));
+    }
+
+    #[test]
+    fn layer_export_has_a_builtin_handler() {
+        assert!(super::TagRegistry::new().contains("lysave"));
     }
 
     #[test]

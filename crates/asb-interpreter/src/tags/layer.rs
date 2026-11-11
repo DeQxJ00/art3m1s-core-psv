@@ -332,6 +332,18 @@ impl TagHandler for LyeditHandler {
     }
 }
 
+/// [lysave] Write the current image of a layer to the save directory.
+pub struct LysaveHandler;
+
+impl TagHandler for LysaveHandler {
+    fn execute(&self, ctx: &mut ExecutionContext<'_>) -> Result<TagResult> {
+        Ok(TagResult::Emit(Event::SaveLayerImage {
+            id: ctx.resolve_param_str("id")?,
+            file: ctx.resolve_param_str("file")?,
+        }))
+    }
+}
+
 /// [lydrag] 图层拖动处理器
 pub struct LydragHandler;
 

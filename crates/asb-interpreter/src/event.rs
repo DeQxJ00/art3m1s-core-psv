@@ -580,6 +580,8 @@ pub enum Event {
         width: Option<u32>,
         height: Option<u32>,
     },
+    /// Export the selected image surface [lysave].
+    SaveLayerImage { id: String, file: String },
 
     // ── 脚本/宏 ──────────────────────────────────────
     /// 右键单击脚本 [rclick]

@@ -390,6 +390,25 @@ impl Compositor {
         lyedit::process_pending(&self.scene, &mut queue, provider);
     }
 
+    /// Read the native-size surface, including preceding pixel edits.
+    pub(crate) fn with_layer_pixels<T>(
+        &self,
+        id: &str,
+        provider: &mut dyn TextureProvider,
+        use_pixels: impl FnOnce(u32, u32, &[u8]) -> T,
+    ) -> Option<T> {
+        let id = self.resolve_layer_target(id)?;
+        let file = self.scene.get(&id)?.file.as_deref().filter(|file| !file.is_empty())?;
+        self.process_layer_edits(provider);
+
+        let edits = self.layer_edits.borrow();
+        if let Some(edit) = edits.states.get(&id).filter(|edit| edit.base_file == file) {
+            return Some(use_pixels(edit.width, edit.height, &edit.pixels));
+        }
+        let (width, height, pixels) = provider.pixels_of(file)?;
+        Some(use_pixels(width, height, &pixels))
+    }
+
     /// 当前有效的"图层 ID → lyedit 加工后纹理名"重定向表（帧构建用）。
     pub(crate) fn layer_edit_overrides(&self) -> HashMap<String, String> {
         self.layer_edits.borrow().valid_overrides(&self.scene)
@@ -2131,6 +2150,24 @@ mod tests {
             value: "fgmask".into(),
         }));
         assert_eq!(c.scene().get("1").unwrap().mask.as_deref(), Some("fgmask"));
+    }
+
+    #[test]
+    fn layer_pixels_include_pending_edits_and_exclude_stage_transform() {
+        let mut compositor = Compositor::new();
+        let mut provider = MockProvider::new();
+        provider.put_pixels("base", 1, 1, vec![10, 20, 30, 255]);
+        compositor.apply_event(&create("image", "base"));
+        compositor.apply_event(&Event::Layer(LayerEvent::SetProperty {
+            id: "image".into(), property: "width".into(), value: "99".into(),
+        }));
+        compositor.apply_event(&Event::LayerEdit {
+            id: "image".into(), mode: "negative".into(), color: None,
+            file: None, left: None, top: None,
+        });
+        assert_eq!(compositor.with_layer_pixels("image", &mut provider, |w, h, rgba| {
+            (w, h, rgba.to_vec())
+        }), Some((1, 1, vec![245, 235, 225, 255])));
     }
 
     #[test]

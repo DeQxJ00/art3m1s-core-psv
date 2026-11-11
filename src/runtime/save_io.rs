@@ -612,6 +612,18 @@ impl CoreRuntime {
         Ok(())
     }
 
+    pub(super) fn handle_save_layer_image(&mut self, id: &str, file: &str) -> Result<(), String> {
+        let name = normalize_relative_path(file).ok_or_else(|| format!("invalid layer image path: {file}"))?;
+        let name = if std::path::Path::new(&name).extension().is_some() { name } else { format!("{name}.png") };
+        let path = self.save_path_for(&name)?;
+        let png = self.compositor.with_layer_pixels(id, &mut self.texture_provider, |width, height, rgba| {
+            encode_png_rgba(rgba, width, height)
+        }).ok_or_else(|| format!("layer {id} has no readable image surface"))??;
+        crate::ffi::request_write(&path, &png)?;
+        self.invalidate_saved_image(&path);
+        Ok(())
+    }
+
     fn screenshot_paths_for(&self, file: &str) -> Result<(String, String), String> {
         let name =
             normalize_relative_path(file).ok_or_else(|| format!("非法缩略图路径: {file}"))?;
