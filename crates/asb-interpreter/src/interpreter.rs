@@ -868,6 +868,8 @@ impl Interpreter {
         ctx.script_stack.clear();
         ctx.scenario_text_source = None;
         ctx.pending_stack_override = None;
+        ctx.debug_skip_target = None;
+        ctx.debug_skip_pending_rewind = false;
         ctx.wait_reason_info = None;
     }
 
@@ -1337,6 +1339,7 @@ impl Interpreter {
                     self.arrived_by_jump = true;
                     self.prune_queued_wait_checkpoints_for_jump();
                     self.current_line = line;
+                    self.arm_debug_skip_after_rewind();
                     // 继续抽干剩余标签而非立即返回——排在 jump 之后的 calllua
                     // 等函数调用仍有效（典型：fn.push 的 jump 和按钮点击 handler
                     // 先后入队，jump 先于 handler 被抽到，若此时 return 则 handler
@@ -1347,6 +1350,7 @@ impl Interpreter {
                     self.last_flush_saw_jump = true;
                     self.prune_queued_wait_checkpoints_for_jump();
                     self.jump_to_external_script(&file, &label)?;
+                    self.arm_debug_skip_after_rewind();
                     continue;
                 }
                 TagResult::Call {
@@ -1411,6 +1415,7 @@ impl Interpreter {
                             .ok_or_else(|| Error::LabelNotFound(label.clone()))?;
                         self.current_line = line;
                     }
+                    self.arm_debug_skip_after_rewind();
                     // `e:tag(call)` 的后续 e:tag 命令是这个新帧的
                     // reservedCommands，必须先在该帧内抽干；典型写法是
                     // call dummy ... return，用来给一组同步命令建立临时帧。
@@ -1992,6 +1997,14 @@ impl Interpreter {
                 tag: instruction.tag.clone(),
                 params: instruction.params.clone(),
             }))
+        }
+    }
+
+    fn arm_debug_skip_after_rewind(&self) {
+        let mut ctx = self.engine_ctx.lock().unwrap();
+        if ctx.debug_skip_pending_rewind && ctx.debug_skip_target.as_ref()
+            .is_some_and(|(file, _)| self.current_script.as_ref() == Some(file)) {
+            ctx.debug_skip_pending_rewind = false;
         }
     }
 

@@ -435,6 +435,10 @@ pub struct EngineContext {
     /// `e:setScriptStack` 请求的调用栈强制重写（与 `script_stack` 同构），
     /// 解释器在下一轮抽干标签队列前应用并清除。
     pub pending_stack_override: Option<Vec<(String, usize)>>,
+    /// Destination for indexed replay; consumed at the matching dialogue wait.
+    pub debug_skip_target: Option<(String, usize)>,
+    /// The queued rewind must execute before the current PC can satisfy the target.
+    pub debug_skip_pending_rewind: bool,
     /// 已加载脚本的共享只读视图（脚本名 → Script），供 e:getScriptBlock 按
     /// `{file, index}` 查询指令块。与解释器共享同一份 `Arc<Script>`，无内存翻倍。
     pub scripts_view: HashMap<String, Arc<crate::script::Script>>,
@@ -499,6 +503,8 @@ impl EngineContext {
             script_stack: Vec::new(),
             scenario_text_source: None,
             pending_stack_override: None,
+            debug_skip_target: None,
+            debug_skip_pending_rewind: false,
             scripts_view: HashMap::new(),
             wait_reason_info: None,
         }
@@ -1472,7 +1478,14 @@ impl UserData for EngineApi {
         // e:debugSkip{index=...}
         methods.add_method("debugSkip", |_lua, this, t: mlua::Table| {
             let index: i64 = t.get("index").unwrap_or(0);
-            let ctx = this.ctx.lock().unwrap();
+            let mut ctx = this.ctx.lock().unwrap();
+            let queued_file = ctx.tag_queue.iter().rev()
+                .find(|(tag, params)| matches!(tag.as_str(), "jump" | "call") && params.contains_key("file"))
+                .and_then(|(_, params)| params.get("file").cloned());
+            ctx.debug_skip_pending_rewind = queued_file.is_some() && index > 0;
+            let file = queued_file
+                .or_else(|| ctx.script_stack.last().map(|(file, _)| file.clone()));
+            ctx.debug_skip_target = file.filter(|_| index > 0).map(|file| (file, index as usize));
             ctx.callbacks.debug_skip(index);
             Ok(())
         });

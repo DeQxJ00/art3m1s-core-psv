@@ -219,6 +219,21 @@ impl CoreRuntime {
         &mut self,
         profile: &mut crate::profiler::FrameProfile,
     ) -> Option<RenderRegion> {
+        let region = self.render_replay_frame(profile);
+        // Complete captures and transitions, but never present replay scenes.
+        if self.debug_skip_active.load(std::sync::atomic::Ordering::SeqCst) {
+            self.renderer.render(&DrawList::default());
+            self.last_rendered_scene = None;
+            self.last_submitted_frame = None;
+            return Some(RenderRegion::Full);
+        }
+        region
+    }
+
+    fn render_replay_frame(
+        &mut self,
+        profile: &mut crate::profiler::FrameProfile,
+    ) -> Option<RenderRegion> {
         // Preserve a complete scene while sibling movie layers await upload,
         // including commands not yet consumed by the host decoder queue.
         if self.waiting_for_video_first_frames() {

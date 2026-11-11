@@ -136,8 +136,14 @@ impl CoreRuntime {
                         WaitReason::Stop { .. } => {}
                         _ => {}
                     }
-                    self.wait_reason = Some(reason);
+                    self.wait_reason = Some(reason.clone());
                     self.reset_control_wait_flags();
+                    if debug_skip_checkpoint_wait(&reason)
+                        && self.debug_skip_active.load(Ordering::SeqCst)
+                        && take_reached_debug_target(&self.interpreter) {
+                        self.advance_exskip_stop(reason, profile);
+                        break;
+                    }
                     if self.batch_debug_wait(profile, &mut skip_batch_started, &mut skip_batch_waits) {
                         continue;
                     }
@@ -415,12 +421,24 @@ impl CoreRuntime {
         stop_reason: WaitReason,
         profile: &mut crate::profiler::FrameProfile,
     ) {
+        if self.interpreter.engine_context().lock().unwrap().debug_skip_pending_rewind {
+            self.advance_wait_line();
+            return;
+        }
         if !self.debug_skip_active.swap(false, Ordering::SeqCst) {
             crate::core_debug!("[runtime] Stop:exskip without active debugSkip; skipping stop");
             self.advance_wait_line();
             return;
         }
 
+        let target = {
+            let context = self.interpreter.engine_context();
+            let mut context = context.lock().unwrap();
+            context.debug_skip_pending_rewind = false;
+            context.debug_skip_target.take()
+        };
+        crate::core_info!("[debug-skip] checkpoint position={:?}:{} target={:?} reason={:?}",
+            self.interpreter.current_script(), self.interpreter.current_line(), target, stop_reason);
         crate::core_info!("[debug-skip] checkpoint; firing onDebugSkipOut");
         if let Err(e) = self.fire_named_event_handler("onDebugSkipOut") {
             crate::core_error!("onDebugSkipOut 错误: {e:?}");
@@ -755,6 +773,26 @@ pub(crate) fn wait_reason_is_input_wait(reason: Option<&WaitReason>) -> bool {
     )
 }
 
+fn take_reached_debug_target(interpreter: &asb_interpreter::Interpreter) -> bool {
+    let context = interpreter.engine_context();
+    let mut context = context.lock().unwrap();
+    let reached = !context.debug_skip_pending_rewind && context.debug_skip_target.as_ref().is_some_and(|(file, index)|
+        interpreter.current_script() == Some(file.as_str()) && interpreter.current_line() >= *index);
+    if reached {
+        crate::core_info!("[debug-skip] indexed checkpoint position={:?}:{} target={:?}",
+            interpreter.current_script(), interpreter.current_line(), context.debug_skip_target);
+        context.debug_skip_target = None;
+    }
+    reached
+}
+
+fn debug_skip_checkpoint_wait(reason: &WaitReason) -> bool {
+    // Scripted history entries can use an unconditional zero-time wait even
+    // when normal dialogue waits are disabled during replay.
+    matches!(reason, WaitReason::Generic | WaitReason::Generic0
+        | WaitReason::Timed { milliseconds: 0, .. })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -765,6 +803,48 @@ mod tests {
     use asb_interpreter::event::WaitReason;
     use asb_interpreter::{CallFrame, CallbackResult, Event, ExecutionResult, InterpreterConfig};
     use std::collections::HashMap;
+
+    #[test]
+    fn indexed_replay_recognizes_zero_time_history_checkpoints() {
+        assert!(super::debug_skip_checkpoint_wait(&WaitReason::Timed {
+            milliseconds: 0, input: 1,
+        }));
+        assert!(!super::debug_skip_checkpoint_wait(&WaitReason::Timed {
+            milliseconds: 500, input: 1,
+        }));
+    }
+
+    #[test]
+    fn indexed_replay_does_not_stop_at_old_wait_before_queued_rewind() {
+        let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "*start\n[@]\n[@]\n[@]\n[@]").unwrap();
+        it.boot("story").unwrap();
+        it.restore_position("story", 4, vec![]).unwrap();
+        it.lua().load("__engine:tag{'jump',file='story',label='start'}; __engine:debugSkip{index=2}").exec().unwrap();
+        assert!(!super::take_reached_debug_target(&it), "old progress is not replay progress");
+        it.drain_queued_tags_only().unwrap();
+        assert!(!super::take_reached_debug_target(&it));
+        it.restore_position("story", 2, vec![]).unwrap();
+        assert!(super::take_reached_debug_target(&it));
+    }
+
+    #[test]
+    fn indexed_replay_uses_destination_and_consumes_only_its_wait() {
+        let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "[stop]\n[@]\n[@]\n[@]").unwrap();
+        it.load_script("menu", "[stop]\n[@]\n[@]\n[@]").unwrap();
+        it.boot("menu").unwrap();
+        it.lua().load("__engine:tag{'jump',file='story'}; __engine:debugSkip{index=2}").exec().unwrap();
+        assert_eq!(it.engine_context().lock().unwrap().debug_skip_target, Some(("story".into(),2)));
+        it.drain_queued_tags_only().unwrap();
+        it.restore_position("menu",3,vec![]).unwrap();
+        assert!(!super::take_reached_debug_target(&it));
+        it.restore_position("story",1,vec![]).unwrap();
+        assert!(!super::take_reached_debug_target(&it));
+        it.restore_position("story",2,vec![]).unwrap();
+        assert!(super::take_reached_debug_target(&it));
+        assert!(!super::take_reached_debug_target(&it));
+    }
 
     #[test]
     fn message_layer_queries_observe_switch_and_conditional_pop_before_dialogue() {
