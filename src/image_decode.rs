@@ -192,6 +192,23 @@ mod tests {
         let decoder=image::ImageReader::new(std::io::Cursor::new(&jpeg)).with_guessed_format().unwrap().into_decoder().unwrap();
         assert_eq!(rgba(decoder,8192).unwrap(),image::load_from_memory(&jpeg).unwrap().into_rgba8());
     }
+
+    #[test]
+    fn baseline_jpeg_separate_scans_match_interleaved_pixels() {
+        // Synthetic 4:2:0 image with gray and colored gradients. jpegtran
+        // changes only the scan layout, leaving the DCT coefficients intact.
+        let separate = include_bytes!("image_decode_testdata/jpeg-baseline-separate-scans.jpg");
+        let interleaved = include_bytes!("image_decode_testdata/jpeg-baseline-interleaved.jpg");
+        let decode = |bytes: &[u8]| {
+            let decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format().unwrap().into_decoder().unwrap();
+            rgba(decoder, 64 * 48 * 4).unwrap()
+        };
+        let actual = decode(separate);
+        let expected = decode(interleaved);
+        let differing_pixels = actual.pixels().zip(expected.pixels()).filter(|(a, b)| a != b).count();
+        assert_eq!(differing_pixels, 0, "scan layout changed decoded RGB values");
+    }
     #[test]
     fn pal8_expands_every_index_and_partial_trns_defaults_to_opaque() {
         let alpha=[0,1,127,128,254,255,17,32,64,96,160,192,224,240,250,253,0];

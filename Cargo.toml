@@ -73,3 +73,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 
 [patch.crates-io]
 lua-src = { path = "vendor/lua-src" }
+# Use the upstream baseline JPEG multi-scan fix until it is in a stable release.
+# image and zune-jpeg must use the same zune-core types.
+zune-core = { git = "https://github.com/etemesi254/zune-image.git", rev = "0346b875169ed528e206441c97899d99002e17ca" }
+zune-jpeg = { git = "https://github.com/etemesi254/zune-image.git", rev = "0346b875169ed528e206441c97899d99002e17ca" }
