@@ -1625,6 +1625,16 @@ impl UserData for EngineApi {
             Ok(())
         });
 
+        methods.add_method("initNis", |_lua, this, arg: mlua::Value| {
+            let callbacks = &this.ctx.lock().unwrap().callbacks;
+            if matches!(arg, mlua::Value::Integer(_) | mlua::Value::Number(_)) {
+                callbacks.debug(2, "initNis is unavailable on this platform", false);
+            } else {
+                callbacks.debug(1, "initNis received an invalid argument", false);
+            }
+            Ok(mlua::Value::Nil)
+        });
+
         // e:callShellExecute{file=..., ...} -> number
         // 文档：以阻塞方式运行时返回被执行程序的返回值，非阻塞时返回值不确定。
         methods.add_method("callShellExecute", |_lua, this, t: mlua::Table| {
@@ -2123,6 +2133,17 @@ mod tests {
         init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
         lua.load("assert(select('#', __engine:setUseGlobalCapture(true)) == 0)").exec().unwrap();
         assert!(logs.lock().unwrap()[0].contains("setUseGlobalCapture"));
+    }
+
+    #[test]
+    fn lua_nis_uses_platform_fallback() {
+        let lua = Lua::new();
+        let probe = EmoteProbe::default();
+        let logs = probe.logs.clone();
+        let ctx = EngineContext::new(Box::new(probe));
+        init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
+        lua.load("assert(__engine:initNis(0.5) == nil)").exec().unwrap();
+        assert!(logs.lock().unwrap()[0].contains("initNis"));
     }
 
     #[test]
