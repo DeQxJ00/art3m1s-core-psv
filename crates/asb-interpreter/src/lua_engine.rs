@@ -1610,6 +1610,11 @@ impl UserData for EngineApi {
             lua.create_string(&converted)
         });
 
+        methods.add_method("getWindowHandle", |_lua, this, ()| {
+            this.ctx.lock().unwrap().callbacks.debug(2, "getWindowHandle is unavailable on this platform", false);
+            Ok(mlua::Value::Nil)
+        });
+
         // e:callShellExecute{file=..., ...} -> number
         // 文档：以阻塞方式运行时返回被执行程序的返回值，非阻塞时返回值不确定。
         methods.add_method("callShellExecute", |_lua, this, t: mlua::Table| {
@@ -2086,6 +2091,17 @@ mod tests {
         assert_eq!(logs.len(), 2);
         assert!(logs[0].contains("[include:missing] missing.lua"));
         assert!(logs[1].contains("[include:missing] missing-script.lua"));
+    }
+
+    #[test]
+    fn lua_window_handle_uses_platform_fallback() {
+        let lua = Lua::new();
+        let probe = EmoteProbe::default();
+        let logs = probe.logs.clone();
+        let ctx = EngineContext::new(Box::new(probe));
+        init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
+        lua.load("assert(__engine:getWindowHandle() == nil)").exec().unwrap();
+        assert!(logs.lock().unwrap()[0].contains("getWindowHandle"));
     }
 
     #[test]
