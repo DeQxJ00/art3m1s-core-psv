@@ -135,6 +135,7 @@ impl CoreRuntime {
                 magic_paths: Arc::clone(&self.magic_paths),
                 layer_info: Arc::clone(&self.layer_info),
                 png_comments: self.png_comments.clone(),
+                savepath: super::save_io::sanitize_savepath(self.project_savepath.as_deref()),
                 volumes: Arc::clone(&self.volumes),
                 debug_skip_active: Arc::clone(&self.debug_skip_active),
                 script_status: Arc::clone(&self.script_status),

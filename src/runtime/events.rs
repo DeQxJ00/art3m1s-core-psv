@@ -1198,7 +1198,8 @@ impl CoreRuntime {
                             .unwrap_or(false)
                     } else {
                         let resolved = super::magic_path::resolve_path(&magic_for_exists, file);
-                        crate::ffi::query_asset_size(&resolved).is_some()
+                        super::callbacks::script_resource_exists(&resolved, &savepath_for_exists,
+                            |p| crate::ffi::query_asset_size(p).is_some())
                     }
                 }),
                 file_crc32: Box::new(move |file| {

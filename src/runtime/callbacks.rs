@@ -11,6 +11,20 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use super::magic_path;
 use crate::ffi;
 
+fn is_save_resource(path: &str, savepath: &str) -> bool {
+    let mut parts = path.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".");
+    savepath.split('/').all(|expected| parts.next().is_some_and(|part| part.eq_ignore_ascii_case(expected)))
+        && parts.next().is_some()
+}
+
+pub(super) fn script_resource_exists(path: &str, savepath: &str, mut exists: impl FnMut(&str) -> bool) -> bool {
+    // A script may gate a texture load on the original filename. Keep exact
+    // matches first and share the renderer's native replacements for that name.
+    exists(path) || (crate::native_texture::file_image_reference(path)
+        && !is_save_resource(path, savepath)
+        && crate::native_texture::replacement_paths(path).any(|candidate| exists(&candidate)))
+}
+
 pub(super) type LayerInfoTable =
     std::sync::Arc<std::sync::Mutex<super::layer_info::LayerQueryState>>;
 
@@ -20,6 +34,7 @@ pub(super) struct FfiCallbacks {
     pub magic_paths: std::sync::Arc<magic_path::MagicPathTable>,
     pub layer_info: LayerInfoTable,
     pub png_comments: super::png_comments::SharedComments,
+    pub savepath: String,
     pub volumes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f32>>>,
     pub debug_skip_active: Arc<AtomicBool>,
     pub script_status: Arc<AtomicU8>,
@@ -448,7 +463,7 @@ impl EngineCallbacks for FfiCallbacks {
 
     fn is_file_exists(&self, path: &str) -> bool {
         let resolved = magic_path::resolve_path(&self.magic_paths, path);
-        ffi::query_asset_size(&resolved).is_some()
+        script_resource_exists(&resolved, &self.savepath, |p| ffi::query_asset_size(p).is_some())
     }
 
     fn file_write(&self, path: &str, data: &[u8]) -> asb_interpreter::Result<()> {
@@ -721,7 +736,18 @@ impl EngineCallbacks for FfiCallbacks {
             return (!value.is_empty()).then_some(value);
         }
         let started = std::time::Instant::now();
-        let size = ffi::query_asset_size(&resolved)?;
+        let Some(size) = ffi::query_asset_size(&resolved) else {
+            if is_save_resource(&resolved, &self.savepath) {
+                return None;
+            }
+            // Older converted scripts check isFileExists(.png) before reading
+            // comments. A DDS alias must still expose their coordinate CSV.
+            let comments = super::png_comments::read_converted_comments(
+                &resolved, ffi::query_asset_size, |p, len| ffi::request_asset_range(p, 0, len),
+            )?;
+            self.png_comments.lock().unwrap().insert(resolved, comments.clone());
+            return Some(comments);
+        };
         let mut bytes_read = 0usize;
         let comments = super::png_comments::read_buffered_comments(size, |offset, len| {
             let bytes = ffi::request_asset_range(&resolved, offset, len)?;
@@ -1262,6 +1288,7 @@ mod tests {
             magic_paths: Arc::clone(&magic_paths),
             layer_info: Arc::new(std::sync::Mutex::new(Default::default())),
             png_comments: Default::default(),
+            savepath: "save".into(),
             volumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             debug_skip_active: Arc::new(AtomicBool::new(false)),
             script_status: Arc::new(AtomicU8::new(0)),
@@ -1300,6 +1327,7 @@ mod tests {
                 as Arc<magic_path::MagicPathTable>,
             layer_info: Arc::new(std::sync::Mutex::new(Default::default())),
             png_comments: Default::default(),
+            savepath: "save".into(),
             volumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             debug_skip_active: Arc::new(AtomicBool::new(false)),
             script_status: Arc::new(AtomicU8::new(0)),
@@ -1360,6 +1388,25 @@ mod tests {
         // Invalid C path guarantees no host I/O; even failed writes invalidate.
         let _=callbacks.file_write("bad\0path",b"changed");
         assert!(callbacks.png_comments.lock().unwrap().get("image/fg/test.png").is_none());
+    }
+
+    #[test]
+    fn script_existence_checks_accept_only_game_texture_replacements() {
+        let mut queried = Vec::new();
+        let mut exists = |path: &str| {
+            queried.push(path.to_owned());
+            matches!(path, "fg/body.png" | "fg/eye.dds" | "fg/mouth.pvr" | "save/slot.dds")
+        };
+
+        assert!(super::script_resource_exists("fg/body.png", "save", &mut exists));
+        assert!(super::script_resource_exists("fg/eye.PNG", "save", &mut exists));
+        assert!(super::script_resource_exists("fg/mouth.jpeg", "save", &mut exists));
+        assert!(!super::script_resource_exists("fg/eye.csv", "save", &mut exists));
+        assert!(!super::script_resource_exists(r"save\slot.png", "save", &mut exists));
+        assert_eq!(queried, [
+            "fg/body.png", "fg/eye.PNG", "fg/eye.dds", "fg/mouth.jpeg",
+            "fg/mouth.dds", "fg/mouth.pvr", "fg/eye.csv", r"save\slot.png",
+        ]);
     }
     #[test]
     fn png_comment_callback_consumes_worker_preparation_without_host_io(){

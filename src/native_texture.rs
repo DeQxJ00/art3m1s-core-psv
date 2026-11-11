@@ -149,11 +149,22 @@ pub(crate) fn file_image_reference(path:&str)->bool {
     }
 }
 
+pub(crate) fn legacy_image_stem(path: &str) -> Option<&str> {
+    let (stem, ext) = path.rsplit_once('.')?;
+    (!stem.is_empty() && ["png", "jpg", "jpeg"].iter().any(|e| ext.eq_ignore_ascii_case(e)))
+        .then_some(stem)
+}
+
+pub(crate) fn replacement_paths(path: &str) -> impl Iterator<Item = String> + '_ {
+    legacy_image_stem(path).into_iter().flat_map(|stem| {
+        [".dds", ".pvr"].into_iter().map(move |suffix| format!("{stem}{suffix}"))
+    })
+}
+
 pub(crate) fn candidates(path:&str)->impl Iterator<Item=std::borrow::Cow<'_,str>>{
     use std::borrow::Cow;
-    let stem=path.rsplit_once('.').filter(|(_,ext)|["png","jpg","jpeg"].iter().any(|e|ext.eq_ignore_ascii_case(e))).map(|(stem,_)|stem);
     SUFFIXES.into_iter().map(move |s|if s.is_empty(){Cow::Borrowed(path)}else{Cow::Owned(format!("{path}{s}"))})
-        .chain(stem.into_iter().flat_map(|s|[Cow::Owned(format!("{s}.dds")),Cow::Owned(format!("{s}.pvr"))]))
+        .chain(replacement_paths(path).map(Cow::Owned))
 }
 
 // Script size queries use bounded header reads, independently of payload

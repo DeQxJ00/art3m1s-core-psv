@@ -229,6 +229,7 @@ mod tests {
             magic_paths: Default::default(),
             layer_info: Arc::clone(&state),
             png_comments: Default::default(),
+            savepath: "save".into(),
             volumes: Default::default(),
             debug_skip_active: Default::default(),
             script_status: Default::default(),

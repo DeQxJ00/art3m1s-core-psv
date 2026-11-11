@@ -6,6 +6,40 @@ type Comments=HashMap<String,String>;
 pub(super) type SharedComments=Arc<Mutex<CommentCache>>;
 const LIMIT:usize=1024*1024;
 const MAX_ENTRIES:usize=1024;
+
+pub(super) fn read_converted_comments(
+    path: &str,
+    mut query: impl FnMut(&str) -> Option<u64>,
+    mut read: impl FnMut(&str, usize) -> Option<Vec<u8>>,
+) -> Option<Comments> {
+    let (stem, ext) = path.rsplit_once('.')?;
+    if !ext.eq_ignore_ascii_case("png") {
+        return None;
+    }
+    query(&format!("{stem}.dds"))?;
+    let csv = format!("{stem}.csv");
+    let len = usize::try_from(query(&csv)?).ok().filter(|&len| len <= LIMIT)?;
+    let bytes = read(&csv, len)?;
+    if bytes.len() != len || !bytes.is_ascii() {
+        return None;
+    }
+    let rows = std::str::from_utf8(&bytes).ok()?
+        .strip_prefix("art3m1s_png_coordinates_v1\n")?.strip_suffix('\n')?;
+    let mut comments = HashMap::new();
+    for row in rows.split('\n') {
+        let (key, value) = row.split_once(',')?;
+        let mut chars = key.bytes();
+        let first = chars.next()?;
+        if !(first.is_ascii_alphabetic() || first == b'_')
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            || value.is_empty() || value.bytes().any(|c| c.is_ascii_control())
+            || comments.insert(key.to_owned(), value.to_owned()).is_some()
+        {
+            return None;
+        }
+    }
+    Some(comments)
+}
 #[derive(Default)]
 pub(super) struct CommentCache {
     entries: VecDeque<(String,Comments,usize,bool)>,
@@ -127,6 +161,22 @@ pub(super) fn read_comments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn converted_texture_comments_require_a_dds_and_a_valid_coordinate_sidecar() {
+        let csv = b"art3m1s_png_coordinates_v1\nComment,pos,-12,34\noffset,4,8\n";
+        let query = |p: &str| match p {
+            "fg/eyes.dds" => Some(128),
+            "fg/eyes.csv" | "fg/loose.csv" => Some(csv.len() as u64),
+            _ => None,
+        };
+        let read = |path: &str, len| {
+            assert_eq!((path, len), ("fg/eyes.csv", csv.len()));
+            Some(csv.to_vec())
+        };
+        assert_eq!(read_converted_comments("fg/eyes.PNG", query, read).unwrap()["Comment"], "pos,-12,34");
+        assert!(read_converted_comments("fg/loose.png", query, read).is_none());
+        assert!(read_converted_comments("fg/eyes.png", query, |_, _| Some(vec![b'x'; csv.len()])).is_none());
+    }
     #[test] fn prepared_metadata_matches_foreground_parser_without_reading_idat(){
         let mut bytes=b"\x89PNG\r\n\x1a\n".to_vec();
         chunk(&mut bytes,b"tEXt",b"position\0old");
