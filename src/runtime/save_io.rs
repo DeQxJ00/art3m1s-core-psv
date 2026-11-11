@@ -365,6 +365,11 @@ impl CoreRuntime {
             self.apply_skip_config(Some(config.allow), Some(config.unread));
         }
         self.clear_scene_text();
+        // Seed saved definitions before onLoad. Commands from scene
+        // reconstruction can then replace them before the page is replayed.
+        if let Some(definitions) = data.message_text.as_mut().and_then(|text| text.text_tweens.take()) {
+            self.restore_saved_text_tweens(definitions);
+        }
         self.hovered_layers.clear();
         self.wait_reason = None;
         self.surface_timeline_cursor=Default::default();

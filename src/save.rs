@@ -201,8 +201,13 @@ pub struct MessageTextSnapshot {
     pub input_handlers: Option<Vec<(String, String, crate::compositor::reduce::InputHandler)>>,
     #[serde(default)]
     pub history: Option<HistorySnapshot>,
-
+    /// Absent in legacy files, which retain the definitions built by the script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_tweens: Option<TextTweenDefinitions>,
 }
+
+pub type TextTweenDefinitions =
+    std::collections::BTreeMap<String, Vec<crate::text::ScetweenConfig>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistorySnapshot {
@@ -905,6 +910,7 @@ mod tests {
             layers: vec![MessageLayerTextSnapshot { id: "dialogue".into(), page_font: Default::default(),
                 layered: Some(true), text_hidden: Some(true),
                 tags: vec![crate::text::BacklogTag::IndentModify(1), crate::text::BacklogTag::Text("Restored text".into())] }],
+            text_tweens: None,
         });
         let mut json = serde_json::to_value(&data).unwrap();
         let restored: SaveData = serde_json::from_value(json.clone()).unwrap();

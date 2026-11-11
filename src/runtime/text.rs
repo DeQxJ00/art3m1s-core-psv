@@ -891,12 +891,22 @@ impl CoreRuntime {
             layer_stack: Some(state.layer_stack.clone()),
             layers,
             input_handlers: Some(self.compositor.input_snapshot()),
+            text_tweens: include_history.then(|| state.layers.iter()
+                .filter(|(_, layer)| !layer.scetween.is_empty())
+                .map(|(id, layer)| (id.clone(), layer.scetween.iter().map(ScetweenConfig::definition).collect()))
+                .collect()),
             history: include_history.then(|| crate::save::HistorySnapshot {
                 pages: state.backlog.snapshot_pages().map(|page| page.as_ref().clone()).collect(),
                 settings: state.backlog.settings.clone(), write_mode: state.backlog.write_mode,
                 max_pages: state.backlog.max_pages,
             }),
         })
+    }
+
+    pub(super) fn restore_saved_text_tweens(&mut self, definitions: crate::save::TextTweenDefinitions) {
+        if let Some(renderer) = self.text_renderer.as_mut() {
+            replace_text_tweens(renderer.font_state_mut(), definitions);
+        }
     }
 
     pub(super) fn restore_pending_message_text(&mut self) {
@@ -1117,6 +1127,20 @@ impl CoreRuntime {
     }
 }
 
+fn replace_text_tweens(
+    state: &mut crate::text::render::FontState,
+    mut definitions: crate::save::TextTweenDefinitions,
+) {
+    for (id, layer) in &mut state.layers {
+        layer.scetween = definitions.remove(id).unwrap_or_default();
+    }
+    for (id, tweens) in definitions {
+        let mut layer = crate::text::render::MessageLayer::new(id.clone());
+        layer.scetween = tweens;
+        state.layers.insert(id, layer);
+    }
+}
+
 /// 覆盖字体在 renderer 字体缓存里使用的逻辑 face 名。`:` 前缀与内部保留纹理
 /// 同约定，不会与脚本 face（游戏内相对路径）冲突。
 pub(super) const HOST_FONT_OVERRIDE_FACE: &str = ":host/font-override";
@@ -1169,6 +1193,40 @@ pub(super) fn font_fallback_candidates(face: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn saved_text_tweens_replace_definitions_without_replaying_glyph_order() {
+        use crate::save::MessageTextSnapshot;
+        use crate::text::{ScetweenConfig, ScetweenMode};
+        use crate::text::render::{FontState, MessageLayer};
+
+        let tween = ScetweenConfig {
+            mode: ScetweenMode::Hide,
+            param: Some("entirealpha".into()),
+            diff: Some(-255.0),
+            time_per_char: 140,
+            random_delay: true,
+            random_order: Some(vec![1, 0]),
+            ..Default::default()
+        };
+        let definition = tween.definition();
+        assert!(definition.random_order.is_none());
+        let snapshot = MessageTextSnapshot {
+            text_tweens: Some([("dialogue".into(), vec![definition.clone()])].into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("random_order"));
+        let restored: MessageTextSnapshot = serde_json::from_str(&json).unwrap();
+        let mut state = FontState::new();
+        let mut stale = MessageLayer::new("menu".into());
+        stale.scetween.push(tween);
+        state.layers.insert(stale.id.clone(), stale);
+        super::replace_text_tweens(&mut state, restored.text_tweens.unwrap());
+        assert_eq!(state.layers["dialogue"].scetween, vec![definition]);
+        assert!(state.layers["menu"].scetween.is_empty());
+        assert!(serde_json::from_str::<MessageTextSnapshot>("{}").unwrap().text_tweens.is_none());
+    }
+
     #[test]
     fn reselecting_message_preserves_layer_mode_unless_explicitly_changed() {
         let mut renderer = crate::text::GlyphTextRenderer::new();

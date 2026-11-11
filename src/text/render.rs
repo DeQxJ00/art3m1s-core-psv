@@ -5,6 +5,7 @@
 use crate::compositor::anim::Easing;
 use crate::render_pipeline::draw::{DrawCommand, TextureProvider};
 use crate::text::backlog::{Backlog, BacklogTag};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -740,7 +741,7 @@ impl MessageLayer {
 // ---------------------------------------------------------------------------
 
 /// 逐字显示动画模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScetweenMode {
     /// 出现（文本逐字出现）
     In,
@@ -787,7 +788,7 @@ impl ScetweenMode {
 /// 逐字显示的动画参数配置。
 ///
 /// 对应 Artemis 的 `scetween` 标签，控制每个字符出现/消失时的缓动效果。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScetweenConfig {
     /// 动画模式
     pub mode: ScetweenMode,
@@ -806,6 +807,7 @@ pub struct ScetweenConfig {
     /// 是否随机顺序显示
     pub random_delay: bool,
     /// 随机显示时使用的字符顺序
+    #[serde(skip)]
     pub random_order: Option<Vec<usize>>,
 }
 
@@ -826,6 +828,24 @@ impl Default for ScetweenConfig {
 }
 
 impl ScetweenConfig {
+    pub(crate) fn definition(&self) -> Self {
+        let Self {
+            mode, set_mode, param, ease, diff, delay_per_char, time_per_char,
+            random_delay, random_order: _,
+        } = self;
+        Self {
+            mode: *mode,
+            set_mode: *set_mode,
+            param: param.clone(),
+            ease: *ease,
+            diff: *diff,
+            delay_per_char: *delay_per_char,
+            time_per_char: *time_per_char,
+            random_delay: *random_delay,
+            random_order: None,
+        }
+    }
+
     /// 从 `TextAnimation` 事件参数构建逐字动画配置。
     pub fn from_params(params: &HashMap<String, String>) -> Self {
         let mode = params
@@ -865,7 +885,7 @@ impl ScetweenConfig {
 }
 
 /// Scetween 设置模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScetweenSetMode {
     /// 替换指定 type 的动画设置
     Init,
