@@ -123,7 +123,10 @@ impl CoreRuntime {
                 data = data.with_gameplay_checkpoint(checkpoint, &save_writes);
             }
         }
-        if let Some(snapshot) = &self.save_screenshot {
+        if data.scene.is_some() {
+            // A gameplay checkpoint owns its scene; a menu screenshot may be
+            // absent or stale and must not replace it with the live menu.
+        } else if let Some(snapshot) = &self.save_screenshot {
             data = data.with_scene(snapshot.scene.clone());
             if let Some(message_text) = snapshot.message_text.clone() {
                 data = data.with_message_text(message_text);
@@ -297,6 +300,8 @@ impl CoreRuntime {
             return;
         }
         self.gameplay_save_checkpoint = Some(crate::save::GameplayCheckpoint {
+            scene: self.compositor.scene_snapshot(),
+            message_text: self.capture_message_text_snapshot(),
             skip_config: self.capture_skip_config(),
             input_handlers: self.compositor.input_snapshot(),
             script: script.to_string(),
@@ -388,6 +393,11 @@ impl CoreRuntime {
         }
         self.sync_layer_info_all();
         self.interpreter.append_queued_tags(deferred);
+        if waiting {
+            let resumed = resume_legacy_checkpoint_ui(&mut self.interpreter, &self.compositor.scene_snapshot())
+                .map_err(|e| format!("恢复剧情输入失败: {e}"))?;
+            crate::core_info!("[runtime] checkpoint UI completion queued={}", resumed);
+        }
         self.reload_persistent_lua_tables()
             .map_err(|e| format!("恢复当前系统存档索引失败: {e}"))?;
         self.apply_system_audio_volume();
@@ -621,6 +631,65 @@ fn take_loaded_skip_config(text: &mut Option<crate::save::MessageTextSnapshot>) 
     text.as_mut().and_then(|text| text.skip_config.take())
 }
 
+// A gameplay checkpoint bypasses the saved menu's return continuation. Older
+// scripts serialize that menu's input level in lua.scr and expect their normal
+// load completion to rebind dialogue controls. Preserve the native completion
+// step: it also clears transient title state when loading from the title menu.
+fn resume_legacy_checkpoint_ui(interpreter: &mut asb_interpreter::Interpreter, scene: &crate::compositor::Scene) -> Result<bool, String> {
+    let has_menu = scene.iter_ids().iter().any(|id| id == "500" || id.starts_with("500.") || id == "600" || id.starts_with("600."));
+    let (resumed, needs_frames): (bool, Option<bool>) = interpreter.lua().load(r#"
+        -- Some script generations serialize the save UI but resume at the
+        -- gameplay checkpoint. Run their load completion, including text and
+        -- input restoration, rather than leaving the serialized UI active.
+        if not ... and type(scr)=='table' and not scr.select
+            and type(scr.ip)=='table' and type(scr.ip.file)=='string'
+            and type(scr.ip.block)=='number' and type(scr.ip.save)=='table'
+            and scr.savecom==nil and scr.uifunc==nil
+            and type(load_exec)=='function' and type(restoreNext)=='function'
+            and type(restoreText)=='function' and type(delonpush_ui)=='function' then
+            delonpush_ui()
+            __engine:tag{'calllua',['function']='restoreNext'}
+            __engine:tag{'calllua',['function']='restoreText'}
+            return true
+        end
+        if ... and type(scr)=='table' and not scr.select
+            and type(scr.ip)=='table' and type(scr.ip.file)=='string'
+            and type(scr.ip.block)=='number' and type(scr.ip.save)=='table'
+            and (scr.savecom=='save' or scr.savecom=='load')
+            and scr.uifunc==scr.savecom and type(btn)=='table'
+            and btn.name==scr.savecom and type(btn[btn.name])=='table'
+            and type(load_exec)=='function' and type(restoreNext)=='function'
+            and type(restoreText)=='function' then
+            load_exec(__engine, {})
+            return true, true
+        end
+        if type(scr) ~= 'table' or type(scr.adv) ~= 'table'
+            or scr.adv.level ~= 1 or scr.select
+            or type(adv) ~= 'table' or adv.func ~= nil
+            or type(return_to_game_common) ~= 'function'
+            or type(return_to_game_key) ~= 'function' then return false end
+        if type(load_exec) == 'function' then
+            load_exec(__engine, {})
+        elseif ... then
+            if type(return_to_game) ~= 'function' then return false end
+            return_to_game()
+        else
+            return_to_game_common()
+        end
+        return true
+    "#).call(has_menu).map_err(|e| e.to_string())?;
+    if needs_frames == Some(true) {
+        // load_exec first returns out of the saved menu and then jumps to
+        // its cleanup helper. Supply both frames when the saved PC is already
+        // the gameplay checkpoint, so the helper's return reaches that PC.
+        for _ in 0..2 {
+            interpreter.push_inline_event_frame().map_err(|e| e.to_string())?;
+        }
+        return Ok(true);
+    }
+    Ok(resumed)
+}
+
 fn prepare_loaded_wait(interpreter: &mut asb_interpreter::Interpreter, data: &crate::save::SaveData) -> bool {
     let waiting = data.waiting_for_input.unwrap_or_else(||saved_position_resumes_input_wait(interpreter));
     if waiting {
@@ -809,6 +878,110 @@ mod tests {
         saved_position_resumes_input_wait,
     };
     use asb_interpreter::{Interpreter, InterpreterConfig};
+
+    #[test]
+    fn checkpoint_without_menu_rebuilds_dialogue_and_releases_ui_input() {
+        let mut it=Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            scr={ip={file='scene',block=2,save={}}}; order=''
+            function load_exec() error('there is no menu to close') end
+            function delonpush_ui() order=order..'input;' end
+            function restoreNext() order=order..'window;' end
+            function restoreText() order=order..'text;' end
+        "#).exec().unwrap();
+        assert!(super::resume_legacy_checkpoint_ui(&mut it,&crate::compositor::Scene::new()).unwrap());
+        it.flush_pending_tags().unwrap();
+        assert_eq!(it.lua().globals().get::<String>("order").unwrap(),"input;window;text;");
+    }
+
+    #[test]
+    fn checkpoint_closes_serialized_save_menu_without_legacy_adv_level() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "*main\n[stop]\n").unwrap();
+        it.load_script("cleanup", "*main\n[var name=cleaned data=1]\n[return]\n").unwrap();
+        it.start("story", "main").unwrap();
+        it.lua().load(r#"
+            scr={adv={},ip={file='scene',block=25,save={}},savecom='save',uifunc='save'}
+            btn={name='save',save={id='500.',p={}}}; calls=0
+            function restoreNext() end
+            function restoreText() end
+            function load_exec(e,p)
+                calls=calls+1
+                e:tag{'return'}
+                e:tag{'jump',file='cleanup',label='main'}
+            end
+        "#).exec().unwrap();
+        let mut scene=crate::compositor::Scene::new();
+        scene.create("500.1",Some("menu".into()));
+        assert!(super::resume_legacy_checkpoint_ui(&mut it,&scene).unwrap());
+        assert_eq!(it.lua().globals().get::<i64>("calls").unwrap(),1);
+        it.flush_pending_tags().unwrap();
+        it.run().unwrap();
+        assert_eq!(it.current_script(),Some("story"));
+        assert!(it.call_stack().is_empty());
+        assert_eq!(it.get_variable("cleaned"),Some(asb_interpreter::Value::Int(1)));
+        for state in ["scr.select={}", "scr.select=nil;scr.ip=nil", "scr.ip={file='scene',block=25,save={}};scr.uifunc='config'"] {
+            it.lua().load(state).exec().unwrap();
+            assert!(!super::resume_legacy_checkpoint_ui(&mut it,&scene).unwrap());
+        }
+    }
+
+    #[test]
+    fn checkpoint_resumes_native_ui_return_only_for_absent_menu() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            scr={adv={level=1},vsync='game'}; adv={}; calls=0
+            function return_to_game_key() end
+            function return_to_game_common() calls=calls+1 end
+        "#).exec().unwrap();
+        let mut scene=crate::compositor::Scene::new();
+        assert!(super::resume_legacy_checkpoint_ui(&mut it,&scene).unwrap());
+        scene.create("500.1",Some("menu".into()));
+        assert!(!super::resume_legacy_checkpoint_ui(&mut it,&scene).unwrap());
+        let scene=crate::compositor::Scene::new();
+        for state in ["scr.select={}","scr.select=nil;adv.func='load'", "adv.func=nil;scr.adv.level=0"] {
+            it.lua().load(state).exec().unwrap();
+            assert!(!super::resume_legacy_checkpoint_ui(&mut it,&scene).unwrap());
+        }
+        assert_eq!(it.lua().globals().get::<i64>("calls").unwrap(),1);
+    }
+
+    #[test]
+    fn checkpoint_with_leftover_menu_uses_native_close_path() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            scr={adv={level=1}}; adv={}; closed=false
+            function return_to_game_key() end
+            function return_to_game_common() error('menu must be closed first') end
+            function return_to_game() closed=true; scr.adv.level=0; scr.adv.mode=true end
+        "#).exec().unwrap();
+        let mut scene=crate::compositor::Scene::new();
+        scene.create("500.10.1",Some("slot".into()));
+        assert!(super::resume_legacy_checkpoint_ui(&mut it,&scene).unwrap());
+        assert!(it.lua().globals().get::<bool>("closed").unwrap());
+    }
+
+    #[test]
+    fn checkpoint_loaded_from_title_runs_load_completion_before_return() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            scr={adv={level=1}}; adv={}; title={}; resumed=false
+            function return_to_game_key() end
+            function return_to_game_common() resumed=true end
+            function return_to_game()
+                if title then return end
+                return_to_game_common()
+            end
+            function load_exec(e, param)
+                title=nil
+                return_to_game()
+            end
+        "#).exec().unwrap();
+        let mut scene=crate::compositor::Scene::new();
+        scene.create("500.10.1",Some("slot".into()));
+        assert!(super::resume_legacy_checkpoint_ui(&mut it,&scene).unwrap());
+        assert!(it.lua().globals().get::<bool>("resumed").unwrap());
+    }
 
     #[test]
     fn load_wait_stays_on_story_when_immediate_callback_enters_rebuild_helper() {

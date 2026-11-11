@@ -234,6 +234,8 @@ pub struct CallFrameSnapshot {
 /// 嵌套出去的，编号存档改写回这个等待的 PC/栈/局部变量。
 #[derive(Debug, Clone)]
 pub struct GameplayCheckpoint {
+    pub scene: crate::compositor::Scene,
+    pub message_text: Option<MessageTextSnapshot>,
     pub skip_config: SkipConfigSnapshot,
     pub input_handlers: Vec<(String, String, crate::compositor::reduce::InputHandler)>,
     pub script: String,
@@ -365,6 +367,8 @@ impl SaveData {
     /// menu variables or depending on a script's serialization key names.
     pub fn with_gameplay_checkpoint(mut self, checkpoint: &GameplayCheckpoint,
         save_writes: &std::collections::HashMap<String, Option<asb_interpreter::Value>>) -> Self {
+        self.scene = Some(checkpoint.scene.clone());
+        self.message_text = checkpoint.message_text.clone();
         self.current_script.clone_from(&checkpoint.script);
         self.current_line = checkpoint.line;
         self.call_stack.clone_from(&checkpoint.call_stack);
@@ -551,6 +555,8 @@ mod tests {
         variables.set("sysbtn_mode", "set".into());
         variables.set("status", "adv".into());
         GameplayCheckpoint {
+            scene: crate::compositor::Scene::new(),
+            message_text: None,
             skip_config: SkipConfigSnapshot { allow: true, unread: false },
             input_handlers: Vec::new(),
             script: "macro.iet".into(),
@@ -613,6 +619,7 @@ mod tests {
         assert!(checkpoint.is_ancestor_of(&data.current_script, &data.call_stack));
         let data = data.with_gameplay_checkpoint(&checkpoint,
             &std::collections::HashMap::from([("memsave.size".into(), Some("1".into()))]));
+        assert!(data.scene.is_some(), "checkpoint must carry its gameplay scene independently of thumbnails");
         assert_eq!(data.current_script, "macro.iet");
         assert_eq!(data.current_line, 1626);
         assert_eq!(data.call_stack.len(), 2);

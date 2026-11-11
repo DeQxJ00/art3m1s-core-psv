@@ -363,24 +363,9 @@ impl CoreRuntime {
 
     pub(super) fn begin_inline_event_frame(&mut self) {
         self.refresh_inline_event_frame();
-        if self.active_inline_event_frame.is_some() {
-            return;
-        }
-        let Some(script) = self.interpreter.current_script().map(str::to_string) else {
-            return;
-        };
-        let line = self.interpreter.current_line();
-        let stack = self.interpreter.call_stack();
-        if let Err(error) = self.interpreter.push_inline_event_frame() {
+        if let Err(error) = push_input_event_frame(&mut self.interpreter, &mut self.active_inline_event_frame) {
             crate::core_error!("建立事件返回帧失败: {error:?}");
-            return;
         }
-        self.active_inline_event_frame = Some(InlineEventFrame {
-            script,
-            line,
-            stack,
-            claimed_by_jump: false,
-        });
     }
 
     pub(super) fn refresh_inline_event_frame(&mut self) {
@@ -388,7 +373,8 @@ impl CoreRuntime {
             return;
         };
         let stack = self.interpreter.call_stack();
-        if !inline_event_marker_is_active(frame, &stack) {
+        if !self.interpreter.is_inline_event_frame(frame.stack.len())
+            || !inline_event_marker_is_active(frame, &stack) {
             self.active_inline_event_frame = None;
         }
     }
@@ -593,6 +579,22 @@ fn pointer_hit_test_required(
         || button_edge
 }
 
+fn push_input_event_frame(
+    interpreter: &mut asb_interpreter::Interpreter,
+    active: &mut Option<InlineEventFrame>,
+) -> asb_interpreter::Result<()> {
+    // A jump-owned frame belongs to the suspended UI helper, not to a new
+    // click inside that UI. Preserve it on the interpreter stack and give the
+    // nested callback its own return (e.g. save confirmation -> save menu).
+    if active.as_ref().is_some_and(|frame| !frame.claimed_by_jump) { return Ok(()); }
+    let Some(script) = interpreter.current_script().map(str::to_string) else { return Ok(()); };
+    let line = interpreter.current_line();
+    let stack = interpreter.call_stack();
+    interpreter.push_inline_event_frame()?;
+    *active = Some(InlineEventFrame { script, line, stack, claimed_by_jump: false });
+    Ok(())
+}
+
 pub(super) fn inline_event_marker_is_active(
     frame: &InlineEventFrame,
     stack: &[asb_interpreter::CallFrame],
@@ -666,7 +668,7 @@ fn is_rclick_trigger_key(key: u32) -> bool {
 }
 
 fn should_dispatch_push(bits: u32, keyrepeat: bool) -> bool {
-    let down_edge = bits & OVERRIDE_IS_DOWN_EDGE != 0;
+    let down_edge = bits & (OVERRIDE_IS_DOWN_EDGE | OVERRIDE_IS_DECIDE) != 0;
     let is_push = bits & OVERRIDE_IS_PUSH != 0;
     down_edge || (keyrepeat && is_push && !down_edge)
 }
@@ -768,6 +770,38 @@ mod tests {
     use asb_interpreter::event::{Event, LayerEvent, WaitReason};
     use asb_interpreter::{CallFrame, Interpreter, InterpreterConfig};
     use std::collections::HashMap;
+
+    #[test]
+    fn nested_save_callback_returns_to_menu_before_story() {
+        use asb_interpreter::{CallbackResult, ExecutionResult};
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "[wait]").unwrap();
+        it.load_script("menu", "[stop]").unwrap();
+        it.load_script("save_confirmation", "[return]").unwrap();
+        it.set_callback(|e| match e {
+            Event::Wait { .. } => CallbackResult::Pause,
+            _ => CallbackResult::Continue,
+        });
+        it.boot("story").unwrap();
+        it.run().unwrap();
+        let mut active = None;
+        super::push_input_event_frame(&mut it, &mut active).unwrap();
+        it.engine_context().lock().unwrap().tag_queue.push(("jump".into(), HashMap::from([("file".into(), "menu".into())])));
+        it.drain_queued_tags_only().unwrap();
+        active.as_mut().unwrap().claimed_by_jump = true;
+        it.run().unwrap();
+        // The save callback interrupts a menu that owns the outer return.
+        super::push_input_event_frame(&mut it, &mut active).unwrap();
+        it.engine_context().lock().unwrap().tag_queue.push(("jump".into(), HashMap::from([("file".into(), "save_confirmation".into())])));
+        it.drain_queued_tags_only().unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(_)));
+        assert_eq!(it.current_script(), Some("menu"));
+        assert_eq!(it.call_stack().len(), 1);
+        it.engine_context().lock().unwrap().tag_queue.push(("return".into(), HashMap::new()));
+        it.drain_queued_tags_only().unwrap();
+        assert_eq!(it.current_script(), Some("story"));
+        assert!(it.call_stack().is_empty());
+    }
 
     #[test]
     fn loaded_scene_keeps_two_stage_button_dispatch() {
@@ -1046,6 +1080,24 @@ mod tests {
             lua.load(blocked).exec().unwrap();
             assert!(!super::host_menu_context_available(&interpreter), "{blocked}");
         }
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
+    fn legacy_up_uses_registered_backlog_only_in_dialogue() {
+        let interpreter = Interpreter::default();
+        interpreter.lua().load("scr={adv={mode=true,level=0},mw={msg=true}}; adv={}").exec().unwrap();
+        let mut compositor = Compositor::new();
+        compositor.apply_event(&Event::SetEventHandler {
+            event_name: "push".into(), file: None, label: None, call: false,
+            handler: Some("calllua".into()), extra_params: HashMap::from([
+                ("key".into(), "33".into()), ("lua".into(), "adv_backlog".into()),
+                ("function".into(), "setonpush_call".into()),
+            ]),
+        });
+        assert!(super::resolve_input_binding(&interpreter, &compositor, "push", "38").is_some());
+        interpreter.lua().load("scr.adv.level=1").exec().unwrap();
+        assert!(super::resolve_input_binding(&interpreter, &compositor, "push", "38").is_none());
     }
 
     #[cfg(feature = "gxm-menu-key-alias")]
@@ -1594,6 +1646,18 @@ mod tests {
     }
 
     #[test]
+    fn callback_receives_registered_call_flag() {
+        let interpreter = Interpreter::new(InterpreterConfig::default());
+        assert!(enqueue_handler_tags(
+            &interpreter, Some("calllua"), None, None, true,
+            &HashMap::from([("function".into(), "event_callback".into())]), &[],
+        ));
+        let context = interpreter.engine_context();
+        let context = context.lock().unwrap();
+        assert_eq!(context.tag_queue[0].1.get("call").map(String::as_str), Some("1"));
+    }
+
+    #[test]
     fn zero_handler_target_does_not_enqueue_script_control_flow() {
         let interpreter = Interpreter::new(InterpreterConfig::default());
         assert!(!enqueue_handler_tags(
@@ -1737,6 +1801,7 @@ mod tests {
         assert!(!should_dispatch_push(OVERRIDE_IS_PUSH, false));
         assert!(should_dispatch_push(OVERRIDE_IS_PUSH, true));
         assert!(!should_dispatch_push(OVERRIDE_IS_DOWN, true));
+        assert!(should_dispatch_push(OVERRIDE_IS_DECIDE, false));
         assert!(should_dispatch_discrete_role(OVERRIDE_IS_DECIDE));
         assert!(should_dispatch_discrete_role(OVERRIDE_IS_DOWN_EDGE));
         assert!(!should_dispatch_discrete_role(OVERRIDE_IS_DOWN));
@@ -1803,6 +1868,11 @@ pub(super) fn enqueue_handler_tags(
     let mut queued = false;
     if let Some(tag) = handler_tag {
         let mut p = params.clone();
+        // Registration extracts call from the extra parameters, but Lua
+        // callbacks also inspect it before unwinding their event frame.
+        if call {
+            p.insert("call".to_string(), "1".to_string());
+        }
         for (k, v) in runtime_params {
             p.insert(k.to_string(), v.to_string());
         }
@@ -2015,6 +2085,15 @@ fn missing_direction_binding<'a>(
         "39" => ("RT", "QLOAD"), "40" => ("DW", "CLICK"),
         _ => return None,
     };
+    // Legacy PC dispatchers bind PageUp instead of Up in dialogue. Reuse
+    // their registered callback, retaining its modal/wait checks. UI arrow
+    // handlers are resolved before this fallback and must remain untouched.
+    if key == "38" && host_menu_context_available(interpreter) {
+        let native = legacy_host_action_key(interpreter, compositor, "BACKLOG");
+        if native != 0 {
+            return compositor.get_input_handler("push", &native.to_string()).map(Cow::Borrowed);
+        }
+    }
     // Only supplement the standard script dispatcher, and only from the
     // current UI's declared actions. Never call save/backlog functions directly
     // or bypass transition, disabled-button and event-filter checks.

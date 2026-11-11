@@ -249,6 +249,7 @@ pub struct Interpreter {
     current_line: usize,
     /// 调用栈
     call_stack: Vec<CallFrame>,
+    inline_event_depths: Vec<usize>,
     /// 脚本加载器（文本）
     script_loader: Option<ScriptLoader>,
     /// 脚本文件加载器（二进制，支持自动检测）
@@ -542,6 +543,8 @@ impl Interpreter {
         if let Err(e) = crate::luau_polyfill::install(&lua, Arc::clone(&engine_ctx)) {
             eprintln!("警告: 注入 Luau 兼容层失败: {:?}", e);
         }
+        #[cfg(feature = "backend-lua51")]
+        crate::save_file_io::install(&lua, Arc::clone(&engine_ctx)).expect("install save file I/O");
         let _ = crate::lua_engine::init_lua_engine_api(&lua, Arc::clone(&engine_ctx));
 
         Self {
@@ -554,6 +557,7 @@ impl Interpreter {
             current_script: None,
             current_line: 0,
             call_stack: Vec::new(),
+            inline_event_depths: Vec::new(),
             script_loader: None,
             file_loader: None,
             callback: Box::new(default_callback),
@@ -822,6 +826,7 @@ impl Interpreter {
         self.current_script = Some(script.to_string());
         self.current_line = line;
         self.call_stack.clear();
+        self.inline_event_depths.clear();
         self.queued_call_barriers.clear();
         self.queued_wait_checkpoints.clear();
         self.active_queued_wait = None;
@@ -845,6 +850,7 @@ impl Interpreter {
         self.current_script = None;
         self.current_line = 0;
         self.call_stack.clear();
+        self.inline_event_depths.clear();
         self.queued_call_barriers.clear();
         self.queued_wait_checkpoints.clear();
         self.active_queued_wait = None;
@@ -1441,6 +1447,7 @@ impl Interpreter {
 
     fn pop_call_frame(&mut self) -> Option<CallFrame> {
         let frame = self.call_stack.pop();
+        self.inline_event_depths.retain(|depth| *depth <= self.call_stack.len());
         if frame.is_some() {
             // A return abandons waits owned by the frame it leaves, including
             // their deferred tags. Otherwise a later call to the same helper
@@ -1532,7 +1539,12 @@ impl Interpreter {
             .map(|frame| (frame.script.clone(), frame.return_line))
             .collect();
         if let Some(current) = &self.current_script {
-            stack.push((current.clone(), self.current_line));
+            // Native input callbacks expose an anonymous script frame. Lua
+            // uses it to unwind only the callback before jumping out of a UI.
+            let anonymous = self.inline_event_depths.contains(&self.call_stack.len())
+                && self.call_stack.last().is_some_and(|frame|
+                    frame.script == *current && frame.return_line == self.current_line);
+            stack.push((if anonymous { String::new() } else { current.clone() }, self.current_line));
         }
         self.engine_ctx.lock().unwrap().script_stack = stack;
     }
@@ -1769,11 +1781,12 @@ impl Interpreter {
                     message: "invalid compiled goto target".into(),
                 });
         }
-        // lyc2 is a host compatibility alias, whereas native projects may
-        // register it as a path-expanding script macro. Do not shadow that
-        // macro with the fallback alias.
+        // Compatibility helpers must not shadow a project's implementation.
+        // In particular, confirmation macros manage their own dialog and
+        // result variable; the host fallback cannot substitute for them.
         let has_builtin = self.tag_registry.contains(&instruction.tag)
-            && !(instruction.tag == "lyc2" && self.macros.contains(&instruction.tag));
+            && !(matches!(instruction.tag.as_str(), "lyc2" | "yesno")
+                && self.macros.contains(&instruction.tag));
 
         if apply_tag_filter {
             // 场景脚本中的标签先经过 Artemis tag filter。filter 内通过 e:tag /
@@ -2512,6 +2525,7 @@ impl Interpreter {
             self.current_script = Some(script.to_string());
             self.current_line = 0;
             self.call_stack.clear();
+        self.inline_event_depths.clear();
             self.queued_call_barriers.clear();
             self.queued_wait_checkpoints.clear();
             self.active_queued_wait = None;
@@ -2545,6 +2559,7 @@ impl Interpreter {
         self.current_script = Some(script.to_string());
         self.current_line = line;
         self.call_stack = stack;
+        self.inline_event_depths.clear();
         self.queued_call_barriers.clear();
         self.queued_wait_checkpoints.clear();
         self.active_queued_wait = None;
@@ -2682,7 +2697,13 @@ impl Interpreter {
             .lock()
             .unwrap()
             .retain_macro_scopes(self.call_stack.len());
+        self.inline_event_depths.push(self.call_stack.len());
+        self.sync_script_state_to_engine();
         Ok(())
+    }
+
+    pub fn is_inline_event_frame(&self, index: usize) -> bool {
+        self.inline_event_depths.contains(&(index + 1))
     }
 
     /// 获取 Lua 上下文
@@ -2730,6 +2751,11 @@ impl Interpreter {
             return None;
         }
         let frame = self.call_stack.remove(index);
+        self.inline_event_depths.retain_mut(|depth| {
+            if *depth == index + 1 { return false; }
+            if *depth > index + 1 { *depth -= 1; }
+            true
+        });
         for barrier in &mut self.queued_call_barriers {
             if barrier.stack_depth > index {
                 barrier.stack_depth -= 1;
@@ -2965,6 +2991,30 @@ mod tests {
             "old helper stop at {} must not rearm", old_pc);
         assert_eq!(it.get_variable("resumed"), Some(Value::Int(1)));
         assert!(it.get_variable("abandoned").is_none());
+    }
+
+    #[test]
+    fn inline_confirmation_callback_can_unwind_its_empty_frame() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.load_script("main", "[call file=dialog label=open]\n[var name=saved data=1]\n[stop]").unwrap();
+        it.load_script("dialog", "*open\n[stop]\n[return]\n*close\n[return]").unwrap();
+        it.lua().load(r#"
+            function confirm()
+                local stack = __engine:getScriptStack()
+                assert(stack[#stack].file == '', 'input callback must be an empty script frame')
+                __engine:tag{'return'}
+                __engine:tag{'jump', file='dialog', label='close'}
+            end
+        "#).exec().unwrap();
+        it.set_callback(|event| if matches!(event, Event::Wait { .. }) { CallbackResult::Pause } else { CallbackResult::Continue });
+        it.boot("main").unwrap();
+        it.run().unwrap();
+        it.push_inline_event_frame().unwrap();
+        it.lua().load("__engine:tag{'calllua', ['function']='confirm'}").exec().unwrap();
+        it.drain_queued_tags_only().unwrap();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("saved"), Some(Value::Int(1)));
+        assert!(it.call_stack().is_empty());
     }
 
     #[test]
@@ -4197,6 +4247,22 @@ mod tests {
     }
 
     #[test]
+    fn registered_confirmation_macro_returns_game_result() {
+        let mut it = Interpreter::default();
+        it.set_file_loader(Box::new(|_| Ok(br#"
+*yesno
+[var name="t.yesno" data="1"]
+[return]
+"#.to_vec())));
+        it.load_macro_file("helpers.iet").unwrap();
+        it.load_script("main", "*main\n[yesno file=\"save\"]\n[var name=\"t.finished\" data=\"1\"]\n[return]\n").unwrap();
+        it.start("main", "main").unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Completed));
+        assert_eq!(it.variables().get("t.yesno"), Some(&Value::Int(1)));
+        assert_eq!(it.variables().get("t.finished"), Some(&Value::Int(1)));
+    }
+
+    #[test]
     fn registered_layer_macro_takes_precedence_over_compatibility_alias() {
         let mut it = Interpreter::default();
         it.set_file_loader(Box::new(|_| Ok(br#"
@@ -4717,12 +4783,49 @@ mod tests {
         "#).exec().unwrap();
     }
 
-    #[cfg(feature = "backend-luau")]
+    #[cfg(feature = "backend-lua51")]
+    #[test]
+    fn lua_save_io_uses_host_storage_and_reads_binary_back() {
+        let writes = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.set_variable("s.savepath", crate::Value::String("save/nested".into()));
+        it.set_engine_callbacks(Box::new(TestCallbacks { writes: writes.clone() }));
+        let storage = writes.clone();
+        it.set_file_loader(Box::new(move |path| {
+            storage.lock().unwrap().iter().rev().find(|(p,_)| p == path)
+                .map(|(_,b)| b.clone()).ok_or_else(|| crate::Error::IoError(
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "missing")))
+        }));
+        it.lua().load(r#"
+            assert(io.open('save/nested/system.dat', 'rb') == nil)
+            select = function() error('game menu select must not be called') end
+            local f = assert(io.open('save/nested/system.dat', 'wb'))
+            assert(f:write('A', string.char(0), 'B'))
+            assert(io.close(f))
+            local r = assert(io.open('save/nested/system.dat', 'rb'))
+            assert(r:read('*all') == 'A'..string.char(0)..'B')
+            assert(r:close())
+            assert(io.type(r) == 'closed file')
+            assert(not pcall(function() r:read('*a') end))
+            local a = assert(io.open('save/nested/system.dat', 'ab'))
+            a:write('C'); assert(a:flush()); assert(a:close())
+            local r = assert(io.open('save/nested/system.dat','rb'))
+            assert(r:seek('set', 2) == 2)
+            assert(r:read(2) == 'BC'); assert(r:read(1) == nil); r:close()
+            local w = assert(io.open('save/nested/system.dat','wb'))
+            w:write('Z'); w:close()
+            local r = assert(io.open('save/nested/system.dat','rb'))
+            assert(r:read('*a') == 'Z'); r:close()
+            assert(io.open('save/nested/system.dat','bad') == nil)
+            assert(io.type(io.stdout) == 'file')
+        "#).exec().unwrap();
+        assert_eq!(writes.lock().unwrap().last().unwrap().1, b"Z");
+    }
+
     struct TestCallbacks {
         writes: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
     }
 
-    #[cfg(feature = "backend-luau")]
     impl EngineCallbacks for TestCallbacks {
         fn debug(&self, _level: i32, _data: &str, _raw: bool) {}
         fn enqueue_tag(&self, _tag: String, _params: HashMap<String, String>) {}

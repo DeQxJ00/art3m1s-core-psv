@@ -678,7 +678,8 @@ fn settle_inline_event_frame(
     saw_queued_jump: bool,
 ) -> asb_interpreter::Result<()> {
     let marker_active = active_frame.as_ref().is_some_and(|frame| {
-        super::input::inline_event_marker_is_active(frame, &interpreter.call_stack())
+        interpreter.is_inline_event_frame(frame.stack.len())
+            && super::input::inline_event_marker_is_active(frame, &interpreter.call_stack())
     });
     if !marker_active {
         *active_frame = None;
@@ -1100,12 +1101,7 @@ mod tests {
         ));
 
         let line = interpreter.current_line();
-        let mut stack = interpreter.call_stack();
-        stack.push(CallFrame {
-            script: "story".into(),
-            return_line: line,
-        });
-        interpreter.restore_position("story", line, stack).unwrap();
+        interpreter.push_inline_event_frame().unwrap();
         let mut frame = Some(InlineEventFrame {
             script: "story".into(),
             line,
@@ -1178,12 +1174,7 @@ mod tests {
         ));
 
         let line = interpreter.current_line();
-        let mut stack = interpreter.call_stack();
-        stack.push(CallFrame {
-            script: "title".into(),
-            return_line: line,
-        });
-        interpreter.restore_position("title", line, stack).unwrap();
+        interpreter.push_inline_event_frame().unwrap();
         let mut frame = Some(InlineEventFrame {
             script: "title".into(),
             line,
@@ -1224,6 +1215,22 @@ mod tests {
         assert_eq!(interpreter.current_script(), Some("title"));
         assert_eq!(interpreter.current_line(), line);
         assert!(interpreter.call_stack().is_empty());
+    }
+
+    #[test]
+    fn callback_return_then_call_keeps_the_real_return_frame() {
+        let mut it = asb_interpreter::Interpreter::new(InterpreterConfig::default());
+        it.load_script("story", "*main\n[stop]").unwrap();
+        it.load_script("dialog", "*open\n[stop]\n[return]").unwrap();
+        it.start("story", "main").unwrap();
+        let line = it.current_line();
+        it.push_inline_event_frame().unwrap();
+        let mut frame = Some(InlineEventFrame { script: "story".into(), line, stack: Vec::new(), claimed_by_jump: false });
+        it.lua().load("__engine:tag{'return'}; __engine:tag{'call',file='dialog',label='open'}").exec().unwrap();
+        let drain = it.drain_queued_tags_only().unwrap();
+        settle_inline_event_frame(&mut it, &mut frame, false, false, drain.saw_call, drain.saw_jump).unwrap();
+        assert!(frame.is_none());
+        assert_eq!(it.call_stack().len(), 1, "real caller at the same PC must survive");
     }
 
     #[test]

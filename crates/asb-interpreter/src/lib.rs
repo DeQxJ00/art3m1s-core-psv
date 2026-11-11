@@ -46,6 +46,8 @@
 //! interpreter.run().unwrap();
 //! ```
 
+#[cfg(feature = "backend-lua51")]
+mod save_file_io;
 pub mod error;
 pub mod event;
 pub mod expression;
