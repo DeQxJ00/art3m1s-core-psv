@@ -74,7 +74,7 @@ impl GlyphTextRenderer {
             "/font" => self.font_pop(),
             "fontdefault" => self.font_default(p),
             "print" => self.push_text(val("data").unwrap_or(""), false),
-            "rp" => self.state.active_layer_mut().clear_page(),
+            "rp" => self.push_page_break(Some(0)),
             "rt" => {
                 self.state.set_rt_omit_blank_line(val("omitblankline").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0) != 0);
                 self.push_line_break();

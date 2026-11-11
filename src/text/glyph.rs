@@ -1272,6 +1272,18 @@ impl TextRenderer for GlyphTextRenderer {
         changed
     }
 
+    fn active_layer_indent_nest(&self) -> usize {
+        let Some(layer) = self.state.active_layer.as_ref().and_then(|id| self.state.layers.get(id)) else {
+            return 0;
+        };
+        let width = if layer.width > 0.0 { layer.width } else { f32::MAX };
+        self.layout_cache.borrow_mut().layout_indented(
+            &layer.text_buffer, width, &self.state.layout, &layer.keep_ranges(),
+            TextAlignment::from(layer.font.align.as_deref().unwrap_or("left")),
+            layer.indent_options.as_ref(), &layer.indent_initial, &layer.indent_actions,
+        ).final_indent.stack.len()
+    }
+
     fn active_layer_text_metrics(&self) -> Option<(f32, f32, f32)> {
         let id = self.state.active_layer.as_deref()?;
         let ly = self.state.layers.get(id)?;

@@ -235,6 +235,8 @@ pub enum Event {
     },
     /// Pop the current message layer's indentation; negative clears all.
     IndentModify { unindent: i32 },
+    /// Read the active message layer after earlier text events reach the host.
+    MessageIndentQuery { params: HashMap<String, String> },
     /// Internal reproduction record, never advertised as a native Artemis tag.
     RestoreIndentState { data: String },
     /// 禁则处理 [prohibit]

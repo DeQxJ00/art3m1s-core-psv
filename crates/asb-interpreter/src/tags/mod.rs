@@ -680,6 +680,11 @@ struct VarHandler;
 
 impl TagHandler for VarHandler {
     fn execute(&self, ctx: &mut ExecutionContext<'_>) -> Result<TagResult> {
+        if ctx.instruction.get("system") == Some("get_message_layer_indent_nest") {
+            return Ok(TagResult::Emit(Event::MessageIndentQuery {
+                params: ctx.instruction.params.clone(),
+            }));
+        }
         var_handler::apply_var_tag(&ctx.instruction.params, ctx.variables)?;
         Ok(TagResult::Continue)
     }

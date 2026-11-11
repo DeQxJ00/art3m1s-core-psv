@@ -1229,6 +1229,10 @@ pub trait TextRenderer {
     /// 当前消息层已存文本的度量：`(整体宽度, 总高度, 最后一行宽度)`。
     /// 供 var system=get_message_layer_width/height/line_width 查询。
     /// 无文本/无渲染器时返回 `None`（查询落 0）。
+    fn active_layer_indent_nest(&self) -> usize {
+        0
+    }
+
     fn active_layer_text_metrics(&self) -> Option<(f32, f32, f32)> {
         None
     }

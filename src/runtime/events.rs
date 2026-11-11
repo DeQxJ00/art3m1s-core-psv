@@ -42,7 +42,7 @@ pub(super) fn event_requires_state_sync(event: &Event) -> bool {
     // Scripts may inspect s.current_message_layer immediately after chgmsg,
     // including to conditionally pop the name layer before printing dialogue.
     matches!(event, Event::Exec { .. } | Event::SaveGame { .. } | Event::RestoreMemoryScene(_)
-        | Event::MessageLayerSwitch { .. } | Event::MessageLayerPop)
+        | Event::MessageLayerSwitch { .. } | Event::MessageLayerPop | Event::MessageIndentQuery { .. })
 }
 
 // Count only the actual events being dispatched, including invalid requests
@@ -189,6 +189,7 @@ impl CoreRuntime {
 
             // 存档 / 读档 / 文件删除——通过宿主回调真正落盘（方案 B + A1）
             match event {
+                Event::MessageIndentQuery { params } => self.apply_message_indent_query(params),
                 Event::RestoreMemoryScene(scene) => {
                     match serde_json::from_value::<crate::save::MemoryScene>(scene.clone()) {
                         Ok(mut snapshot) => {
@@ -1217,6 +1218,7 @@ impl CoreRuntime {
                         .map(super::text::native_query_tags)
                 }),
                 message_layer_metrics: Box::new(super::text::text_metrics_snapshot),
+                message_layer_indent_nest: Box::new(super::text::message_indent_nest_snapshot),
             },
         );
     }

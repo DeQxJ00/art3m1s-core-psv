@@ -53,6 +53,7 @@ pub struct HostQueryHooks {
     /// 当前消息层文本度量 `(整体宽度, 总高度, 最后一行宽度)`。
     /// 供 get_message_layer_width/height/line_width。
     pub message_layer_metrics: Box<dyn Fn() -> (f32, f32, f32) + Send + Sync>,
+    pub message_layer_indent_nest: Box<dyn Fn() -> usize + Send + Sync>,
 }
 
 static HOST_QUERY_HOOKS: RwLock<Option<HostQueryHooks>> = RwLock::new(None);
@@ -532,6 +533,12 @@ pub fn execute_var_system(
                 _ => line_width,
             };
             variables.set(name, Value::Float(value as f64));
+        }
+
+        "get_message_layer_indent_nest" => {
+            let name = params.get("name").map(String::as_str).unwrap_or("");
+            let depth = with_host_hooks(|hooks| (hooks.message_layer_indent_nest)()).unwrap_or(0);
+            variables.set(name, Value::Int(depth as i64));
         }
 
         "get_layer_info" | "get_font" => {
@@ -1239,6 +1246,7 @@ mod tests {
                 (id == "adv01").then(|| vec!["[print data=\"cur\"]".to_string()])
             }),
             message_layer_metrics: Box::new(|| (320.0, 48.0, 120.0)),
+            message_layer_indent_nest: Box::new(|| 2),
         });
 
         let run = |params: &[(&str, &str)]| {

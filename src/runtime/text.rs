@@ -210,10 +210,14 @@ impl ImmediateText {
         }
         Some(script_message_layer(self.active.as_deref(), &self.layer_stack).into())
     }
-    fn metrics(&mut self) -> (f32, f32, f32) {
+    fn apply_pending(&mut self) {
         for (tag, params) in self.pending.drain(..) {
             self.renderer.observe_metric_tag(&tag, &params);
         }
+    }
+
+    fn metrics(&mut self) -> (f32, f32, f32) {
+        self.apply_pending();
         self.renderer.active_layer_text_metrics().unwrap_or((0.0, 0.0, 0.0))
     }
 }
@@ -273,6 +277,13 @@ pub(crate) fn text_metrics_snapshot() -> (f32, f32, f32) {
         return renderer.metrics();
     }
     *TEXT_METRICS.lock().unwrap()
+}
+
+pub(super) fn message_indent_nest_snapshot() -> usize {
+    let mut mirror = IMMEDIATE_TEXT.lock().unwrap();
+    let Some(mirror) = mirror.as_mut() else { return 0; };
+    mirror.apply_pending();
+    mirror.renderer.active_layer_indent_nest()
 }
 
 /// 读取当前 backlog 快照（get_backlog_* / get_message_tags 钩子入口）。
@@ -379,6 +390,17 @@ fn message_layer_scene_id(message_id: &str, layered: bool) -> String {
 }
 
 impl CoreRuntime {
+    pub(super) fn apply_message_indent_query(&mut self, params: &HashMap<String, String>) {
+        let depth = self.text_renderer.as_ref().map_or(0, |renderer| renderer.active_layer_indent_nest());
+        let mut params = params.clone();
+        params.remove("system");
+        params.insert("data".into(), depth.to_string());
+        let variables = self.interpreter.variables_handle();
+        if let Err(error) = asb_interpreter::tags::var_handler::apply_var_tag(&params, &mut variables.lock().unwrap()) {
+            crate::core_warn!("[text] message indentation query failed: {error}");
+        }
+    }
+
     pub(super) fn active_message_layer_id(&self) -> Option<String> {
         self.text_renderer
             .as_ref()
