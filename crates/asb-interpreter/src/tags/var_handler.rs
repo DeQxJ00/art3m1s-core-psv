@@ -204,6 +204,11 @@ pub fn execute_var_system(
             }
         }
 
+        "array" => {
+            let name = params.get("name").map(String::as_str).unwrap_or("");
+            set_pseudo_array(name, None, variables);
+        }
+
         "random" => {
             let name = params.get("name").map(|s| s.as_str()).unwrap_or("");
             let min = get_resolved("min").and_then(|v| v.as_int()).unwrap_or(0);
@@ -1165,6 +1170,27 @@ mod tests {
             Some("system/config.iet".into())
         );
         assert!(vars.get("$'slider.' + id + '.file'").is_none());
+    }
+
+    #[test]
+    fn array_initializes_size_at_the_resolved_destination() {
+        let mut vars = VariableStore::new();
+        vars.set("key", Value::from("items"));
+        vars.set("items.size", Value::Int(3));
+        vars.set("items.0", Value::from("preserve"));
+        vars.push_macro_scope(1, &HashMap::new());
+        apply_var_tag(
+            &HashMap::from([
+                ("name".into(), "$key".into()),
+                ("system".into(), "array".into()),
+                ("writelocal".into(), "1".into()),
+            ]),
+            &mut vars,
+        ).unwrap();
+        assert_eq!(vars.get("items.size"), Some(&Value::Int(0)));
+        assert_eq!(vars.get("items.0"), Some(&Value::from("preserve")));
+        vars.retain_macro_scopes(0);
+        assert_eq!(vars.get("items.size"), Some(&Value::Int(3)));
     }
 
     #[test]
