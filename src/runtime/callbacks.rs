@@ -387,6 +387,10 @@ impl EngineCallbacks for FfiCallbacks {
         crate::core_info!("{data}");
     }
 
+    fn dump_memory_status(&self) {
+        crate::resource_ledger::art3m1s_resource_report();
+    }
+
     fn enqueue_tag(&self, _tag: String, _params: HashMap<String, String>) {}
     fn observe_immediate_tag(&self, tag: &str, params: &HashMap<String, String>) -> Option<String> {
         self.layer_info.lock().unwrap().observe_tag(tag, params);

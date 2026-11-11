@@ -262,6 +262,9 @@ pub trait EngineCallbacks: Send + Sync {
     /// 恢复字体缓存。
     fn restore_font_cache(&self, _path: &str) {}
 
+    /// Report memory diagnostics through the host log.
+    fn dump_memory_status(&self) {}
+
     /// 读取 PNG 文件的注释块（如立绘坐标）。默认无注释返回 None。
     fn load_png_comments(&self, _path: &str) -> Option<HashMap<String, String>> {
         None
@@ -1645,6 +1648,11 @@ impl UserData for EngineApi {
             Ok(())
         });
 
+        methods.add_method("dumpMemoryStatus", |_lua, this, ()| {
+            this.ctx.lock().unwrap().callbacks.dump_memory_status();
+            Ok(mlua::Value::Nil)
+        });
+
         // e:callShellExecute{file=..., ...} -> number
         // 文档：以阻塞方式运行时返回被执行程序的返回值，非阻塞时返回值不确定。
         methods.add_method("callShellExecute", |_lua, this, t: mlua::Table| {
@@ -2168,6 +2176,17 @@ mod tests {
     }
 
     #[test]
+    fn lua_dump_memory_status_returns_nil() {
+        let lua = Lua::new();
+        let probe = EmoteProbe::default();
+        let logs = probe.logs.clone();
+        let ctx = EngineContext::new(Box::new(probe));
+        init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
+        lua.load("assert(__engine:dumpMemoryStatus() == nil)").exec().unwrap();
+        assert_eq!(*logs.lock().unwrap(), ["memory status"]);
+    }
+
+    #[test]
     fn include_nonmissing_errors_still_abort() {
         for path in ["denied.lua", "short.lua", "syntax.lua", "runtime.lua"] {
             let lua = Lua::new();
@@ -2218,6 +2237,9 @@ mod tests {
     }
 
     impl EngineCallbacks for EmoteProbe {
+        fn dump_memory_status(&self) {
+            self.logs.lock().unwrap().push("memory status".into());
+        }
         fn preload_hints_enabled(&self) -> bool { self.preload_hints }
         fn bind_surface_async(&self, key: &str) { self.surface_binds.lock().unwrap().push(key.into()); }
         fn debug(&self, _level: i32, data: &str, _raw: bool) {
