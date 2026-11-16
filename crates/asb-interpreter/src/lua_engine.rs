@@ -906,7 +906,7 @@ impl UserData for EngineApi {
                             Value::Boolean(false)
                                 if tag_name == "lyprop" && key_str.as_deref() == Some("mask") => Some(String::new()),
                             Value::String(s) if tag_param_has_legacy_text(&tag_name, key_str.as_deref().unwrap_or_default()) =>
-                                Some(lua_file_path(&s)?),
+                                Some(lua_text(&s)?),
                             Value::String(s) => match s.to_str() {
                                 Ok(text) => Some(text.to_string()),
                                 Err(_) => {
@@ -1033,7 +1033,7 @@ impl UserData for EngineApi {
                                         Value::Boolean(false)
                                             if tag_name == "lyprop" && ks == "mask" => Some(String::new()),
                                         Value::String(s) if tag_param_has_legacy_text(&tag_name, &ks) =>
-                                            Some(lua_file_path(&s)?),
+                                            Some(lua_text(&s)?),
                                         Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                                         Value::Integer(i) => Some(i.to_string()),
                                         Value::Number(n) => Some(n.to_string()),
@@ -1343,7 +1343,7 @@ impl UserData for EngineApi {
             match args.into_iter().next() {
                 Some(Value::String(path)) => {
                     #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(14);
-                    let path = lua_file_path(&path)?;
+                    let path = lua_text(&path)?;
                     let reader = {
                         let ctx = this.ctx.lock().unwrap();
                         ctx.file_reader.clone()
@@ -1375,7 +1375,7 @@ impl UserData for EngineApi {
         // e:isFileExists("path")
         methods.add_method("isFileExists", |_lua, this, path: mlua::String| {
             #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(2);
-            let path = lua_file_path(&path)?;
+            let path = lua_text(&path)?;
             let ctx = this.ctx.lock().unwrap();
             Ok(ctx.callbacks.is_file_exists(&path))
         });
@@ -1942,22 +1942,23 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// 把 surface 键参数转成字符串。boot 里 bind/unbindSurface 传入的多为路径字符串，
-/// 也可能是数值索引；其它类型暂转为空串（stub 阶段不区分具体 surface）。
-fn lua_file_path(path: &mlua::String) -> LuaResult<String> {
-    if let Ok(text) = path.to_str() {
+fn lua_text(value: &mlua::String) -> LuaResult<String> {
+    if let Ok(text) = value.to_str() {
         return Ok(text.to_owned());
     }
-    // Legacy CSV data stays byte-exact in Lua. Convert only its filename at
-    // the host boundary; e:file must still return arbitrary binary data intact.
-    let utf8 = convert_encoding_default("", "utf8", path.as_bytes().as_ref());
+    // Legacy CSV data stays byte-exact in Lua. Convert known text parameters
+    // at the host boundary; e:file still returns arbitrary binary data intact.
+    let utf8 = convert_encoding_default("", "utf8", value.as_bytes().as_ref());
     String::from_utf8(utf8).map_err(mlua::Error::external)
 }
 
 fn tag_param_has_legacy_text(tag: &str, key: &str) -> bool {
     matches!((tag, key),
         ("call" | "jump", "file" | "label")
-        | ("lyc" | "lyc2" | "anime" | "seplay" | "bgmplay", "file")
+        | ("lyc" | "lyc2" | "anime" | "seplay" | "splay" | "sxfade" | "bgmplay" | "voice", "file")
+        | ("seplay" | "sestop" | "sepan" | "sefade" | "sefadein" | "sefadeout"
+            | "voice" | "/voice" | "setonsoundfinish" | "delonsoundfinish", "id")
+        | ("wait", "se") | ("automode", "syncse")
         | ("lyc" | "lyprop" | "anime", "mask")
         | ("print", "data"))
 }

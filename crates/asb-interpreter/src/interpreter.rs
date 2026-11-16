@@ -3730,8 +3730,14 @@ mod tests {
         it.lua().load(r#"
             function queue(e)
                 local file = e:convertEncoding{from='utf8', to='sjis', source='voice/第一話/line'}
+                local music = e:convertEncoding{from='utf8', to='sjis', source='bgm/放課後_a'}
+                local sound_id = e:convertEncoding{from='utf8', to='sjis', source='足音'}
                 local caption = e:convertEncoding{from='utf8', to='sjis', source='次の行'}
+                e:tag{'splay', file=music}
+                e:enqueueTag{'sxfade', file=music}
                 e:enqueueTag{'seplay', id='100.1', file=file}
+                e:tag{'seplay', id=sound_id, file='se/steps'}
+                e:enqueueTag{'sestop', id=sound_id}
                 e:tag{'print', data=caption}
                 e:tag{'rp'}
             end
@@ -3742,6 +3748,14 @@ mod tests {
         let events = events.lock().unwrap();
         assert!(events.iter().any(|event| matches!(event,
             Event::SePlay { file, .. } if file == "voice/第一話/line")));
+        assert!(events.iter().any(|event| matches!(event,
+            Event::BgmPlay { file, .. } if file == "bgm/放課後_a")));
+        assert!(events.iter().any(|event| matches!(event,
+            Event::BgmCrossFade { file, .. } if file == "bgm/放課後_a")));
+        assert!(events.iter().any(|event| matches!(event,
+            Event::SePlay { id, file, .. } if id == "足音" && file == "se/steps")));
+        assert!(events.iter().any(|event| matches!(event,
+            Event::SeStop { id, .. } if id == "足音")));
         assert!(events.iter().any(|event| matches!(event,
             Event::ScenarioText { content, .. } if content == "次の行")));
     }
