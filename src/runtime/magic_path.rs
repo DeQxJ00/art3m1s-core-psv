@@ -56,9 +56,52 @@ impl ScenePaths {
     }
 }
 
+/// Hidden image prefetch ownership survives temporary visibility changes.
+/// Failed maintenance is retried without publishing an unapplied reference.
+#[derive(Default)]
+pub(super) struct HiddenImageBindings {
+    current: ScenePaths,
+    hidden: ScenePaths,
+    bound: std::collections::HashSet<String>,
+}
+impl HiddenImageBindings {
+    pub fn clear(&mut self) { *self=Self::default(); }
+    pub fn sync(&mut self, table:&MagicPathTable,
+        current:&std::collections::HashSet<String>, hidden:&std::collections::HashSet<String>,
+        mut bind:impl FnMut(&str)->bool, mut unbind:impl FnMut(&str)->bool) {
+        let current=self.current.resolve(table,current);
+        let hidden=self.hidden.resolve(table,hidden);
+        self.bound.retain(|path| current.binary_search(path).is_ok() || !unbind(path));
+        for path in hidden {
+            if !self.bound.contains(path) && bind(path) { self.bound.insert(path.clone()); }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_bindings_retry_and_invalidate_without_duplicate_references() {
+        let table=MagicPathTable::new(HashMap::from([("ui".into(),"pc/a".into())]));
+        let files=std::collections::HashSet::from([":ui/face.png".into()]);
+        let mut bindings=HiddenImageBindings::default();
+        let mut calls=0;
+        bindings.sync(&table,&files,&files,|_|{calls+=1;false},|_|panic!("nothing bound"));
+        assert_eq!(calls,1);
+        bindings.sync(&table,&files,&files,|p|{assert_eq!(p,"pc/a/face.png");true},|_|panic!("still current"));
+        bindings.sync(&table,&files,&files,|_|panic!("duplicate bind"),|_|panic!("still current"));
+        // Becoming visible keeps its reference until it leaves the scene.
+        bindings.sync(&table,&files,&Default::default(),|_|panic!(),|_|panic!());
+        table.lock().unwrap().insert("ui".into(),"pc/b".into());
+        bindings.sync(&table,&files,&files,|p|{assert_eq!(p,"pc/b/face.png");true},|_|false);
+        assert_eq!(bindings.bound.len(),2);
+        bindings.sync(&table,&files,&files,|_|panic!("duplicate bind"),|p|{assert_eq!(p,"pc/a/face.png");true});
+        assert_eq!(bindings.bound.len(),1);
+        bindings.sync(&table,&Default::default(),&Default::default(),|_|panic!(),|_|true);
+        assert!(bindings.bound.is_empty());
+    }
 
     #[test]
     fn scene_paths_reuse_and_invalidate_exact_dependencies() {

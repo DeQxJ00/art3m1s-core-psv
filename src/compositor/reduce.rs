@@ -19,6 +19,9 @@ use std::collections::{HashMap, HashSet};
 
 mod hit_test;
 
+/// Immutable, deterministically ordered bindings shared by save snapshots.
+pub type InputSnapshot = std::sync::Arc<Vec<(String, String, InputHandler)>>;
+
 /// 已注册的输入事件处理器。
 ///
 /// 由 Lua 脚本通过 `e:tag{"setonpush", key=..., handler="calllua", function="..."}`
@@ -91,7 +94,8 @@ pub struct Compositor {
     /// 舞台到物理像素的缩放因子（HiDPI）。
     pub(super) stage_scale: f32,
     /// 输入事件处理器注册表，按 (event_name, key) 索引。
-    pub(super) input_handlers: HashMap<(String, String), InputHandler>,
+    input_handlers: HashMap<(String, String), InputHandler>,
+    input_snapshot: RefCell<Option<InputSnapshot>>,
     /// 自上次 `poll_tween_events` 以来产生待处理的缓动完成事件。
     pub(super) pending_tween_events: Vec<TweenHandler>,
     /// `[trans]` 转场状态（交叉淡化等）。
@@ -137,6 +141,7 @@ impl Default for Compositor {
             clock_ms: 0,
             stage_scale: 1.0,
             input_handlers: HashMap::new(),
+            input_snapshot: RefCell::new(None),
             pending_tween_events: Vec::new(),
             trans_state: RefCell::new(None),
             anime_states: HashMap::new(),
@@ -280,6 +285,7 @@ impl Compositor {
     pub fn reset_for_engine(&mut self) {
         self.reset_for_load();
         self.input_handlers.clear();
+        *self.input_snapshot.get_mut() = None;
     }
 
     pub fn clock_ms(&self) -> u64 {
@@ -296,13 +302,19 @@ impl Compositor {
     }
 
     /// 查询指定事件/键组合的已注册处理器。宿主在检测到输入后调用。
-    pub(crate) fn input_snapshot(&self) -> Vec<(String, String, InputHandler)> {
+    pub(crate) fn input_snapshot(&self) -> InputSnapshot {
+        if let Some(snapshot) = self.input_snapshot.borrow().as_ref() {
+            return snapshot.clone();
+        }
         let mut entries: Vec<_> = self.input_handlers.iter().map(|((event, key), handler)|
             (event.clone(), key.clone(), handler.clone())).collect();
         entries.sort_by(|a,b| (&a.0,&a.1).cmp(&(&b.0,&b.1)));
-        entries
+        let snapshot = std::sync::Arc::new(entries);
+        *self.input_snapshot.borrow_mut() = Some(snapshot.clone());
+        snapshot
     }
     pub(crate) fn restore_input_snapshot(&mut self, entries: &[(String, String, InputHandler)]) {
+        *self.input_snapshot.get_mut() = None;
         self.input_handlers = entries.iter().map(|(event,key,handler)|
             ((event.clone(),key.clone()),handler.clone())).collect();
     }
@@ -833,27 +845,32 @@ impl Compositor {
                     &[("call", call)],
                 );
                 for key in key.split(',').map(str::trim) {
-                self.input_handlers.insert(
-                    (event_name.to_string(), key.to_string()),
-                    InputHandler {
+                    let key = (event_name.to_string(), key.to_string());
+                    let next = InputHandler {
                         handler: handler.map(str::to_string),
                         file: file.map(str::to_string),
                         label: label.map(str::to_string),
                         call,
                         params: extra_params.clone(),
                         filter_params: filter_params.clone(),
-                    },
-                );
+                    };
+                    if self.input_handlers.get(&key) != Some(&next) {
+                        self.input_handlers.insert(key, next);
+                        *self.input_snapshot.get_mut() = None;
+                    }
                 }
             }
             CompositorEvent::DelInputHandler { event_name, key } => {
+                let before = self.input_handlers.len();
                 if let Some(key) = key {
                     for key in key.split(',').map(str::trim) {
                         self.input_handlers.remove(&(event_name.to_string(), key.to_string()));
                     }
                 } else {
-                    self.input_handlers
-                        .retain(|(name, _), _| name != event_name);
+                    self.input_handlers.retain(|(name, _), _| name != event_name);
+                }
+                if self.input_handlers.len() != before {
+                    *self.input_snapshot.get_mut() = None;
                 }
             }
             // ── 帧动画 ──
@@ -1050,6 +1067,46 @@ mod tests {
     use crate::render_pipeline::draw::{TextureId, TextureInfo, TextureProvider};
     use asb_interpreter::Event;
     use asb_interpreter::event::LayerEvent;
+
+    fn register_snapshot_input(c: &mut Compositor, keys: &str, function: &str) {
+        c.apply_compositor_event(CompositorEvent::SetInputHandler {
+            event_name: "push", file: None, label: None, call: false,
+            handler: Some("calllua"), extra_params: &HashMap::from([
+                ("key".into(), keys.into()), ("function".into(), function.into())]),
+        });
+    }
+
+    #[test]
+    fn input_snapshots_share_unchanged_bindings_and_preserve_old_state() {
+        let mut c=Compositor::new();
+        register_snapshot_input(&mut c,"38,40","history");
+        let old=c.input_snapshot();
+        let repeated=c.input_snapshot();
+        assert_eq!(old.as_ptr(),repeated.as_ptr(),"unchanged snapshots must share their allocation");
+        register_snapshot_input(&mut c,"38,40","history");
+        assert_eq!(old.as_ptr(),c.input_snapshot().as_ptr(),"same registration must not invalidate");
+        c.apply_compositor_event(CompositorEvent::DelInputHandler{event_name:"push",key:Some("99")});
+        assert_eq!(old.as_ptr(),c.input_snapshot().as_ptr());
+        register_snapshot_input(&mut c,"38","next");
+        let changed=c.input_snapshot();
+        assert_ne!(old.as_ptr(),changed.as_ptr());
+        assert_eq!(old[0].2.params["function"],"history");
+        assert_eq!(changed[0].2.params["function"],"next");
+        assert_eq!(changed[1].2.params["function"],"history");
+        c.apply_compositor_event(CompositorEvent::DelInputHandler{event_name:"push",key:Some("38")});
+        assert_eq!(c.input_snapshot().len(),1);
+        assert_eq!(changed.len(),2);
+        c.restore_input_snapshot(&old);
+        assert_eq!(&c.input_snapshot()[..],&old[..]);
+        c.reset_for_load();
+        assert_eq!(c.input_snapshot().len(),2);
+        c.apply_compositor_event(CompositorEvent::DelInputHandler{event_name:"push",key:None});
+        assert!(c.input_snapshot().is_empty());
+        c.restore_input_snapshot(&old);
+        c.reset_for_engine();
+        assert!(c.input_snapshot().is_empty());
+        assert_eq!(old.len(),2);
+    }
 
     fn looping_particle() -> super::anim::Tween {
         super::anim::Tween { param:"left".into(),from:1100.,to:-100.,easing:super::anim::Easing::Linear,

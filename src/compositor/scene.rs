@@ -554,6 +554,7 @@ impl Scene {
     /// 设置（合并）某图层的属性，会按需创建该节点。增量语义：只改动传入的键。
     pub fn set_props(&mut self, id: &str, raw: &HashMap<String, String>) {
         self.ensure_path(id);
+        if self.get(id).is_some_and(|layer|raw.iter().all(|(k,v)|layer.props.matches_raw(k,v))){return;}
         if let Some(layer) = self.get_mut(id) {
             layer.props.merge_raw(raw);
         }
@@ -836,6 +837,25 @@ mod tests {
             scene.get("1").unwrap().children,
             vec!["1.2".to_string(), "1.0".to_string(), "1.1".to_string()]
         );
+    }
+
+    #[test]
+    fn repeated_properties_do_not_invalidate_query_projection() {
+        let mut scene=Scene::new();
+        let values=raw(&[("left","10"),("top","20"),("alpha","255"),("visible","1"),("clip","0,0,64,32")]);
+        scene.set_props("figure.face",&values);
+        let mut mirror=Scene::new();let mut accepted=HashMap::new();
+        assert!(mirror.sync_query_changes_from(&scene,&mut accepted)>0);
+        scene.set_props("figure.face",&values);
+        assert_eq!(mirror.sync_query_changes_from(&scene,&mut accepted),0);
+        scene.set_props("figure.face",&raw(&[("x","10.0"),("alpha","bad")]));
+        assert_eq!(mirror.sync_query_changes_from(&scene,&mut accepted),0);
+        scene.get_mut("figure.face").unwrap().props.left=Some(11.0);
+        scene.set_props("figure.face",&values);
+        assert_eq!(scene.get("figure.face").unwrap().props.left,Some(10.0));
+        assert_eq!(mirror.sync_query_changes_from(&scene,&mut accepted),1);
+        scene.set_props("new.empty",&HashMap::new());
+        assert!(scene.get("new.empty").is_some());
     }
 
     #[test]

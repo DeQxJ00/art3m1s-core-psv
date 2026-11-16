@@ -22,6 +22,16 @@ fn animation_frame_hints(event: &Event) -> Vec<String> {
     paths
 }
 
+#[cfg(any(test, all(target_os="vita", feature="gxm-backend")))]
+fn animation_hint_run(events:&[RuntimeEvent],start:usize)->(usize,Vec<String>){
+    let mut end=start;let mut paths=Vec::new();let mut seen=std::collections::HashSet::new();
+    while let Some(RuntimeEvent{event:Event::Anime{..},..})=events.get(end){
+        for path in animation_frame_hints(&events[end].event){if seen.insert(path.clone()){paths.push(path);}}
+        end+=1;
+    }
+    (end,paths)
+}
+
 #[cfg(test)]
 mod animation_prefetch_tests {
     use super::*;
@@ -35,6 +45,14 @@ mod animation_prefetch_tests {
         assert_eq!(animation_frame_hints(&frame("init", "first.png", Some("first.png"))), vec!["first.png"]);
         assert!(animation_frame_hints(&frame("end", "unused", None)).is_empty());
         assert!(animation_frame_hints(&frame("add", "", None)).is_empty());
+    }
+    #[test] fn animation_hint_runs_preserve_event_barriers_and_first_use_order(){
+        let events=vec![frame("init","eye",Some("mask")),frame("add","mouth",Some("mask")),
+            frame("end","",None),Event::Layer(LayerEvent::Delete{id:"figure".into()}),frame("init","later",None)]
+            .into_iter().map(|event|RuntimeEvent{event,text_source:None}).collect::<Vec<_>>();
+        assert_eq!(animation_hint_run(&events,0),(3,vec!["eye".into(),"mask".into(),"mouth".into()]));
+        assert_eq!(animation_hint_run(&events,3),(3,vec![]));
+        assert_eq!(animation_hint_run(&events,4),(5,vec!["later".into()]));
     }
 }
 
@@ -181,7 +199,9 @@ impl CoreRuntime {
 
         let mut trace = crate::ffi::debug_enabled()
             .then(|| Vec::with_capacity(events.len().min(EVENT_TRACE_LIMIT)));
-        for RuntimeEvent { event, text_source } in events {
+        #[cfg(all(target_os="vita", feature="gxm-backend"))]
+        let mut hinted_until=0;
+        for (_event_index, RuntimeEvent { event, text_source }) in events.iter().enumerate() {
             let runtime_started = profile.mark();
             if matches!(event, Event::Exit) {
                 crate::core_info!("[runtime] Event::Exit received");
@@ -660,8 +680,9 @@ impl CoreRuntime {
             // Explicit frame registrations are dependencies too: a later blink
             // must not first decode its image inside the render submission.
             #[cfg(all(target_os="vita", feature="gxm-backend"))]
-            {
-                let paths: Vec<_> = animation_frame_hints(event).into_iter()
+            if _event_index>=hinted_until && matches!(event,Event::Anime{..}) {
+                let (end,hints)=animation_hint_run(events,_event_index);hinted_until=end;
+                let paths: Vec<_> = hints.into_iter()
                     .map(|p| super::magic_path::resolve_path(&self.magic_paths, &p)).collect();
                 if !paths.is_empty() {
                     super::surface_loader::preload(&paths, super::surface_loader::Kind::Animation,

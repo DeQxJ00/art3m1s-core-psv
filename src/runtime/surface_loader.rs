@@ -11,13 +11,33 @@ const BUDGET: usize = 16 * 1024 * 1024;
 // The 96 MiB experiment exhausted the process heap in decoder_to_vec on hardware.
 const READY_BUDGET: usize = BUDGET;
 const MAX_QUEUE: usize = 64;
+#[derive(Default)]
+struct RequestTimings {
+    route:&'static str, entries:usize, refs:usize, flags:u8,
+    scan_us:u128, budget_wait_us:u128, refill_us:u128, demand_us:u128,
+}
+impl RequestTimings {
+    fn report(&self,total_us:u128,state_wait_us:u128,asynchronous:bool,lease:bool){
+        if total_us<2000{return;}
+        // Report after releasing loader/budget locks; bound diagnostic IO.
+        static WINDOW:Mutex<(Option<crate::profile_clock::Instant>,u32)>=Mutex::new((None,0));
+        let mut window=WINDOW.lock().unwrap();
+        if window.0.is_none_or(|t|t.elapsed().as_secs()>=1){*window=(Some(crate::profile_clock::Instant::now()),0);}
+        if window.1>=64{return;}window.1+=1;drop(window);
+        let measured=state_wait_us+self.scan_us+self.budget_wait_us+self.refill_us+self.demand_us;
+        crate::core_info!("[surface-bind-parts] total_us={} state_wait_us={} scan_us={} budget_wait_us={} refill_us={} demand_us={} other_us={} route={} async={} lease={} entries={} refs_before={} flags_before={}; flags payload=1 pending=2 speculative=4 suppressed=8 leased=16; wall time",
+            total_us,state_wait_us,self.scan_us,self.budget_wait_us,self.refill_us,self.demand_us,
+            total_us.saturating_sub(measured),self.route,asynchronous,lease,self.entries,self.refs,self.flags);
+    }
+}
 const SCRIPT_PREFETCH_BURST: usize = 4;
+const ANIMATION_PREFETCH_BURST: usize = 4;
 const STORY_DECODE_WINDOW:usize=8;
 const STORY_DECODE_BYTES:usize=16*1024*1024;
 // One suspended source only, charged to the existing 16 MiB working allowance.
 // Never suspend decoded pixels or introduce a second decoder/worker.
 const MAX_PAUSED_SOURCE:usize=2*1024*1024;
-enum LoadStep { Complete(Option<Payload>), Paused(Tracked<Vec<u8>>) }
+enum LoadStep { Missing(u64), Complete(Option<Payload>), Paused(Tracked<Vec<u8>>) }
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
 pub(super) enum Kind { #[default] Image, Mask, Animation }
 impl Kind {
@@ -53,14 +73,40 @@ fn demote(payload: &mut Option<Payload>) -> usize {
     let released = pixels.as_raw().capacity();
     *payload = Some(Payload::Encoded(encoded,proof)); released
 }
-struct Entry { refs: usize, ticket: u64, bind_order:u64, prepared:bool, story_suppressed:bool, pending: bool, deferred: bool, demanded: bool, speculative:bool, payload: Option<Payload>,kind:Kind,leased:bool,lookahead:bool,retry_bytes:usize }
+struct Entry { refs: usize, ticket: u64, bind_order:u64, prepared:bool, missing_epoch:Option<u64>, story_suppressed:bool, pending: bool, deferred: bool, demanded: bool, speculative:bool, payload: Option<Payload>,kind:Kind,leased:bool,lookahead:bool,retry_bytes:usize }
+impl Entry {
+    // Explicit runtime frame registration, unlike the broad Lua cache list.
+    fn registered_animation(&self)->bool { self.leased && self.kind==Kind::Animation }
+}
 struct ReadyClaim { path:String,ticket:u64,bytes:usize,started:std::time::Instant }
 #[derive(Default)]
+struct AccountingSnapshot {
+    ready:CacheParts, mask:CacheParts, animation:CacheParts,
+    preload:crate::image_cache_budget::ScriptPreloadCounts,
+    reserved:usize, pending:bool,
+}
+impl AccountingSnapshot {
+    fn publish(&self, account:&mut crate::image_cache_budget::CacheBudget){
+        account.set_ready_parts(self.ready);
+        self.publish_reservation(account);
+    }
+    fn publish_reservation(&self, account:&mut crate::image_cache_budget::CacheBudget){
+        account.ready_reserved=self.reserved;
+        account.mask_parts=self.mask;
+        account.animation_parts=self.animation;
+        account.script_preload=self.preload;
+        account.request_ready(self.pending);
+    }
+}
+#[derive(Default)]
 struct State {
+    #[cfg(test)] accounting_scans:usize,
+    #[cfg(test)] refill_path_copies:usize,
+    accounting_epoch:u64,
     ready_claim:Option<ReadyClaim>,
     entries: HashMap<String, Entry>, queue: VecDeque<(String, u64)>,
     masks:VecDeque<(String,u64)>,animations:VecDeque<(String,u64)>,urgent:Option<String>,lane:usize,chapter:String,
-    script_burst:usize,
+    script_burst:usize, animation_burst:usize,
     // References to existing jobs only: no extra binding or resource lifetime.
     scene_priority:VecDeque<(String,u64)>,
     story_priority:VecDeque<(String,u64)>,
@@ -108,12 +154,34 @@ impl State{
             ||self.ready_claim.as_ref().is_some_and(|c|c.path!=path&&live(&c.path,c.ticket))
     }
     fn pop_job(&mut self)->Option<(String,u64)>{
+        let job=self.pop_job_inner();
+        if let Some((path,_))=&job {
+            if self.entries[path].registered_animation(){self.animation_burst=self.animation_burst.saturating_add(1);}
+            else{self.animation_burst=0;}
+        }
+        job
+    }
+    fn pop_job_inner(&mut self)->Option<(String,u64)>{
         if let Some(job)=self.pop_priority_job(){return Some(job);}
         if let Some(c)=&self.ready_claim{
             if self.entries.get(&c.path).is_some_and(|e|e.pending&&e.ticket==c.ticket)
                 &&!self.active.as_ref().is_some_and(|(p,t)|p==&c.path&&*t==c.ticket){
                 let job=(c.path.clone(),c.ticket);self.remove_queued(&job.0);
                 self.entries.get_mut(&job.0).unwrap().deferred=false;return Some(job);
+            }
+        }
+        // Explicitly registered animation frames are near-term dependencies,
+        // even when a broad Lua cache list already bound the same paths. Give
+        // at most four jobs precedence, then one normal scheduling opportunity.
+        // Visible demand and physical memory reservations still go first.
+        if self.animation_burst<ANIMATION_PREFETCH_BURST {
+            let candidate=self.entries.iter().filter(|(p,e)|e.pending&&e.registered_animation()
+                &&!self.active.as_ref().is_some_and(|(a,t)|a==*p&&*t==e.ticket))
+                .min_by_key(|(_,e)|e.ticket).map(|(p,e)|(p.clone(),e.ticket));
+            if let Some(job)=candidate {
+                self.remove_queued(&job.0);
+                self.entries.get_mut(&job.0).unwrap().deferred=false;
+                return Some(job);
             }
         }
         while self.script_burst<SCRIPT_PREFETCH_BURST && !self.story_priority.is_empty(){
@@ -151,7 +219,7 @@ impl State{
         self.entries.get_mut(&path).unwrap().deferred=false;
         Some((path,ticket))
     }
-    fn clear_queues(&mut self){self.ready_claim=None;self.queue.clear();self.masks.clear();self.animations.clear();self.urgent=None;self.scene_priority.clear();self.story_priority.clear();self.story_managed.clear();self.story_order.clear();self.story_current.clear();self.story_redecoded.clear();self.script_burst=0;}
+    fn clear_queues(&mut self){self.ready_claim=None;self.queue.clear();self.masks.clear();self.animations.clear();self.urgent=None;self.scene_priority.clear();self.story_priority.clear();self.story_managed.clear();self.story_order.clear();self.story_current.clear();self.story_redecoded.clear();self.script_burst=0;self.animation_burst=0;}
     fn kind_parts(&self,kind:Kind)->CacheParts{
         self.entries.values().filter(|e|e.kind==kind).filter_map(|e|e.payload.as_ref()).fold(CacheParts::default(),|mut sum,p|{sum.add(p.parts());sum})
     }
@@ -167,17 +235,43 @@ impl State{
         self.ready_claim.as_ref().map_or(0,|c|c.bytes.saturating_sub(self.entries.get(&c.path).and_then(|e|e.payload.as_ref()).map_or(0,Payload::bytes)))
     }
     fn update_reservation(&mut self,account:&mut crate::image_cache_budget::CacheBudget){
-        self.refresh_claim();
-        account.ready_reserved=self.claim_bytes();
-        account.mask_parts=self.kind_parts(Kind::Mask);
-        account.animation_parts=self.kind_parts(Kind::Animation);
-        account.script_preload=self.script_preload_counts();
-        if !self.entries.values().any(|e|e.pending){self.reserve_requested=false;}
-        account.request_ready(self.reserve_requested);
+        self.accounting_snapshot().publish_reservation(account);
     }
+    // Collect under the loader state lock; publishing this value needs only a
+    // short shared-budget transaction and does not scan resource paths.
+    fn accounting_snapshot(&mut self)->AccountingSnapshot{
+        #[cfg(test)] {self.accounting_scans+=1;}
+        self.accounting_epoch=crate::ffi::file_size_epoch();
+        self.refresh_claim();
+        let mut snapshot=AccountingSnapshot{reserved:self.claim_bytes(),..Default::default()};
+        let mut pending=false;
+        for (path,e) in &self.entries{
+            pending|=e.pending;
+            if let Some(payload)=&e.payload{
+                let parts=payload.parts();snapshot.ready.add(parts);
+                match e.kind{Kind::Mask=>snapshot.mask.add(parts),Kind::Animation=>snapshot.animation.add(parts),Kind::Image=>{}}
+            }
+            if e.refs==0||e.story_suppressed||crate::ui_image_lifetime::transient_menu_image(path){continue;}
+            snapshot.preload.bound+=1;
+            if e.missing_epoch==Some(crate::ffi::file_size_epoch()){snapshot.preload.missing+=1;continue;}
+            snapshot.preload.pending+=usize::from(e.pending);
+            snapshot.preload.planned+=1;snapshot.preload.completed+=usize::from(e.prepared);
+            match e.payload{
+                Some(Payload::Gray(..)|Payload::Pixels(..)|Payload::Sparse(..))=>snapshot.preload.pixels+=1,
+                Some(Payload::Encoded(..))=>snapshot.preload.encoded+=1,None=>{},
+            }
+        }
+        if !pending{self.reserve_requested=false;}
+        snapshot.pending=self.reserve_requested;
+        snapshot
+    }
+    #[cfg(test)]
     fn script_preload_counts(&self)->crate::image_cache_budget::ScriptPreloadCounts{
         let mut counts=crate::image_cache_budget::ScriptPreloadCounts::default();
         for (_,e) in self.entries.iter().filter(|(p,e)|e.refs>0&&!e.story_suppressed&&!crate::ui_image_lifetime::transient_menu_image(p)){
+            counts.bound+=1;
+            if e.missing_epoch==Some(crate::ffi::file_size_epoch()){counts.missing+=1;continue;}
+            counts.pending+=usize::from(e.pending);
             counts.planned+=1;
             counts.completed+=usize::from(e.prepared);
             match e.payload{
@@ -218,6 +312,10 @@ impl Loader {
           let mut paused:Option<(String,u64,Tracked<Vec<u8>>)>=None;
           let mut video_turn=false;
           loop {
+            // Vita mutexes need not hand ownership to a waiting render thread.
+            // A metadata-only miss/rejection must not reacquire the lock in a
+            // tight loop. Sleep outside all locks, including on continue paths.
+            std::thread::sleep(std::time::Duration::from_millis(1));
             let mut state = s.state.lock().unwrap();
             if paused.as_ref().is_some_and(|(p,t,_)|!state.entries.get(p).is_some_and(|e|e.pending&&e.ticket==*t)){
                 paused=None;state.parked=None;
@@ -248,6 +346,23 @@ impl Loader {
                 else{(state.pop_job(),false)};
             let Some((path,ticket))=job else{continue;};
             if !state.entries.get(&path).is_some_and(|e| e.pending && e.ticket == ticket) { continue; }
+            // The count cap concerns retained Lua-bound payloads, not binding
+            // metadata. Decline speculation before I/O; visible demand bypasses
+            // this gate and uses the publication/replacement path below.
+            let count_limit=s.cache.as_ref().map_or(usize::MAX,|b|b.lock().unwrap().lua_load_max);
+            let animation_admission=count_limit>0&&state.entries[&path].registered_animation();
+            if !priority&&state.entries[&path].speculative&&!state.entries[&path].demanded
+                && !animation_admission
+                && !lua_count_admit(&mut state,&path,count_limit,false){
+                let e=state.entries.get_mut(&path).unwrap();e.pending=false;e.deferred=false;e.retry_bytes=0;
+                if paused.as_ref().is_some_and(|(p,t,_)|p==&path&&*t==ticket){paused=None;state.parked=None;}
+                state.remove_queued(&path);
+                let declined=decline_capped_speculation(&mut state);
+                refill(&mut state);
+                if declined>0{crate::core_info!("[surface-prefetch] count-cap retired={} limit={} bindings={}",declined+1,count_limit,state.entries.len());}
+                if let Some(cache)=&s.cache{state.accounting_snapshot().publish(&mut cache.lock().unwrap());}
+                s.wake.notify_all();continue;
+            }
             // A claim only asks the render thread to reclaim. Do not decode
             // until the bytes are physically available. Foreground demand can
             // use the existing fallback instead of waiting for a retain pass.
@@ -307,6 +422,16 @@ impl Loader {
             state.active=None;
             let mut payload=match step{
                 LoadStep::Complete(p)=>p,
+                LoadStep::Missing(epoch)=>{
+                    if !state.stop&&state.entries.get(&path).is_some_and(|e|e.pending&&e.ticket==ticket){
+                        let e=state.entries.get_mut(&path).unwrap();
+                        e.pending=false;e.deferred=false;e.retry_bytes=0;e.prepared=false;
+                        e.missing_epoch=Some(epoch);e.payload=None;
+                        let snapshot=state.accounting_snapshot();
+                        if let Some(b)=&s.cache{snapshot.publish(&mut b.lock().unwrap());}
+                    }
+                    s.wake.notify_all();continue;
+                }
                 LoadStep::Paused(bytes)=>{
                     if !state.stop&&state.entries.get(&path).is_some_and(|e|e.pending&&e.ticket==ticket){
                         assert!(paused.is_none()&&bytes.capacity()<=MAX_PAUSED_SOURCE);
@@ -319,16 +444,28 @@ impl Loader {
                 }
             };
             if state.entries.get(&path).is_some_and(|e| e.pending && e.ticket == ticket) && !state.stop {
+                let count_limit=s.cache.as_ref().map_or(usize::MAX,|b|b.lock().unwrap().lua_load_max);
+                let demanded=priority||!state.entries[&path].speculative||state.entries[&path].demanded;
+                // Decode registered frames ahead of first display, replacing
+                // cold bound payloads only after a successful result. Keep the
+                // same unique Lua count and byte limits; do not change demand
+                // or retention semantics for the other admission policies.
+                let replace_cold=demanded||state.entries[&path].registered_animation();
+                let count_declined=payload.is_some()&&!lua_count_admit(&mut state,&path,count_limit,replace_cold);
+                if count_declined{payload=None;}
+                let inventory=state.accounting_snapshot();
+                let kind=state.entries[&path].kind;
+                let mut class_used=match kind{Kind::Image=>inventory.ready.total()-inventory.mask.total()-inventory.animation.total(),Kind::Mask=>inventory.mask.total(),Kind::Animation=>inventory.animation.total()};
+                let initial_class_used=class_used;
                 // Lock order: loader state -> retention budget. Provider retain
                 // never takes loader state and never invokes a loader callback.
                 let mut account=s.cache.as_ref().map(|b|b.lock().unwrap());
+                let locked_at=std::time::Instant::now();
                 let physical_budget=account.as_ref().map_or(budget,|b|b.ready_limit());
                 let own_claim=state.ready_claim.as_ref().is_some_and(|c|c.path==path&&c.ticket==ticket);
-                let budget=if own_claim{physical_budget}else{physical_budget.saturating_sub(state.claim_bytes()).max(state.ready_parts().total())};
-                let kind=state.entries[&path].kind;
+                let budget=if own_claim{physical_budget}else{physical_budget.saturating_sub(inventory.reserved).max(inventory.ready.total())};
                 let loaded_bytes=payload.as_ref().map_or(0,Payload::bytes);
-                let mut class_used=state.kind_parts(kind).total();
-                if kind!=Kind::Image&&state.entries[&path].demanded{
+                if kind!=Kind::Image&&state.entries[&path].demanded&&class_used.saturating_add(loaded_bytes)>kind.cap(){
                     let needed=payload.as_ref().map_or(0,Payload::bytes);
                     let mut older:Vec<_>=state.entries.iter().filter(|(p,e)|p.as_str()!=path&&e.kind==kind&&!e.demanded&&e.payload.is_some()).map(|(p,e)|(e.ticket,p.clone())).collect();older.sort_unstable();
                     if needed<=kind.cap(){
@@ -343,10 +480,12 @@ impl Loader {
                 if payload.as_ref().is_some_and(|p| p.bytes() > budget) { demote(&mut payload); }
                 if payload.as_ref().is_some_and(|p| p.bytes() > budget) { payload = None; }
                 let bytes = payload.as_ref().map_or(0, Payload::bytes);
-                let used: usize = state.entries.values().filter_map(|e| e.payload.as_ref()).map(Payload::bytes).sum();
+                let used=inventory.ready.total().saturating_sub(initial_class_used-class_used);
                 let mut total = used.saturating_add(bytes);
-                let mut old: Vec<_> = state.entries.iter().filter(|(_, e)| e.payload.is_some() && !e.demanded).map(|(p,e)| (e.ticket,p.clone())).collect();
-                old.sort_unstable();
+                let old=if total>budget{
+                    let mut old:Vec<_>=state.entries.iter().filter(|(_,e)|e.payload.is_some()&&!e.demanded).map(|(p,e)|(e.ticket,p.clone())).collect();
+                    old.sort_unstable();old
+                }else{Vec::new()};
                 // A later speculative request must not destroy completed,
                 // still-bound first-use payloads to admit itself. Native surfaces
                 // distinguish referenced objects from the reclaimable cache;
@@ -398,19 +537,21 @@ impl Loader {
                 entry.pending = false;
                 // Admission failure is not a missing file. Remember only the
                 // required capacity, never a second pixel/source allocation.
-                entry.retry_bytes=if speculative&&payload.is_none(){loaded_bytes}else{0};
+                entry.retry_bytes=if speculative&&!count_declined&&payload.is_none(){loaded_bytes}else{0};
                 if let Some(p)=payload.as_mut(){p.ready();}
-                if payload.is_some(){entry.prepared=true;}
+                if payload.is_some(){entry.prepared=true;entry.missing_epoch=None;}
                 entry.payload = payload;
                 let payload_kind=match &entry.payload {Some(Payload::Gray(..))=>"gray8",Some(Payload::Pixels(..))=>"pixels",Some(Payload::Sparse(..))=>"zero-span",Some(Payload::Encoded(..))=>"encoded",None if entry.retry_bytes>0=>"capacity-deferred",None=>"missing"};
                 let retained_bytes=entry.payload.as_ref().map_or(0,Payload::bytes);
-                let parts=state.ready_parts();let cache_bytes=parts.total();
-                if let Some(b)=account.as_mut(){b.set_ready_parts(parts);state.update_reservation(b);}
-                crate::core_info!("[surface-prefetch] ready path={} bytes={} elapsed_us={} payload={} retained_bytes={} cache_bytes={} cache_budget={} kind={} kind_bytes={} kind_limit={}",
-                    path, bytes, start.elapsed().as_micros(),payload_kind,retained_bytes,cache_bytes,budget,kind.label(),state.kind_parts(kind).total(),kind.cap());
                 let reclaim_budget=account.as_ref().map_or(budget,|b|b.ready_reclaim_limit());
                 retry_capacity_with_reclaim(&mut state,physical_budget,reclaim_budget);
-                if let Some(b)=account.as_mut(){b.set_ready_parts(state.ready_parts());state.update_reservation(b);}
+                let snapshot=state.accounting_snapshot();
+                if let Some(b)=account.as_mut(){snapshot.publish(b);}
+                let budget_hold_us=locked_at.elapsed().as_micros();
+                drop(account);
+                let kind_bytes=match kind{Kind::Image=>snapshot.ready.total()-snapshot.mask.total()-snapshot.animation.total(),Kind::Mask=>snapshot.mask.total(),Kind::Animation=>snapshot.animation.total()};
+                crate::core_info!("[surface-prefetch] ready path={} bytes={} elapsed_us={} payload={} retained_bytes={} cache_bytes={} cache_budget={} kind={} kind_bytes={} kind_limit={} budget_hold_us={} entries={}",
+                    path, bytes, start.elapsed().as_micros(),payload_kind,retained_bytes,snapshot.ready.total(),budget,kind.label(),kind_bytes,kind.cap(),budget_hold_us,state.entries.len());
             }
             s.wake.notify_all();
           }
@@ -420,12 +561,27 @@ impl Loader {
     pub fn bind(&self, path: &str, asynchronous: bool) {
         self.request(path,asynchronous,Kind::Image,false);
     }
+    pub fn try_bind_hidden(&self,path:&str)->bool {
+        let started=crate::profile_clock::Instant::now();
+        let Ok(state)=self.shared.state.try_lock() else{return false;};
+        if state.stop{return false;}
+        let locked_us=started.elapsed().as_micros();
+        let mut parts=RequestTimings::default();
+        self.request_locked(path,true,Kind::Image,false,state,&mut parts);
+        parts.report(started.elapsed().as_micros(),locked_us,true,false);
+        true
+    }
+    pub fn try_unbind_hidden(&self,path:&str)->bool {
+        let Ok(state)=self.shared.state.try_lock() else{return false;};
+        self.unbind_locked(path,state);
+        true
+    }
     pub fn begin_chapter(&self,chapter:&str){
         let mut state=self.shared.state.lock().unwrap();
         if state.chapter==chapter{return;}
         state.chapter=chapter.into();
         state.story_priority.clear();state.story_managed.clear();state.story_order.clear();state.story_current.clear();state.story_redecoded.clear();state.ready_claim=None;
-        state.script_burst=0;
+        state.script_burst=0;state.animation_burst=0;
         for e in state.entries.values_mut(){e.leased=false;e.lookahead=false;}
         state.entries.retain(|_,e|e.refs>0);
         let live:std::collections::HashSet<_>=state.entries.keys().cloned().collect();
@@ -434,7 +590,65 @@ impl Loader {
         state.animations.retain(|(p,_)|live.contains(p));
         refill(&mut state);self.update_ready_account(&mut state);self.shared.wake.notify_all();
     }
-    pub fn preload(&self,path:&str,kind:Kind){self.request(path,true,kind,true);}
+    #[cfg(test)]
+    pub fn preload(&self,path:&str,kind:Kind){self.preload_many(&[path.into()],kind);}
+    fn preload_many(&self,paths:&[String],kind:Kind){
+        if paths.is_empty(){return;}
+        let started=crate::profile_clock::Instant::now();
+        let mut state=self.shared.state.lock().unwrap();
+        let locked_us=started.elapsed().as_micros();
+        if state.stop{return;}
+        let epoch=crate::ffi::file_size_epoch();
+        let mut counts=None;
+        let mut changed=false;
+        // Register a contiguous animation run atomically. No image bytes are
+        // loaded here; publish counters and refill the bounded queue only once.
+        for path in paths {
+            if state.entries.get(path).is_some_and(|e|e.leased&&!e.story_suppressed&&
+                e.missing_epoch.is_none_or(|old|old==epoch)&&
+                !(e.kind==Kind::Image&&kind!=Kind::Image&&e.payload.is_none())){continue;}
+            let counts=counts.get_or_insert_with(||{
+                let mut c=[0usize;3];for e in state.entries.values(){if e.leased{c[e.kind as usize]+=1;}}c
+            });
+            let already=state.entries.get(path).is_some_and(|e|e.leased&&e.missing_epoch.is_none_or(|old|old==epoch));
+            if !already&&counts[kind as usize]>=128{continue;}
+            let e=state.entries.entry(path.clone()).or_insert(Entry{refs:0,ticket:0,bind_order:0,
+                prepared:false,missing_epoch:None,story_suppressed:false,pending:false,deferred:false,
+                demanded:false,speculative:false,payload:None,kind,leased:false,lookahead:false,retry_bytes:0});
+            if e.leased{counts[e.kind as usize]-=1;}
+            e.leased=true;
+            let reclassify=e.kind==Kind::Image&&kind!=Kind::Image&&e.payload.is_none();
+            if reclassify{e.kind=kind;}
+            counts[e.kind as usize]+=1;
+            e.story_suppressed=false;
+            if crate::ffi::image_missing_cached(path)==Some(epoch)&&!e.pending&&e.payload.is_none(){e.missing_epoch=Some(epoch);}
+            let schedule=e.missing_epoch!=Some(epoch)&&!crate::ui_image_lifetime::transient_menu_image(path)
+                &&!already&&!e.pending&&e.payload.is_none();
+            if reclassify{if let Some(job)=state.remove_queued(path){state.queue_mut(kind).push_back(job);}}
+            if schedule {
+                state.serial+=1;let ticket=state.serial;
+                let e=state.entries.get_mut(path).unwrap();
+                e.ticket=ticket;e.missing_epoch=None;e.prepared=false;e.pending=true;e.deferred=true;
+                e.speculative=true;e.retry_bytes=0;state.reserve_requested=true;
+            }
+            changed=true;
+        }
+        let registered_us=started.elapsed().as_micros();
+        let mut refill_us=0;let mut scan_us=0;let mut budget_wait_us=0;let mut publish_us=0;
+        if changed{
+            let phase=crate::profile_clock::Instant::now();refill(&mut state);refill_us=phase.elapsed().as_micros();
+            if let Some(cache)=&self.shared.cache{
+                let phase=crate::profile_clock::Instant::now();let snapshot=state.accounting_snapshot();scan_us=phase.elapsed().as_micros();
+                let phase=crate::profile_clock::Instant::now();let mut account=cache.lock().unwrap();budget_wait_us=phase.elapsed().as_micros();
+                let phase=crate::profile_clock::Instant::now();snapshot.publish(&mut account);publish_us=phase.elapsed().as_micros();
+            }
+            self.shared.wake.notify_one();
+        }
+        drop(state);
+        let total=started.elapsed().as_micros();
+        if total>=2_000{crate::core_info!("[prefetch-batch-parts] files={} total_us={} state_wait_us={} register_us={} refill_us={} scan_us={} budget_wait_us={} publish_us={}; exclusive wall spans",
+            paths.len(),total,locked_us,registered_us-locked_us,refill_us,scan_us,budget_wait_us,publish_us);}
+    }
     // Independent rolling ownership: never changes Lua bind/unbind counts or
     // the chapter mask/animation leases. Retired jobs cannot publish stale data.
     pub fn update_lookahead(&self,paths:&[String]) {
@@ -451,7 +665,7 @@ impl Loader {
         let mut scheduled=0;
         for p in &wanted {
             let e=state.entries.entry(p.clone()).or_insert(Entry{refs:0,ticket:0,bind_order:0,
-                prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,
+                prepared:false,missing_epoch:None,story_suppressed:false,pending:false,deferred:false,demanded:false,
                 speculative:true,payload:None,kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0});
             let entering=!e.lookahead;
             e.lookahead=true;
@@ -470,7 +684,16 @@ impl Loader {
         crate::core_info!("[story-lookahead] window={} scheduled={} retired={}",wanted.len(),scheduled,stale.len());
     }
     pub fn prioritize_scene(&self,paths:&[String])->usize{
-        let mut state=self.shared.state.lock().unwrap();
+        let started=crate::profile_clock::Instant::now();
+        // This is a per-frame scheduling hint, not a resource acquisition.
+        // Keep the previous queue while a worker owns the cache and retry next
+        // frame. Required image reads still use the normal demand path.
+        let mut state=match self.shared.state.try_lock() {
+            Ok(state)=>state,
+            Err(std::sync::TryLockError::WouldBlock)=>return 0,
+            Err(std::sync::TryLockError::Poisoned(error))=>panic!("cache state poisoned: {error}"),
+        };
+        let wait_us=started.elapsed().as_micros();
         state.scene_priority.clear();
         if state.stop{return 0;}
         let mut seen=std::collections::HashSet::new();
@@ -490,6 +713,9 @@ impl Loader {
         }
         let count=state.scene_priority.len();
         if count>0{self.shared.wake.notify_one();}
+        let entries=state.entries.len();
+        drop(state);
+        if wait_us>=1000 {crate::core_info!("[surface-priority-wait] wait_us={} total_us={} paths={} entries={}",wait_us,started.elapsed().as_micros(),paths.len(),entries);}
         count
     }
     // Retire only direct image bindings previously observed in the standard
@@ -534,16 +760,115 @@ impl Loader {
             seen.len(),state.story_priority.len(),stale.len(),released);
     }
     fn request(&self,path:&str,asynchronous:bool,kind:Kind,lease:bool){
-        let mut state = self.shared.state.lock().unwrap();
+        let started=crate::profile_clock::Instant::now();
+        let state = self.shared.state.lock().unwrap();
+        let locked_us=started.elapsed().as_micros();
+        let mut parts=RequestTimings::default();
+        self.request_locked(path,asynchronous,kind,lease,state,&mut parts);
+        parts.report(started.elapsed().as_micros(),locked_us,asynchronous,lease);
+    }
+    fn request_locked(&self,path:&str,asynchronous:bool,kind:Kind,lease:bool,
+        mut state:std::sync::MutexGuard<'_,State>,parts:&mut RequestTimings){
+        parts.route="stopped";parts.entries=state.entries.len();
         if state.stop { return; }
-        let already_leased=state.entries.get(path).is_some_and(|e|e.leased);
+        if let Some(e)=state.entries.get(path){
+            parts.refs=e.refs;
+            parts.flags=u8::from(e.payload.is_some()) | (u8::from(e.pending)<<1) |
+                (u8::from(e.speculative)<<2) | (u8::from(e.story_suppressed)<<3) | (u8::from(e.leased)<<4);
+        }
+        // Published resident counts are a conservative subset of all bound
+        // payloads. Once this subset reaches the cap, speculative work cannot
+        // be admitted. Keep the binding; foreground demand still bypasses it.
+        let count_full=asynchronous&&!lease&&self.shared.cache.as_ref().and_then(|cache|cache.try_lock().ok()).is_some_and(|b|{
+            b.script_preload.pixels.saturating_add(b.script_preload.encoded)>=b.lua_load_max
+        });
+        if asynchronous&&!lease&&!state.entries.contains_key(path){
+            parts.route="new";
+            // A new Lua binding owns no resident bytes. Update just its counts
+            // instead of rescanning the chapter after every asynchronous hint.
+            let epoch=crate::ffi::file_size_epoch();
+            if state.accounting_epoch!=epoch{self.update_ready_account_timed(&mut state,parts);}
+            let lazy=crate::ui_image_lifetime::transient_menu_image(path);
+            let missing=crate::ffi::image_missing_cached(path)==Some(epoch);
+            let pending=!lazy&&!missing&&!count_full;
+            state.serial+=1;let order=state.serial;
+            if pending{state.serial+=1;}
+            let ticket=if pending{state.serial}else{0};
+            let queued=pending&&state.queue_len()<MAX_QUEUE;
+            state.entries.insert(path.into(),Entry{refs:1,ticket,bind_order:order,
+                prepared:false,missing_epoch:missing.then_some(epoch),story_suppressed:false,
+                pending,deferred:pending&&!queued,demanded:false,speculative:pending,
+                payload:None,kind,leased:false,lookahead:false,retry_bytes:0});
+            if queued{state.queue_mut(kind).push_back((path.into(),ticket));}
+            if pending{state.reserve_requested=true;}
+            if let Some(cache)=&self.shared.cache{
+                let wait=crate::profile_clock::Instant::now();
+                let mut b=cache.lock().unwrap();
+                parts.budget_wait_us+=wait.elapsed().as_micros();
+                if !lazy{
+                    b.script_preload.bound+=1;
+                    if missing{b.script_preload.missing+=1;}else{
+                        b.script_preload.planned+=1;b.script_preload.pending+=usize::from(pending);
+                    }
+                }
+                b.request_ready(state.reserve_requested);
+            }
+            if pending{self.shared.wake.notify_one();}
+            return;
+        }
+        // Repeated asynchronous hints only retain the existing lease. No
+        // payload, reference count or reservation changes on this path.
+        // Keep reclassification and suppressed-story recovery on the slow path.
+        if asynchronous && lease && state.entries.get(path).is_some_and(|e|
+            e.leased && !e.story_suppressed && e.missing_epoch.is_none_or(|epoch|epoch==crate::ffi::file_size_epoch()) &&
+            !(e.kind==Kind::Image && kind!=Kind::Image && e.payload.is_none())) {
+            parts.route="lease-reuse";
+            return;
+        }
+        // Different poses often bind the same body/face images. An additional
+        // Lua reference changes neither resident bytes nor unique preload
+        // counts. Avoid rescanning all entries (and taking the budget lock).
+        // Missing/consumed payloads still take the normal retry path.
+        if asynchronous && !lease {
+            if let Some(e)=state.entries.get_mut(path) {
+                if e.refs>0 && !e.story_suppressed && (count_full||e.payload.is_some()||(e.pending&&e.speculative)||
+                    e.missing_epoch==Some(crate::ffi::file_size_epoch()))
+                    && !(e.kind==Kind::Image && kind!=Kind::Image && e.payload.is_none()) {
+                    parts.route="ref-reuse";
+                    e.refs+=1;
+                    return;
+                }
+            }
+        }
+        parts.route="retry";
+        // A consumed image still owns its Lua binding, but no resident bytes.
+        // Retrying it changes only pending/completed progress. Keep first binds,
+        // epoch reconciliation, suppression, lane changes and reservations on
+        // the full accounting path.
+        let retry_progress=if asynchronous&&!lease&&state.ready_claim.is_none()
+            &&state.accounting_epoch==crate::ffi::file_size_epoch()
+            &&!crate::ui_image_lifetime::transient_menu_image(path) {
+            state.entries.get(path).filter(|e|e.refs>0&&!e.story_suppressed
+                &&!e.pending&&e.payload.is_none()
+                &&e.missing_epoch!=Some(crate::ffi::file_size_epoch())
+                &&!(e.kind==Kind::Image&&kind!=Kind::Image)).map(|e|e.prepared)
+        }else{None};
+        let already_leased=state.entries.get(path).is_some_and(|e|e.leased&&e.missing_epoch.is_none_or(|epoch|epoch==crate::ffi::file_size_epoch()));
         let first_binding=!lease&&state.entries.get(path).is_none_or(|e|e.refs==0);
         if lease&&!already_leased&&state.entries.values().filter(|e|e.leased&&e.kind==kind).count()>=128{return;}
         if let Some(e) = state.entries.get_mut(path) { if lease{e.leased=true;}else{e.refs+=1;} }
-        else { state.entries.insert(path.into(), Entry { refs:usize::from(!lease),ticket:0,bind_order:0,prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:false,payload:None,kind,leased:lease,lookahead:false,retry_bytes:0 }); }
+        else { state.entries.insert(path.into(), Entry { refs:usize::from(!lease),ticket:0,bind_order:0,prepared:false,missing_epoch:None,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:false,payload:None,kind,leased:lease,lookahead:false,retry_bytes:0 }); }
         // A chapter hint can precede its Lua binding. Track script order apart
         // from the cancellation ticket; never invalidate an in-flight load.
         if first_binding{state.serial+=1;let order=state.serial;state.entries.get_mut(path).unwrap().bind_order=order;}
+        // A leased animation/story payload can acquire its first Lua binding
+        // without a worker publication. Apply the same count policy here.
+        if first_binding&&state.entries[path].payload.is_some(){
+            let wait=crate::profile_clock::Instant::now();
+            let limit=self.shared.cache.as_ref().map_or(usize::MAX,|b|b.lock().unwrap().lua_load_max);
+            parts.budget_wait_us+=wait.elapsed().as_micros();
+            if !lua_count_admit(&mut state,path,limit,!asynchronous){state.entries.get_mut(path).unwrap().payload=None;}
+        }
         // Classification is fixed when a result is admitted; don't move a large
         // completed ordinary result into a smaller lane without accounting it.
         if state.entries[path].kind==Kind::Image&&kind!=Kind::Image&&state.entries[path].payload.is_none(){
@@ -555,16 +880,32 @@ impl Loader {
         // System-cache bindings for these menus keep reference bookkeeping,
         // but no background IO or READY allocation while the menu is closed.
         let lazy_ui=asynchronous&&crate::ui_image_lifetime::transient_menu_image(path);
-        let needs_job=!lazy_ui&&!(lease&&already_leased)&&state.entries.get(path).is_some_and(|e|!e.pending && e.payload.is_none());
+        if let Some(epoch)=asynchronous.then(||crate::ffi::image_missing_cached(path)).flatten(){
+            let e=state.entries.get_mut(path).unwrap();
+            if !e.pending&&e.payload.is_none(){e.missing_epoch=Some(epoch);}
+        }
+        let skip_missing=asynchronous&&state.entries[path].missing_epoch==Some(crate::ffi::file_size_epoch());
+        let needs_job=!count_full&&!skip_missing&&!lazy_ui&&!(lease&&already_leased)&&state.entries.get(path).is_some_and(|e|!e.pending && e.payload.is_none());
         if needs_job {
             state.serial += 1;let ticket=state.serial;
-            let e=state.entries.get_mut(path).unwrap();e.ticket=ticket;e.prepared=false;e.pending=true;e.deferred=true;e.speculative=asynchronous;e.retry_bytes=0;
-            refill(&mut state);self.shared.wake.notify_one();
+            let e=state.entries.get_mut(path).unwrap();e.ticket=ticket;e.missing_epoch=None;e.prepared=false;e.pending=true;e.deferred=true;e.speculative=asynchronous;e.retry_bytes=0;
+            let refill_started=crate::profile_clock::Instant::now();
+            refill(&mut state);parts.refill_us+=refill_started.elapsed().as_micros();self.shared.wake.notify_one();
         }
         if asynchronous&&needs_job{state.reserve_requested=true;}
-        self.update_ready_account(&mut state);
+        if let Some(completed)=retry_progress.filter(|_|needs_job){
+            parts.route="retry-progress";
+            if let Some(cache)=&self.shared.cache{
+                let wait=crate::profile_clock::Instant::now();
+                let mut b=cache.lock().unwrap();
+                parts.budget_wait_us+=wait.elapsed().as_micros();
+                b.script_preload.pending+=1;
+                b.script_preload.completed-=usize::from(completed);
+                b.request_ready(state.reserve_requested);
+            }
+        }else{self.update_ready_account_timed(&mut state,parts);}
         drop(state);
-        if !asynchronous { self.wait(path); }
+        if !asynchronous {let wait=crate::profile_clock::Instant::now();self.wait(path);parts.demand_us+=wait.elapsed().as_micros();}
     }
     fn wait(&self, path: &str) {
         let start = std::time::Instant::now();
@@ -611,7 +952,9 @@ impl Loader {
         let key = self.key(path)?;
         let started = std::time::Instant::now();
         let mut state = self.shared.state.lock().unwrap();
-        if (crate::ui_image_lifetime::transient_menu_image(&key)||state.entries[&key].story_suppressed)
+        if state.stop{return None;}
+        let story_suppressed=state.entries.get(&key)?.story_suppressed;
+        if (crate::ui_image_lifetime::transient_menu_image(&key)||story_suppressed)
             && state.entries.get(&key).is_some_and(|e|!e.pending&&e.payload.is_none()) {
             state.serial+=1;
             let ticket=state.serial;
@@ -673,7 +1016,13 @@ impl Loader {
     pub fn retain_menu_images_resolving<P:std::borrow::Borrow<std::collections::HashSet<String>>>(
         &self, resolve:impl FnOnce()->P,
     ) {
-        let mut state=self.shared.state.lock().unwrap();
+        // This per-frame cleanup is optional: retry next frame rather than
+        // stall rendering behind a worker publishing or releasing images.
+        let mut state=match self.shared.state.try_lock() {
+            Ok(state)=>state,
+            Err(std::sync::TryLockError::WouldBlock)=>return,
+            Err(std::sync::TryLockError::Poisoned(error))=>panic!("loader state poisoned: {error}"),
+        };
         // Lazy startup bindings have no storage or pending work to release.
         // In a video scene they must not trigger path expansion at 30/60 Hz.
         let candidates:Vec<_>=state.entries.iter().filter(|(p,e)|
@@ -703,8 +1052,34 @@ impl Loader {
         else { state.entries.values().any(|e| e.pending&&e.refs>0) }
     }
     pub fn unbind(&self, path: &str) {
-        let mut state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
+        self.unbind_locked(path,state);
+    }
+    fn unbind_locked(&self,path:&str,mut state:std::sync::MutexGuard<'_,State>){
+        if state.entries.get(path).is_some_and(|e|e.refs==1&&!e.leased&&!e.lookahead
+            &&!e.pending&&e.payload.is_none()&&e.retry_bytes==0)
+            && !state.ready_claim.as_ref().is_some_and(|c|c.path==path){
+            // Count-capped/missing/consumed bindings hold only metadata. Their
+            // removal cannot release capacity or make a deferred job runnable.
+            let epoch=crate::ffi::file_size_epoch();
+            if state.accounting_epoch!=epoch{self.update_ready_account(&mut state);}
+            let e=state.entries.remove(path).unwrap();
+            state.remove_queued(path);
+            if !e.story_suppressed&&!crate::ui_image_lifetime::transient_menu_image(path){
+                if let Some(cache)=&self.shared.cache{
+                    let mut b=cache.lock().unwrap();let counts=&mut b.script_preload;
+                    counts.bound-=1;
+                    if e.missing_epoch==Some(epoch){counts.missing-=1;}else{
+                        counts.planned-=1;counts.completed-=usize::from(e.prepared);
+                    }
+                }
+            }
+            return;
+        }
         if let Some(e) = state.entries.get_mut(path) {
+            // Storage, progress and queue membership are unchanged until the
+            // final Lua reference is released.
+            if e.refs>1 {e.refs-=1;return;}
             e.refs = e.refs.saturating_sub(1);
             if e.refs == 0&&!e.leased&&!e.lookahead { state.entries.remove(path); state.remove_queued(path); }
         }
@@ -740,9 +1115,20 @@ impl Loader {
     }
     fn update_ready_account(&self,state:&mut State){
         if let Some(cache)=&self.shared.cache{
+            let snapshot=state.accounting_snapshot();
             let mut account=cache.lock().unwrap();
-            account.set_ready_parts(state.ready_parts());
-            state.update_reservation(&mut account);
+            snapshot.publish(&mut account);
+        }
+    }
+    fn update_ready_account_timed(&self,state:&mut State,parts:&mut RequestTimings){
+        if let Some(cache)=&self.shared.cache{
+            let scan=crate::profile_clock::Instant::now();
+            let snapshot=state.accounting_snapshot();
+            parts.scan_us+=scan.elapsed().as_micros();
+            let wait=crate::profile_clock::Instant::now();
+            let mut account=cache.lock().unwrap();
+            parts.budget_wait_us+=wait.elapsed().as_micros();
+            snapshot.publish(&mut account);
         }
     }
 }
@@ -823,11 +1209,57 @@ fn rehydrate_story(state:&mut State,budget:usize)->bool{
     false
 }
 // Deferred requests live in existing binding records, not an unbounded job queue.
+// Do not remove Lua bindings when reclaiming cache payloads. Active provider
+// textures are separately owned, and demanded loader results cannot be evicted.
+// The cap is already known to be full. Retire the remaining cold batch in
+// one pass instead of repeatedly sorting and accounting thousands of jobs.
+// Bindings survive; foreground demand can schedule them again when needed.
+fn decline_capped_speculation(state:&mut State)->usize{
+    let mut protected:std::collections::HashSet<String>=state.scene_priority.iter().map(|(p,_)|p.clone()).collect();
+    protected.extend(state.urgent.iter().cloned());
+    protected.extend(state.active.iter().map(|(p,_)|p.clone()));
+    protected.extend(state.parked.iter().map(|(p,_)|p.clone()));
+    protected.extend(state.ready_claim.iter().map(|c|c.path.clone()));
+    let mut declined=0;
+    for (path,e) in &mut state.entries {
+        if e.refs>0&&e.pending&&e.speculative&&!e.demanded&&!e.registered_animation()&&e.payload.is_none()&&!protected.contains(path){
+            e.pending=false;e.deferred=false;e.retry_bytes=0;declined+=1;
+        }
+    }
+    for queue in [&mut state.queue,&mut state.masks,&mut state.animations,&mut state.story_priority]{
+        queue.retain(|(p,t)|state.entries.get(p).is_some_and(|e|e.pending&&e.ticket==*t));
+    }
+    declined
+}
+fn lua_count_admit(state:&mut State,path:&str,limit:usize,demanded:bool)->bool{
+    if limit==usize::MAX||state.entries[path].refs==0{return true;}
+    let mut count=state.entries.iter().filter(|(p,e)|p.as_str()!=path&&e.refs>0&&e.payload.is_some()).count();
+    if count<limit{return true;}
+    if !demanded{return false;}
+    let mut old:Vec<_>=state.entries.iter().filter(|(p,e)|p.as_str()!=path&&e.refs>0&&e.payload.is_some()&&!e.demanded)
+        .map(|(p,e)|(e.registered_animation(),e.bind_order,p.clone())).collect();old.sort_unstable();
+    for (_,_,p) in old{if count<limit{break;}let e=state.entries.get_mut(&p).unwrap();e.payload=None;e.retry_bytes=0;count-=1;}
+    count<limit
+}
+
 fn refill(state:&mut State) {
     if state.stop || state.queue_len() >= MAX_QUEUE { return; }
-    let mut deferred:Vec<_>=state.entries.iter().filter(|(_,e)|e.pending&&e.deferred)
-        .map(|(p,e)|(e.refs==0,e.ticket,p.clone())).collect();deferred.sort_unstable();
-    for (_,ticket,path) in deferred.into_iter().take(MAX_QUEUE-state.queue_len()) {
+    let slots=MAX_QUEUE-state.queue_len();
+    // Select only the jobs that fit. Borrow paths while ranking, then clone
+    // at most MAX_QUEUE of them instead of allocating the whole chapter.
+    let mut candidates=std::collections::BinaryHeap::with_capacity(slots);
+    for (path,e) in &state.entries {
+        if !e.pending||!e.deferred {continue;}
+        let candidate=(e.refs==0,e.ticket,path.as_str());
+        if candidates.len()<slots {candidates.push(candidate);}
+        else if candidates.peek().is_some_and(|last|candidate<*last) {
+            *candidates.peek_mut().unwrap()=candidate;
+        }
+    }
+    let deferred:Vec<_>=candidates.into_sorted_vec().into_iter()
+        .map(|(_,ticket,path)|(ticket,path.to_owned())).collect();
+    #[cfg(test)] {state.refill_path_copies+=deferred.len();}
+    for (ticket,path) in deferred {
         let e=state.entries.get_mut(&path).unwrap();e.deferred=false;let kind=e.kind;state.queue_mut(kind).push_back((path,ticket));
     }
 }
@@ -889,21 +1321,26 @@ fn prefetch_disk_texture(path:&str,budget:usize,cancelled:&dyn Fn()->bool)->Opti
 }
 
 fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,should_yield:&dyn Fn(usize)->bool,budget:usize,comments:&super::png_comments::SharedComments)->LoadStep{
-    super::ogv_cache::reclaim(budget);
-    super::emote_source_cache::reclaim(budget);
+
     let policy=crate::cpu_image_compression::policy_for(path);
     if let Some(bytes)=resume{return decode_source_policy(bytes,cancelled,should_yield,budget,policy.as_ref());}
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     if let Some(bytes)=prefetch_disk_texture(path,budget,cancelled){
         return decode_source_policy(bytes,cancelled,should_yield,budget,policy.as_ref());
     }
+    if let Some(epoch)=crate::ffi::image_missing_cached(path){return LoadStep::Missing(epoch);}
+    let mut found=false;
+    let epoch=crate::ffi::file_size_epoch();
     let bytes=(||{
     for candidate in crate::native_texture::candidates(path) {
         if cancelled(){return None;}
         let metadata_epoch=super::png_comments::prepare_epoch(comments,&candidate);
         let Some(size) = crate::ffi::query_asset_size(&candidate) else { continue; };
+        found=true;
         if cancelled(){return None;}
         if size > budget as u64 { return None; } // Synchronous source remains the fallback.
+        super::ogv_cache::reclaim(budget);
+        super::emote_source_cache::reclaim(budget);
         // Size is already known: avoid a second archive/directory size lookup.
         let mut charge=Charge::reserve(Owner::Source,size as usize);
         let Some(bytes) = crate::ffi::request_asset_range(&candidate, 0, size as usize) else { continue; };
@@ -919,6 +1356,8 @@ fn load(path:&str,resume:Option<Tracked<Vec<u8>>>,cancelled:&dyn Fn()->bool,shou
     }
     None
     })();
+    if !found&&!cancelled()&&epoch==crate::ffi::file_size_epoch()
+        &&crate::ffi::image_missing_cached(path)==Some(epoch){return LoadStep::Missing(epoch);}
     match bytes{Some(b)=>decode_source_policy(b,cancelled,should_yield,budget,policy.as_ref()),None=>LoadStep::Complete(None)}
 }
 #[cfg(test)]
@@ -1053,6 +1492,12 @@ fn worker(comments:super::png_comments::SharedComments)->Option<Arc<Loader>> {
     Some(worker)
 }
 pub(super) fn bind(path:&str,asynchronous:bool,comments:super::png_comments::SharedComments){if let Some(w)=worker(comments){w.bind(path,asynchronous);}}
+pub(super) fn try_bind_hidden(path:&str,comments:super::png_comments::SharedComments)->bool{
+    worker(comments).is_some_and(|w|w.try_bind_hidden(path))
+}
+pub(super) fn try_unbind_hidden(path:&str)->bool{
+    handle().is_none_or(|w|w.try_unbind_hidden(path))
+}
 pub(super) fn wake_models(comments:super::png_comments::SharedComments){if let Some(w)=worker(comments){
     let mut s=w.shared.state.lock().unwrap();s.model_pending=true;w.shared.wake.notify_one();
 }}
@@ -1063,8 +1508,9 @@ pub(super) fn model_should_yield()->bool{handle().is_some_and(|w|{
 pub(super) fn preload(paths:&[String],kind:Kind,chapter:Option<&str>,comments:super::png_comments::SharedComments){
     if let Some(w)=worker(comments){
         if let Some(chapter)=chapter{w.begin_chapter(chapter);}
-        for p in paths{w.preload(p,kind);}
-        crate::core_info!("[surface-prefetch] hints kind={} files={} chapter={} cap={}",kind.label(),paths.len(),chapter.unwrap_or("current"),kind.cap());
+        let started=std::time::Instant::now();
+        w.preload_many(paths,kind);
+        crate::core_info!("[surface-prefetch] hints kind={} files={} chapter={} cap={} batch_us={}",kind.label(),paths.len(),chapter.unwrap_or("current"),kind.cap(),started.elapsed().as_micros());
     }
 }
 pub(super) fn take(path:&str)->Option<Payload>{handle()?.take(path)}
@@ -1088,6 +1534,69 @@ pub(super) fn shutdown(){super::ogv_cache::cancel_plan();let loader=LOADER.lock(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refill_copies_only_available_slots_and_preserves_priority() {
+        let mut state=State::default();
+        for i in 0..3411 {
+            let mut e=story_entry(Payload::encoded(vec![]));
+            e.payload=None;e.pending=true;e.deferred=true;e.ticket=i+1;
+            e.refs=usize::from(i%3==0);
+            state.entries.insert(format!("asset/{i:04}"),e);
+        }
+        let mut expected:Vec<_>=state.entries.iter().map(|(p,e)|(e.refs==0,e.ticket,p.clone())).collect();
+        expected.sort_unstable();
+        refill(&mut state);
+        let got:Vec<_>=state.queue.iter().map(|(p,t)|(*t,p.clone())).collect();
+        let want:Vec<_>=expected.into_iter().take(MAX_QUEUE).map(|(_,t,p)|(t,p)).collect();
+        assert_eq!(got,want);
+        assert_eq!(state.refill_path_copies,MAX_QUEUE,"do not clone paths that cannot enter the bounded queue");
+        assert_eq!(state.entries.values().filter(|e|e.deferred).count(),3411-MAX_QUEUE);
+    }
+    #[test]
+    fn full_preload_cap_keeps_new_and_repeated_bindings_out_of_worker_queue(){
+        let (tx,rx)=std::sync::mpsc::channel();let (go,wait)=std::sync::mpsc::channel();
+        let budget=crate::image_cache_budget::CacheBudget::new(1024*1024);
+        budget.lock().unwrap().lua_load_max=2;
+        let loader=Loader::with_policy(move|path,_|{
+            if path=="blocked"{tx.send(()).unwrap();wait.recv().unwrap();}
+            Some(Payload::encoded(vec![3;16]))
+        },1024*1024,Some(budget.clone())).unwrap();
+        loader.bind("ready-a",false);loader.bind("ready-b",false);
+        loader.preload("blocked",Kind::Mask);
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        for i in 0..1000{let p=format!("future/{i}");loader.bind(&p,true);loader.bind(&p,true);}
+        let pending={let s=loader.shared.state.lock().unwrap();
+            assert_eq!(s.entries["future/999"].refs,2);
+            s.entries.iter().filter(|(p,e)|p.starts_with("future/")&&e.pending).count()};
+        loader.cancel();go.send(()).unwrap();loader.shutdown();
+        assert_eq!(pending,0,"full count cap must reject speculation before enqueue");
+    }
+    #[test]
+    fn bulk_async_bindings_do_not_rescan_all_existing_entries(){
+        let (tx,rx)=std::sync::mpsc::channel();
+        let (go,wait)=std::sync::mpsc::channel();
+        let budget=crate::image_cache_budget::CacheBudget::new(1024*1024);
+        let loader=Loader::with_policy(move|path,_|{
+            if path=="first"{tx.send(()).unwrap();wait.recv().unwrap();}
+            None
+        },1024*1024,Some(budget.clone())).unwrap();
+        loader.bind("first",true);rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let before=loader.shared.state.lock().unwrap().accounting_scans;
+        for i in 0..1000{loader.bind(&format!("image/item{i}"),true);}
+        let scans=loader.shared.state.lock().unwrap().accounting_scans-before;
+        let counts=budget.lock().unwrap().script_preload;
+        assert_eq!(counts.bound,1001);assert_eq!(counts.pending,1001);
+        // Release the blocked worker even when the regression assertion fails.
+        loader.cancel();
+        let before=loader.shared.state.lock().unwrap().accounting_scans;
+        for i in 0..1000{loader.unbind(&format!("image/item{i}"));}
+        let unbind_scans=loader.shared.state.lock().unwrap().accounting_scans-before;
+        let remaining=budget.lock().unwrap().script_preload;
+        go.send(()).unwrap();loader.shutdown();
+        assert!(scans<=1,"metadata binding rescanned entries {scans} times");
+        assert_eq!(remaining.bound,1);assert_eq!(remaining.pending,0);
+        assert!(unbind_scans<=1,"metadata unbinding rescanned entries {unbind_scans} times");
+    }
     #[test]
     fn lookahead_lifetime_is_independent_of_lua_and_chapter_leases() {
         let loader=Loader::new(|_,_|Some(Payload::Encoded(vec![1,2,3].into(),None))).unwrap();
@@ -1143,8 +1652,317 @@ mod tests {
         assert!(loader.take("image").is_none());
     }
     fn story_entry(payload:Payload)->Entry{
-        Entry{refs:1,ticket:1,bind_order:1,prepared:true,story_suppressed:false,pending:false,
+        Entry{refs:1,ticket:1,bind_order:1,prepared:true,missing_epoch:None,story_suppressed:false,pending:false,
             deferred:false,demanded:false,speculative:true,payload:Some(payload),kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0}
+    }
+    #[test]
+    fn full_lua_cache_retires_speculative_batch_but_preserves_visible_work() {
+        let mut s=State::default();
+        s.entries.insert("resident".into(),story_entry(Payload::encoded(vec![1])));
+        for i in 0..3411 {
+            let mut e=story_entry(Payload::encoded(vec![]));
+            e.payload=None;e.pending=true;e.deferred=true;e.ticket=i+2;
+            s.entries.insert(format!("queued/{i}"),e);
+        }
+        s.entries.get_mut("queued/1").unwrap().demanded=true;
+        s.entries.get_mut("queued/2").unwrap().refs=0;
+        s.scene_priority.push_back(("queued/3".into(),5));
+        refill(&mut s);
+        assert_eq!(decline_capped_speculation(&mut s),3408);
+        assert_eq!(s.entries.len(),3412);
+        assert!(s.entries["resident"].payload.is_some());
+        assert!(s.entries["queued/1"].pending);
+        assert!(s.entries["queued/2"].pending);
+        assert!(s.entries["queued/3"].pending);
+        assert!(!s.entries["queued/0"].pending);
+        assert_eq!(s.entries["queued/0"].refs,1);
+        assert!(s.queue.iter().all(|(p,_)|s.entries[p].pending));
+        assert_eq!(s.pop_priority_job().unwrap().0,"queued/3");
+    }
+    #[test] fn lua_count_limit_skips_speculation_but_keeps_bindings_and_demand(){
+        use crate::image_cache_budget::CacheBudget;
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        fn quiet_wait(loader:&Loader,path:&str){
+            let state=loader.shared.state.lock().unwrap();
+            let (s,timeout)=loader.shared.wake.wait_timeout_while(state,std::time::Duration::from_secs(2),|s|s.entries[path].pending).unwrap();
+            assert!(!timeout.timed_out()&&!s.entries[path].pending);
+        }
+        let budget=CacheBudget::new(1024);budget.lock().unwrap().lua_load_max=1;
+        let calls=Arc::new(AtomicUsize::new(0));let count=calls.clone();
+        let loader=Loader::with_policy(move|_,_|{count.fetch_add(1,Ordering::SeqCst);Some(Payload::encoded(vec![7;8]))},1024,Some(budget)).unwrap();
+        loader.bind("first",true);quiet_wait(&loader,"first");
+        loader.bind("first",true);loader.bind("second",true);quiet_wait(&loader,"second");
+        assert_eq!(calls.load(Ordering::SeqCst),1,"count-declined jobs must not read or decode");
+        {let s=loader.shared.state.lock().unwrap();assert_eq!(s.entries["first"].refs,2);assert_eq!(s.entries["second"].refs,1);assert_eq!(s.entries["second"].retry_bytes,0);}
+        // A synchronous binding is actual demand, and may replace a retained
+        // cache payload without deleting its Lua binding or rendered surface.
+        loader.bind("second",false);assert!(loader.take("second").is_some());
+        assert_eq!(calls.load(Ordering::SeqCst),2);
+        {let s=loader.shared.state.lock().unwrap();assert_eq!(s.entries["first"].refs,2);assert!(s.entries["first"].payload.is_none());}
+        loader.bind("third",true);quiet_wait(&loader,"third");assert!(loader.take("third").is_some());
+        loader.unbind("first");loader.unbind("first");
+        assert!(!loader.shared.state.lock().unwrap().entries.contains_key("first"));
+    }
+    #[test] fn lua_count_limit_covers_binding_a_preloaded_animation(){
+        let budget=crate::image_cache_budget::CacheBudget::new(1024);budget.lock().unwrap().lua_load_max=1;
+        let shared=Arc::new(Shared{state:Mutex::new(State::default()),wake:Condvar::new(),cache:Some(budget),budget:1024});
+        let loader=Loader{shared:shared.clone(),worker:Mutex::new(None)};
+        {let mut s=shared.state.lock().unwrap();
+            s.entries.insert("first".into(),story_entry(Payload::encoded(vec![1;8])));
+            let mut second=story_entry(Payload::encoded(vec![2;8]));second.refs=0;second.leased=true;second.kind=Kind::Animation;
+            s.entries.insert("second".into(),second);
+        }
+        loader.bind("second",true);
+        let s=shared.state.lock().unwrap();assert_eq!(s.entries["second"].refs,1);
+        assert!(s.entries["first"].payload.is_some());assert!(s.entries["second"].payload.is_none());
+    }
+    #[test] fn lua_count_limit_preserves_other_demanded_results(){
+        let mut s=State::default();let mut first=story_entry(Payload::encoded(vec![1;8]));first.demanded=true;
+        s.entries.insert("first".into(),first);let mut next=story_entry(Payload::encoded(vec![]));next.payload=None;s.entries.insert("next".into(),next);
+        assert!(!lua_count_admit(&mut s,"next",1,true));assert!(s.entries["first"].payload.is_some());
+    }
+
+    #[test]
+    fn confirmed_missing_bindings_are_not_work_or_resident_and_demand_can_retry(){
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let calls=Arc::new(AtomicUsize::new(0));let count=calls.clone();
+        let budget=crate::image_cache_budget::CacheBudget::new(1024);
+        let loader=Loader::with_steps(move|_,_,_,_,_|{
+            if count.fetch_add(1,Ordering::Relaxed)==0{LoadStep::Missing(crate::ffi::file_size_epoch())}
+            else{LoadStep::Complete(Some(Payload::encoded(vec![1;8])))}
+        },1024,Some(budget.clone())).unwrap();
+        loader.bind("optional",true);loader.wait("optional");
+        for _ in 0..100 {loader.bind("optional",true);}
+        assert_eq!(calls.load(Ordering::Relaxed),1);assert!(!loader.loading(None));
+        let c=budget.lock().unwrap().script_preload;
+        assert_eq!((c.bound,c.planned,c.completed,c.pending,c.missing,c.pixels+c.encoded),(1,0,0,0,1,0));
+        loader.bind("optional",false);
+        assert_eq!(calls.load(Ordering::Relaxed),2);
+        let c=budget.lock().unwrap().script_preload;
+        assert_eq!((c.bound,c.planned,c.pending,c.missing,c.encoded),(1,1,0,0,1));
+        for _ in 0..102 {loader.unbind("optional");}
+        assert_eq!(budget.lock().unwrap().script_preload,Default::default());
+    }
+    #[test]
+    fn stale_missing_epoch_and_generic_failure_remain_retryable(){
+        use std::sync::atomic::{AtomicUsize,Ordering};
+        let calls=Arc::new(AtomicUsize::new(0));let count=calls.clone();
+        let loader=Loader::with_steps(move|_,_,_,_,_|{
+            match count.fetch_add(1,Ordering::Relaxed){
+                0=>LoadStep::Missing(crate::ffi::file_size_epoch().wrapping_sub(1)),
+                1=>LoadStep::Complete(None),
+                _=>LoadStep::Complete(Some(Payload::encoded(vec![1;8]))),
+            }
+        },1024,None).unwrap();
+        for _ in 0..3 {loader.bind("optional",true);loader.wait("optional");}
+        assert_eq!(calls.load(Ordering::Relaxed),3);
+        assert!(loader.take("optional").is_some());
+    }
+    #[test]
+    fn thousands_of_bindings_are_not_reported_as_resident_images(){
+        let mut state=State::default();
+        for i in 0..3411 {
+            let mut e=story_entry(Payload::encoded(vec![]));e.payload=None;e.prepared=false;
+            if i<1271{e.missing_epoch=Some(crate::ffi::file_size_epoch());}
+            else if i<1399{e.payload=Some(Payload::encoded(vec![1]));e.prepared=true;}
+            else if i<1463{e.pending=true;}
+            state.entries.insert(format!("asset/{i}"),e);
+        }
+        let c=state.accounting_snapshot().preload;
+        assert_eq!((c.bound,c.planned,c.missing,c.pending,c.pixels+c.encoded),(3411,2140,1271,64,128));
+    }
+    #[test] fn accounting_snapshot_preserves_lanes_claims_and_missing_progress(){
+        use crate::image_cache_budget::{CacheBudget,ScriptPreloadCounts};
+        let mut state=State::default();
+        state.entries.insert("body".into(),story_entry(Payload::encoded(vec![1;8])));
+        let mut mask=story_entry(Payload::encoded(vec![2;12]));mask.kind=Kind::Mask;mask.refs=0;
+        state.entries.insert("mask".into(),mask);
+        let mut animation=story_entry(Payload::pixels(image::RgbaImage::new(2,2),vec![3;4]));animation.kind=Kind::Animation;
+        state.entries.insert("animation".into(),animation);
+        let mut pending=story_entry(Payload::encoded(vec![4;3]));pending.pending=true;pending.prepared=false;
+        state.entries.insert("pending".into(),pending);
+        state.entries.insert("ui/save/slot".into(),story_entry(Payload::encoded(vec![5;5])));
+        let mut missing=story_entry(Payload::encoded(vec![]));missing.payload=None;missing.prepared=false;
+        state.entries.insert("missing".into(),missing);
+        state.reserve_requested=true;
+        state.ready_claim=Some(ReadyClaim{path:"pending".into(),ticket:1,bytes:30,started:std::time::Instant::now()});
+        let snapshot=state.accounting_snapshot();
+        let shared=CacheBudget::new(1024);let mut account=shared.lock().unwrap();
+        snapshot.publish(&mut account);
+        assert_eq!(account.ready_parts,state.ready_parts());
+        assert_eq!(account.mask_parts,state.kind_parts(Kind::Mask));
+        assert_eq!(account.animation_parts,state.kind_parts(Kind::Animation));
+        assert_eq!(account.ready_reserved,27);
+        assert_eq!(account.script_preload,ScriptPreloadCounts{bound:4,planned:4,completed:2,pixels:1,encoded:2,pending:1,..Default::default()});
+        state.entries.get_mut("pending").unwrap().pending=false;
+        state.accounting_snapshot().publish(&mut account);
+        assert_eq!((account.ready_reserved,account.ready_goal),(0,0));
+    }
+    #[test] fn repeated_lua_bindings_preserve_payload_without_budget_lock(){
+        let budget=crate::image_cache_budget::CacheBudget::new(BUDGET);
+        let shared=Arc::new(Shared{state:Mutex::new(State::default()),wake:Condvar::new(),cache:Some(budget.clone()),budget:BUDGET});
+        let loader=Arc::new(Loader{shared:shared.clone(),worker:Mutex::new(None)});
+        {
+            let mut state=shared.state.lock().unwrap();
+            state.entries.insert("body".into(),story_entry(Payload::encoded(vec![7])));
+            let mut pending=story_entry(Payload::encoded(vec![]));
+            pending.payload=None;pending.pending=true;pending.deferred=true;
+            state.entries.insert("eyes".into(),pending);
+            loader.update_ready_account(&mut state);
+        }
+        let guard=budget.lock().unwrap();
+        let before=guard.script_preload;
+        let (tx,rx)=std::sync::mpsc::channel();let worker_loader=loader.clone();
+        let worker=std::thread::spawn(move||{
+            for path in ["body","eyes"] {
+                worker_loader.bind(path,true);worker_loader.bind(path,true);
+                worker_loader.unbind(path);
+            }
+            tx.send(()).unwrap();
+        });
+        let completed=rx.recv_timeout(std::time::Duration::from_millis(500)).is_ok();
+        drop(guard);worker.join().unwrap();
+        assert!(completed,"reference-only changes must not wait for cache accounting");
+        assert_eq!(budget.lock().unwrap().script_preload,before);
+        {
+            let state=shared.state.lock().unwrap();
+            assert_eq!(state.entries["body"].refs,2);
+            assert_eq!(state.entries["eyes"].refs,2);
+            assert!(state.entries["body"].payload.is_some());
+            assert!(state.entries["eyes"].pending);
+            assert_eq!(state.entries["eyes"].ticket,1);
+        }
+        for path in ["body","eyes"] {loader.unbind(path);loader.unbind(path);}
+        assert!(shared.state.lock().unwrap().entries.is_empty());
+        assert_eq!(budget.lock().unwrap().script_preload.planned,0);
+    }
+    #[test] fn consumed_lua_bindings_update_progress_without_rescanning_chapter(){
+        let budget=crate::image_cache_budget::CacheBudget::new(BUDGET);
+        let shared=Arc::new(Shared{state:Mutex::new(State::default()),wake:Condvar::new(),cache:Some(budget.clone()),budget:BUDGET});
+        let loader=Loader{shared:shared.clone(),worker:Mutex::new(None)};
+        {
+            let mut s=shared.state.lock().unwrap();
+            for i in 0..3413 {
+                let mut e=story_entry(Payload::encoded(vec![]));
+                e.payload=None;e.prepared=i%2==0;e.speculative=true;
+                e.leased=i%3==0;e.kind=if i%5==0{Kind::Animation}else{Kind::Image};
+                s.entries.insert(format!("asset/{i}"),e);
+            }
+            loader.update_ready_account(&mut s);
+        }
+        for i in 0..25 {
+            let path=format!("asset/{i}");
+            loader.bind(&path,true);loader.bind(&path,true);
+            let s=shared.state.lock().unwrap();let b=budget.lock().unwrap();
+            assert_eq!(b.script_preload,s.script_preload_counts());
+            assert_eq!(b.ready_parts.total(),0);
+            assert_eq!(b.ready_reserved,0);assert!(b.ready_goal>0);
+            assert_eq!(s.entries[&path].refs,3);
+            assert!(s.entries[&path].pending);
+        }
+        let (scans,queued)={
+            let s=shared.state.lock().unwrap();
+            (s.accounting_scans,s.queue.len()+s.animations.len())
+        };
+        assert_eq!(scans,1,"retrying consumed bindings must not rescan all 3413 entries");
+        assert_eq!(queued,25);
+        loader.cancel();
+        let s=shared.state.lock().unwrap();let b=budget.lock().unwrap();
+        assert_eq!(b.script_preload,s.script_preload_counts());
+    }
+    #[test] fn consumed_lua_retry_reconciles_stale_epoch_and_preserves_count_cap(){
+        let budget=crate::image_cache_budget::CacheBudget::new(BUDGET);
+        let shared=Arc::new(Shared{state:Mutex::new(State::default()),wake:Condvar::new(),cache:Some(budget.clone()),budget:BUDGET});
+        let loader=Loader{shared:shared.clone(),worker:Mutex::new(None)};
+        {
+            let mut s=shared.state.lock().unwrap();
+            let mut e=story_entry(Payload::encoded(vec![]));e.payload=None;e.prepared=true;
+            s.entries.insert("consumed".into(),e);
+            s.entries.insert("resident".into(),story_entry(Payload::encoded(vec![1])));
+            loader.update_ready_account(&mut s);
+            s.accounting_epoch=crate::ffi::file_size_epoch().wrapping_sub(1);
+        }
+        loader.bind("consumed",true);
+        {
+            let s=shared.state.lock().unwrap();let b=budget.lock().unwrap();
+            assert_eq!(s.accounting_scans,2);
+            assert_eq!(b.script_preload,s.script_preload_counts());
+        }
+        loader.cancel();
+        budget.lock().unwrap().lua_load_max=1;
+        loader.bind("consumed",true);
+        let s=shared.state.lock().unwrap();let b=budget.lock().unwrap();
+        assert!(!s.entries["consumed"].pending);
+        assert_eq!(b.script_preload,s.script_preload_counts());
+        assert_eq!(b.ready_parts.total(),1);
+    }
+    #[test] fn repeated_animation_hint_does_not_wait_for_budget_lock(){
+        let budget=crate::image_cache_budget::CacheBudget::new(BUDGET);
+        let shared=Arc::new(Shared{state:Mutex::new(State::default()),wake:Condvar::new(),cache:Some(budget.clone()),budget:BUDGET});
+        let loader=Arc::new(Loader{shared:shared.clone(),worker:Mutex::new(None)});
+        let mut entry=story_entry(Payload::encoded(vec![7]));
+        entry.kind=Kind::Animation;entry.leased=true;
+        shared.state.lock().unwrap().entries.insert("frame".into(),entry);
+        let guard=budget.lock().unwrap();
+        let (tx,rx)=std::sync::mpsc::channel();let worker_loader=loader.clone();
+        let worker=std::thread::spawn(move||{worker_loader.preload("frame",Kind::Animation);tx.send(()).unwrap();});
+        let completed=rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok();
+        drop(guard);worker.join().unwrap();
+        assert!(completed,"unchanged animation hint must not wait for cache accounting");
+        let state=shared.state.lock().unwrap();
+        assert_eq!(state.entries["frame"].refs,1);
+        assert!(state.entries["frame"].payload.is_some());
+    }
+    #[test] fn animation_batch_accounts_once_and_preserves_lease_limits(){
+        let budget=crate::image_cache_budget::CacheBudget::new(BUDGET);
+        let shared=Arc::new(Shared{state:Mutex::new(State::default()),wake:Condvar::new(),cache:Some(budget),budget:BUDGET});
+        let loader=Loader{shared:shared.clone(),worker:Mutex::new(None)};
+        let mut paths:Vec<_>=(0..140).map(|i|format!("frame/{i}")).collect();
+        paths.insert(2,"frame/0".into());
+        loader.preload_many(&paths,Kind::Animation);
+        let state=shared.state.lock().unwrap();
+        let actual=(state.entries.len(),state.entries.values().filter(|e|e.leased).count(),
+            state.entries.values().all(|e|e.refs==0&&e.pending),state.queue_len(),
+            state.entries.values().filter(|e|e.deferred).count(),state.accounting_scans);
+        drop(state);
+        assert_eq!(actual,(128,128,true,MAX_QUEUE,128-MAX_QUEUE,1),"one publication per animation registration batch");
+        loader.preload_many(&paths[..100],Kind::Animation);
+        let scans=shared.state.lock().unwrap().accounting_scans;
+        assert_eq!(scans,1,"repeated hints are inert");
+    }
+    #[test] fn animation_batch_matches_individual_registration_state(){
+        let make=||{
+            let shared=Arc::new(Shared{state:Mutex::new(State::default()),wake:Condvar::new(),
+                cache:Some(crate::image_cache_budget::CacheBudget::new(BUDGET)),budget:BUDGET});
+            {
+                let mut s=shared.state.lock().unwrap();
+                for i in 0..32 {
+                    let mut e=story_entry(Payload::encoded(vec![7;16]));
+                    e.refs=i%3;e.leased=i%4==0;e.story_suppressed=i%5==0;
+                    if i%2==0{e.payload=None;}
+                    if i%7==0{e.missing_epoch=Some(crate::ffi::file_size_epoch().wrapping_sub(1));}
+                    if i%11==0{e.missing_epoch=Some(crate::ffi::file_size_epoch());}
+                    e.kind=if i%3==0{Kind::Animation}else{Kind::Image};
+                    s.entries.insert(format!("frame/{i}"),e);
+                }
+            }
+            Loader{shared,worker:Mutex::new(None)}
+        };
+        let batch=make();let single=make();
+        let paths:Vec<_>=(0..42).map(|i|format!("frame/{i}")).collect();
+        batch.preload_many(&paths,Kind::Animation);
+        for p in &paths{single.request(p,true,Kind::Animation,true);}
+        let snapshot=|l:&Loader|{
+            let s=l.shared.state.lock().unwrap();
+            let entries:std::collections::BTreeMap<_,_>=s.entries.iter().map(|(p,e)|(p.clone(),
+                (e.refs,e.leased,e.kind as u8,e.pending,e.prepared,e.missing_epoch,e.story_suppressed,
+                 e.speculative,e.payload.as_ref().map(Payload::bytes),e.ticket))).collect();
+            (entries,s.reserve_requested)
+        };
+        assert_eq!(snapshot(&batch),snapshot(&single));
+        let accounting=|l:&Loader|{let b=l.shared.cache.as_ref().unwrap().lock().unwrap();
+            (b.ready_parts,b.mask_parts,b.animation_parts,b.script_preload,b.ready_reserved,b.ready_goal)};
+        assert_eq!(accounting(&batch),accounting(&single));
     }
     fn story_payload(decoded:bool)->Payload{
         let image=image::RgbaImage::from_pixel(32,32,image::Rgba([8,12,20,139]));
@@ -1329,6 +2147,29 @@ mod tests {
         assert!(!loader.loading(None));
         assert!(loader.take("image/bg/room").is_some());
         assert!(loader.take(path).is_some());
+    }
+    #[test]
+    fn menu_release_defers_while_loader_state_is_busy() {
+        let loader=Arc::new(Loader::with_policy(|_,_|Some(Payload::encoded(vec![7;32])),1024,None).unwrap());
+        let path="pc/en/conf/bg.png";
+        loader.bind(path,false);
+        loader.bind("image/bg/room",false);
+        let guard=loader.shared.state.lock().unwrap();
+        let (tx,rx)=std::sync::mpsc::channel();
+        let other=loader.clone();
+        let task=std::thread::spawn(move|| {
+            other.retain_menu_images_resolving(std::collections::HashSet::new);
+            tx.send(()).unwrap();
+        });
+        let completed=rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok();
+        drop(guard);
+        task.join().unwrap();
+        assert!(completed,"opportunistic menu cleanup blocked on loader state");
+        assert!(loader.shared.state.lock().unwrap().entries[path].payload.is_some());
+        loader.retain_menu_images(&Default::default());
+        let state=loader.shared.state.lock().unwrap();
+        assert!(state.entries[path].payload.is_none());
+        assert!(state.entries["image/bg/room"].payload.is_some());
     }
     #[test]
     fn menu_release_does_not_expand_scene_paths_without_releasable_menu_data() {
@@ -1627,7 +2468,7 @@ mod tests {
     fn scene_priority_preserves_bounded_queues_and_rejects_stale_tickets(){
         let mut state=State::default();
         for i in 0..100{
-            state.entries.insert(format!("q{i}"),Entry{refs:1,ticket:i,bind_order:i,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0});
+            state.entries.insert(format!("q{i}"),Entry{refs:1,ticket:i,bind_order:i,prepared:false,missing_epoch:None,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0});
         }
         refill(&mut state);
         state.scene_priority=VecDeque::from([("q99".into(),99),("q98".into(),98),("q97".into(),96)]);
@@ -1642,6 +2483,42 @@ mod tests {
         assert_eq!(seen.len(),100);
         state.scene_priority.push_back(("q1".into(),1));state.clear_queues();
         assert!(state.scene_priority.is_empty());
+    }
+
+    #[test]
+    fn hidden_bindings_retry_busy_cache_without_changing_references() {
+        let loader=Loader::new(|_,_|None).unwrap();
+        {
+            let guard=loader.shared.state.lock().unwrap();
+            assert!(!loader.try_bind_hidden("image"));
+            assert!(!loader.try_unbind_hidden("image"));
+            assert!(guard.entries.is_empty());
+        }
+        assert!(loader.try_bind_hidden("image"));
+        loader.wait("image");
+        assert_eq!(loader.shared.state.lock().unwrap().entries["image"].refs,1);
+        {
+            let guard=loader.shared.state.lock().unwrap();
+            assert!(!loader.try_unbind_hidden("image"));
+            assert_eq!(guard.entries["image"].refs,1);
+        }
+        assert!(loader.try_unbind_hidden("image"));
+        assert!(!loader.shared.state.lock().unwrap().entries.contains_key("image"));
+    }
+
+    #[test]
+    fn scene_priority_hint_does_not_wait_for_busy_cache() {
+        let loader=Loader::new(|_,_|None).unwrap();
+        std::thread::scope(|scope| {
+            let guard=loader.shared.state.lock().unwrap();
+            let (tx,rx)=std::sync::mpsc::channel();
+            let reference=&loader;
+            scope.spawn(move||{tx.send(reference.prioritize_scene(&["image".into()])).unwrap();});
+            let result=rx.recv_timeout(std::time::Duration::from_millis(200));
+            drop(guard);
+            assert_eq!(result.ok(),Some(0));
+        });
+        assert_eq!(loader.prioritize_scene(&[]),0);
     }
 
     #[test]
@@ -1670,16 +2547,84 @@ mod tests {
         loader.preload("chapter-mask",Kind::Mask);loader.wait("chapter-mask");
         assert_eq!(budget.lock().unwrap().script_preload,Counts::default());
         loader.bind("body",true);loader.bind("body",true);loader.wait("body");
-        assert_eq!(budget.lock().unwrap().script_preload,Counts{planned:1,completed:1,pixels:1,encoded:0});
+        assert_eq!(budget.lock().unwrap().script_preload,Counts{bound:1,planned:1,completed:1,pixels:1,encoded:0,..Default::default()});
         assert!(loader.take("body").is_some());
-        assert_eq!(budget.lock().unwrap().script_preload,Counts{planned:1,completed:1,pixels:0,encoded:0});
+        assert_eq!(budget.lock().unwrap().script_preload,Counts{bound:1,planned:1,completed:1,pixels:0,encoded:0,..Default::default()});
         loader.unbind("body");assert_eq!(budget.lock().unwrap().script_preload.completed,1);
         loader.unbind("body");assert_eq!(budget.lock().unwrap().script_preload,Counts::default());
         loader.bind("chapter-mask",true);
-        assert_eq!(budget.lock().unwrap().script_preload,Counts{planned:1,completed:1,pixels:1,encoded:0});
+        assert_eq!(budget.lock().unwrap().script_preload,Counts{bound:1,planned:1,completed:1,pixels:1,encoded:0,..Default::default()});
         loader.begin_chapter("next"); // Script binding survives chapter hint release.
         assert_eq!(budget.lock().unwrap().script_preload.planned,1);
         loader.shutdown();assert_eq!(budget.lock().unwrap().script_preload,Counts::default());
+    }
+    #[test]
+    fn registered_animation_replaces_cold_lua_payload_before_foreground_demand() {
+        let budget=crate::image_cache_budget::CacheBudget::new(1024);
+        budget.lock().unwrap().lua_load_max=2;
+        let loader=Loader::with_policy(priority_test_payload,1024,Some(budget.clone())).unwrap();
+        for path in ["cold-first","cold-second"] { loader.bind(path,true);loader.wait(path); }
+        for path in ["blink-first","blink-second"] {
+            loader.bind(path,true);
+            loader.preload(path,Kind::Animation);
+            // No wait()/take(): both promote foreground demand and would hide
+            // a failure to preload a registered animation at the Lua count cap.
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(2);
+            while loader.shared.state.lock().unwrap().entries[path].pending && std::time::Instant::now()<until {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let (ready,count,bytes)={let state=loader.shared.state.lock().unwrap();
+                (matches!(state.entries[path].payload,Some(Payload::Pixels(..))),
+                 state.entries.values().filter(|e|e.refs>0&&e.payload.is_some()).count(),state.ready_parts().total())};
+            if !ready || count>2 || bytes>1024 { loader.shutdown(); }
+            assert!(ready,"animation must be ready before first display");
+            assert!(count<=2);assert!(bytes<=1024);
+        }
+        { let state=loader.shared.state.lock().unwrap();
+            assert!(state.entries["cold-first"].payload.is_none());
+            assert!(state.entries["cold-second"].payload.is_none());
+            assert_eq!(state.entries["cold-first"].refs,1);
+            assert!(state.entries["blink-first"].payload.is_some());
+        }
+        assert!(loader.take("blink-first").is_some());
+        loader.shutdown();
+    }
+    #[test]
+    fn capped_bulk_retirement_keeps_registered_animation_pending() {
+        let mut state=State::default();
+        for (path,leased,kind) in [("cold",false,Kind::Image),("blink",true,Kind::Animation)] {
+            let mut entry=story_entry(Payload::encoded(vec![1]));
+            entry.payload=None;entry.pending=true;entry.deferred=true;entry.speculative=true;
+            entry.kind=kind;entry.leased=leased;
+            state.entries.insert(path.into(),entry);
+        }
+        assert_eq!(decline_capped_speculation(&mut state),1);
+        assert!(state.entries["blink"].pending);
+        assert!(!state.entries["cold"].pending);
+    }
+    #[test]
+    fn registered_animation_respects_zero_limit_and_failed_decode_keeps_cold_data() {
+        for limit in [0,1] {
+            let budget=crate::image_cache_budget::CacheBudget::new(1024);
+            budget.lock().unwrap().lua_load_max=limit;
+            let calls=Arc::new(std::sync::atomic::AtomicUsize::new(0));let seen=calls.clone();
+            let loader=Loader::with_policy(move|p,c|{
+                if p=="missing-frame" {seen.fetch_add(1,std::sync::atomic::Ordering::Relaxed);None}
+                else {priority_test_payload(p,c)}
+            },1024,Some(budget)).unwrap();
+            if limit>0 {loader.bind("cold",true);loader.wait("cold");}
+            loader.bind("missing-frame",true);loader.preload("missing-frame",Kind::Animation);
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(2);
+            while loader.shared.state.lock().unwrap().entries["missing-frame"].pending && std::time::Instant::now()<until {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let (pending,absent,cold_kept)={let state=loader.shared.state.lock().unwrap();
+                (state.entries["missing-frame"].pending,state.entries["missing-frame"].payload.is_none(),
+                 limit==0||state.entries["cold"].payload.is_some())};
+            loader.shutdown();
+            assert!(!pending&&absent&&cold_kept);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed),limit);
+        }
     }
     #[test] fn script_hud_counts_pending_cancelled_and_missing_as_not_completed(){
         use crate::image_cache_budget::ScriptPreloadCounts as Counts;
@@ -1689,9 +2634,9 @@ mod tests {
             if p=="pending"{started_tx.send(()).unwrap();go_rx.recv().unwrap();priority_test_payload(p,c)}else{None}
         },1024,Some(budget.clone())).unwrap();
         loader.bind("pending",true);started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-        assert_eq!(budget.lock().unwrap().script_preload,Counts{planned:1,..Default::default()});
+        assert_eq!(budget.lock().unwrap().script_preload,Counts{bound:1,planned:1,pending:1,..Default::default()});
         loader.cancel();go_tx.send(()).unwrap();loader.bind("missing",false);
-        assert_eq!(budget.lock().unwrap().script_preload,Counts{planned:2,..Default::default()});
+        assert_eq!(budget.lock().unwrap().script_preload,Counts{bound:2,planned:2,..Default::default()});
         loader.unbind("pending");loader.unbind("missing");
         assert_eq!(budget.lock().unwrap().script_preload,Counts::default());
     }
@@ -1700,7 +2645,7 @@ mod tests {
         let budget=crate::image_cache_budget::CacheBudget::new(80);
         let loader=Loader::with_policy(priority_test_payload,80,Some(budget.clone())).unwrap();
         for path in ["pixels","encoded","no-room"]{loader.bind(path,true);loader.wait(path);}
-        assert_eq!(budget.lock().unwrap().script_preload,Counts{planned:3,completed:2,pixels:1,encoded:1});
+        assert_eq!(budget.lock().unwrap().script_preload,Counts{bound:3,planned:3,completed:2,pixels:1,encoded:1,..Default::default()});
         assert!(!loader.loading(None)); // A declined item is not successful completion.
     }
     #[test] fn gray8_ready_account_and_demotion_preserve_compressed_backup(){
@@ -1800,19 +2745,44 @@ mod tests {
     }
     #[test] fn three_lanes_share_queue_limit_and_urgent_demand_beats_rotation(){
         let mut s=State::default();
-        for i in 0..100{let kind=[Kind::Image,Kind::Mask,Kind::Animation][i%3];s.entries.insert(format!("p{i}"),Entry{refs:1,ticket:i as u64,bind_order:i as u64,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind,leased:false,lookahead:false,retry_bytes:0});}
+        for i in 0..100{let kind=[Kind::Image,Kind::Mask,Kind::Animation][i%3];s.entries.insert(format!("p{i}"),Entry{refs:1,ticket:i as u64,bind_order:i as u64,prepared:false,missing_epoch:None,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind,leased:false,lookahead:false,retry_bytes:0});}
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         assert_eq!(s.pop_job().unwrap().0,"p0");assert_eq!(s.pop_job().unwrap().0,"p1");assert_eq!(s.pop_job().unwrap().0,"p2");assert_eq!(s.pop_job().unwrap().0,"p3");
         refill(&mut s);promote(&mut s,"p99");assert_eq!(s.queue_len(),MAX_QUEUE);assert_eq!(s.pop_job().unwrap().0,"p99");
     }
+    #[test]
+    fn registered_animation_gets_bounded_priority_over_cold_bindings() {
+        let mut state=State::default();
+        for i in 0..100 {
+            let mut e=story_entry(Payload::encoded(vec![1]));
+            e.payload=None;e.pending=true;e.deferred=true;e.speculative=true;
+            e.ticket=i+1;e.bind_order=i+1;
+            state.entries.insert(format!("cold{i}"),e);
+        }
+        for i in 0..6 {
+            let mut e=story_entry(Payload::encoded(vec![1]));
+            e.payload=None;e.pending=true;e.deferred=true;e.speculative=true;
+            e.kind=Kind::Animation;e.leased=true;e.ticket=200+i;e.bind_order=200+i;
+            state.entries.insert(format!("blink{i}"),e);
+        }
+        refill(&mut state);assert_eq!(state.queue_len(),MAX_QUEUE);
+        promote(&mut state,"cold99");assert_eq!(state.pop_job().unwrap().0,"cold99");
+        for expected in ["blink0","blink1","blink2","blink3","cold0","blink4","blink5"] {
+            let job=state.pop_job().unwrap();
+            assert_eq!(job.0,expected);
+            // Simulate completion; a real worker marks this job active first.
+            state.entries.get_mut(&job.0).unwrap().pending=false;
+            refill(&mut state);assert!(state.queue_len()<=MAX_QUEUE);
+        }
+    }
     #[test] fn lua_jobs_bypass_full_supplement_queue_but_effects_are_not_starved(){
         let mut s=State::default();
         for i in 0..80{
-            s.entries.insert(format!("effect{i}"),Entry{refs:0,ticket:i,bind_order:0,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,lookahead:false,retry_bytes:0});
+            s.entries.insert(format!("effect{i}"),Entry{refs:0,ticket:i,bind_order:0,prepared:false,missing_epoch:None,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,lookahead:false,retry_bytes:0});
         }
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         for i in 0..9{
-            s.entries.insert(format!("lua{i}"),Entry{refs:1,ticket:100+i,bind_order:100+i,prepared:false,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0});
+            s.entries.insert(format!("lua{i}"),Entry{refs:1,ticket:100+i,bind_order:100+i,prepared:false,missing_epoch:None,story_suppressed:false,pending:true,deferred:true,demanded:false,speculative:true,payload:None,kind:Kind::Image,leased:false,lookahead:false,retry_bytes:0});
         }
         refill(&mut s);assert_eq!(s.queue_len(),MAX_QUEUE);
         for expected in ["lua0","lua1","lua2","lua3","effect0","lua4","lua5","lua6","lua7","effect1","lua8"]{
@@ -1820,7 +2790,7 @@ mod tests {
         }
         promote(&mut s,"effect79");assert_eq!(s.pop_job().unwrap().0,"effect79");
     }
-    #[test] fn script_binding_upgrades_a_queued_chapter_lease_without_duplicate_load(){
+    #[test] fn script_binding_keeps_registered_animation_priority_without_duplicate_load(){
         let (started_tx,started_rx)=std::sync::mpsc::channel();let (go_tx,go_rx)=std::sync::mpsc::channel();
         let (done_tx,done_rx)=std::sync::mpsc::channel();
         let calls=Arc::new(Mutex::new(Vec::new()));let seen=calls.clone();
@@ -1835,7 +2805,7 @@ mod tests {
         loader.bind("body",true);loader.bind("script-effect",true);go_tx.send(()).unwrap();
         for _ in 0..4{done_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();}
         loader.wait("later-effect");loader.wait("script-effect");
-        assert_eq!(*calls.lock().unwrap(),["barrier","body","script-effect","later-effect"]);
+        assert_eq!(*calls.lock().unwrap(),["barrier","script-effect","body","later-effect"]);
     }
     #[test] fn supplemental_effects_cannot_demote_bound_first_use_pixels(){
         for kind in [Kind::Mask,Kind::Animation]{
@@ -1871,7 +2841,7 @@ mod tests {
     #[test] fn capacity_refill_prefers_lua_order_over_earlier_chapter_tickets(){
         let mut s=State::default();
         for (path,refs,ticket,bind_order) in [("effect",0,1,0),("second",1,2,20),("first",1,3,10)]{
-            s.entries.insert(path.into(),Entry{refs,ticket,bind_order,prepared:false,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,lookahead:false,retry_bytes:72});
+            s.entries.insert(path.into(),Entry{refs,ticket,bind_order,prepared:false,missing_epoch:None,story_suppressed:false,pending:false,deferred:false,demanded:false,speculative:true,payload:None,kind:Kind::Mask,leased:true,lookahead:false,retry_bytes:72});
         }
         assert!(retry_capacity(&mut s,72));
         assert_eq!(s.pop_job().unwrap().0,"first");

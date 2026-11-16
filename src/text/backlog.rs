@@ -261,6 +261,24 @@ mod tests {
     }
 
     #[test]
+    fn save_history_shares_pages_and_survives_eviction_and_clear() {
+        let mut backlog = Backlog::new();
+        backlog.max_pages = 1;
+        backlog.push_page(text_page("first"));
+        let snapshot = crate::save::HistorySnapshot::capture(&backlog);
+        assert!(Arc::ptr_eq(&snapshot.pages[0], backlog.snapshot_pages().next().unwrap()));
+        let copy = snapshot.clone();
+        assert!(Arc::ptr_eq(&snapshot.pages[0], &copy.pages[0]));
+        backlog.push_page(text_page("second"));
+        backlog.clear();
+        assert_eq!(snapshot.pages[0].plain_text(), "first");
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["pages"][0], serde_json::to_value(snapshot.pages[0].as_ref()).unwrap());
+        let restored: crate::save::HistorySnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, snapshot);
+    }
+
+    #[test]
     fn snapshot_identity_tracks_stored_pages_not_settings_or_rejected_writes() {
         let mut backlog = Backlog::new();
         let empty = Arc::clone(backlog.snapshot_revision());

@@ -455,20 +455,71 @@ type FileReaderCallback = unsafe extern "C" fn(
     offset: c_longlong,
 ) -> c_int;
 
-static FILE_READER: Mutex<Option<FileReaderCallback>> = Mutex::new(None);
+#[derive(Clone, Copy)]
+struct FileReader {
+    callback: FileReaderCallback,
+    normalizes_separators: bool,
+}
+impl FileReader {
+    fn read(self, path: &str, buf: *mut u8, len: c_int, offset: c_longlong) -> Option<c_int> {
+        // Normalizing hosts already tried both spellings. Do not allocate an
+        // alternate path or queue a second disk operation after their miss.
+        let candidates = if self.normalizes_separators {
+            [std::borrow::Cow::Borrowed(path), std::borrow::Cow::Borrowed(path)]
+        } else { path_candidates(path) };
+        for (index, candidate) in candidates.into_iter().enumerate() {
+            if index > 0 && candidate.as_ref() == path { continue; }
+            let Some(c_path) = CString::new(candidate.as_ref()).ok() else { continue; };
+            let started = begin_profile_io();
+            let result = unsafe { (self.callback)(c_path.as_ptr(), buf, len, offset) };
+            finish_profile_io(started, if offset < 0 { 0 } else { result.max(0) as usize });
+            if result >= 0 { return Some(result); }
+        }
+        None
+    }
+}
+static FILE_READER: Mutex<Option<FileReader>> = Mutex::new(None);
 // System scripts may probe the same optional asset many times while building
 // menus. Cache hits and misses at the synchronous FFI boundary.
+static FILE_SIZE_EPOCH: AtomicU64 = AtomicU64::new(1);
+pub(crate) fn file_size_epoch()->u64 { FILE_SIZE_EPOCH.load(Ordering::Acquire) }
+
+// Cache-only probe: never performs filesystem I/O on the script thread.
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+fn image_missing_in(cache:&HashMap<String,Option<u64>>,path:&str)->bool{
+    crate::native_texture::candidates(path).all(|p|
+        cache.get(&p.replace('\\',"/"))==Some(&None))
+}
+#[cfg(any(feature = "gl-backend", feature = "gxm-backend"))]
+pub(crate) fn image_missing_cached(path:&str)->Option<u64>{
+    let guard=FILE_SIZE_CACHE.lock().unwrap();
+    image_missing_in(guard.as_ref()?,path).then(file_size_epoch)
+}
 static FILE_SIZE_CACHE: Mutex<Option<HashMap<String, Option<u64>>>> = Mutex::new(None);
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn art3m1s_register_file_reader(cb: FileReaderCallback) {
-    *FILE_READER.lock().unwrap() = Some(cb);
-    *FILE_SIZE_CACHE.lock().unwrap() = Some(HashMap::new());
+    register_file_reader(cb, false);
+}
+
+/// Opt-in for hosts whose callback treats slash and backslash as equivalent
+/// for both size probes and reads. Legacy registrations keep separator retry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_register_normalized_file_reader(cb: FileReaderCallback) {
+    register_file_reader(cb, true);
+}
+
+fn register_file_reader(cb: FileReaderCallback, normalizes_separators: bool) {
+    *FILE_READER.lock().unwrap() = Some(FileReader { callback: cb, normalizes_separators });
+    let mut cache=FILE_SIZE_CACHE.lock().unwrap();
+    *cache = Some(HashMap::new());
+    FILE_SIZE_EPOCH.fetch_add(1,Ordering::Release);
 }
 
 pub fn clear_file_size_cache() {
     if let Some(cache) = FILE_SIZE_CACHE.lock().unwrap().as_mut() {
         cache.clear();
+        FILE_SIZE_EPOCH.fetch_add(1,Ordering::Release);
     }
 }
 
@@ -481,6 +532,7 @@ fn invalidate_file_size_path(cache: &mut HashMap<String, Option<u64>>, path: &st
 fn file_size_changed(path: &str) {
     if let Some(cache)=FILE_SIZE_CACHE.lock().unwrap().as_mut() {
         invalidate_file_size_path(cache,path);
+        FILE_SIZE_EPOCH.fetch_add(1,Ordering::Release);
     }
 }
 
@@ -675,69 +727,29 @@ pub fn save_dir() -> Option<&'static str> {
 // ── Query helpers ────────────────────────────────────────────────
 
 fn query_size(path: &str) -> Option<u64> {
-    let cb = FILE_READER.lock().unwrap().clone()?;
-    let key = path.replace('\\', "/");
+    let key = if path.contains('\\') {
+        std::borrow::Cow::Owned(path.replace('\\', "/"))
+    } else { std::borrow::Cow::Borrowed(path) };
     if let Some(cached) = FILE_SIZE_CACHE
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|cache| cache.get(&key).copied())
+        .and_then(|cache| cache.get(key.as_ref()).copied())
     {
         return cached;
     }
-    // PFS archives in the host preserve the original Windows `\\` separator,
-    // while directory-backed projects conventionally use `/`.  Try the
-    // caller's spelling first, then the alternate separator only on failure;
-    // this keeps normal paths fast and makes the FFI boundary tolerant of both
-    // resource backends without teaching the interpreter game-specific paths.
-    for (index, candidate) in path_candidates(path).into_iter().enumerate() {
-        if index > 0 && candidate.as_ref() == path {
-            continue;
-        }
-        let Some(c_path) = CString::new(candidate.as_ref()).ok() else {
-            continue;
-        };
-        let started = begin_profile_io();
-        let size = unsafe { cb(c_path.as_ptr(), std::ptr::null_mut(), 0, -1) };
-        finish_profile_io(started, 0);
-        if size >= 0 {
-            let result = Some(size as u64);
-            if let Some(cache) = FILE_SIZE_CACHE.lock().unwrap().as_mut() {
-                cache.insert(key.clone(), result);
-            }
-            return result;
-        }
-    }
+    // Do not hold a cache or registration lock during host I/O.
+    let reader = *FILE_READER.lock().unwrap();
+    let result = reader?.read(path, std::ptr::null_mut(), 0, -1).map(|n| n as u64);
     if let Some(cache) = FILE_SIZE_CACHE.lock().unwrap().as_mut() {
-        cache.insert(key, None);
+        cache.insert(key.into_owned(), result);
     }
-    None
+    result
 }
 
 fn read_chunk(path: &str, offset: u64, buf: &mut [u8]) -> Option<usize> {
-    let cb = FILE_READER.lock().unwrap().clone()?;
-    for (index, candidate) in path_candidates(path).into_iter().enumerate() {
-        if index > 0 && candidate.as_ref() == path {
-            continue;
-        }
-        let Some(c_path) = CString::new(candidate.as_ref()).ok() else {
-            continue;
-        };
-        let started = begin_profile_io();
-        let n = unsafe {
-            cb(
-                c_path.as_ptr(),
-                buf.as_mut_ptr(),
-                buf.len() as c_int,
-                offset as c_longlong,
-            )
-        };
-        finish_profile_io(started, n.max(0) as usize);
-        if n >= 0 {
-            return Some(n as usize);
-        }
-    }
-    None
+    let reader = *FILE_READER.lock().unwrap();
+    reader?.read(path, buf.as_mut_ptr(), buf.len() as c_int, offset as c_longlong).map(|n| n as usize)
 }
 
 /// Return the original path and, when useful, a separator-normalized variant.
@@ -2193,11 +2205,60 @@ pub unsafe extern "C" fn art3m1s_runtime_image_mask_active(rt: *const CoreRuntim
 #[cfg(test)]
 mod file_size_invalidation_tests {
     use super::*;
+    thread_local! { static PROBES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    unsafe extern "C" fn probe_reader(path: *const c_char, buf: *mut u8, len: c_int, offset: c_longlong) -> c_int {
+        let path=unsafe { std::ffi::CStr::from_ptr(path) }.to_str().unwrap();
+        PROBES.with(|v| v.borrow_mut().push(path.to_owned()));
+        if path == r"image\present.csv" {
+            if offset < 0 { return 3; }
+            if len >= 3 && !buf.is_null() { unsafe { std::ptr::copy_nonoverlapping(b"1,2".as_ptr(),buf,3); } return 3; }
+        }
+        -1
+    }
+    #[test] fn normalized_reader_does_not_retry_identical_missing_resource() {
+        let reader=FileReader { callback: probe_reader, normalizes_separators: true };
+        for offset in [-1,0] {
+            PROBES.with(|v| v.borrow_mut().clear());
+            assert_eq!(reader.read("image/absent.csv",std::ptr::null_mut(),0,offset),None);
+            PROBES.with(|v| assert_eq!(&*v.borrow(),&["image/absent.csv"]));
+        }
+    }
+    #[test] fn legacy_reader_keeps_separator_fallback_for_sizes_and_payloads() {
+        let reader=FileReader { callback: probe_reader, normalizes_separators: false };
+        PROBES.with(|v| v.borrow_mut().clear());
+        assert_eq!(reader.read("image/present.csv",std::ptr::null_mut(),0,-1),Some(3));
+        PROBES.with(|v| assert_eq!(&*v.borrow(),&["image/present.csv",r"image\present.csv"]));
+        let mut data=[0;3];
+        assert_eq!(reader.read("image/present.csv",data.as_mut_ptr(),3,0),Some(3));
+        assert_eq!(&data,b"1,2");
+        assert_eq!(reader.read("bad\0path",std::ptr::null_mut(),0,-1),None);
+    }
     #[test] fn mutation_preserves_other_positive_and_negative_probes() {
         let mut cache=HashMap::from([("save/slot.dat".into(),Some(9)),("SAVE/slot.dat".into(),None),("image/optional.png".into(),None),("image/bg.png".into(),Some(123))]);
         invalidate_file_size_path(&mut cache,r"save\slot.dat");
         assert_eq!(cache.len(),2);
         assert_eq!(cache["image/bg.png"],Some(123));assert_eq!(cache["image/optional.png"],None);
         cache.insert("save/slot.dat".into(),Some(20));invalidate_file_size_path(&mut cache,"save/slot.dat");assert_eq!(cache.len(),2);
+    }
+}
+
+
+#[cfg(all(test,any(feature="gl-backend",feature="gxm-backend")))]
+mod image_missing_tests {
+    use super::*;
+    #[test]
+    fn all_candidates_must_be_known_absent_and_invalidation_allows_retry(){
+        let path="image/body.png";
+        let mut cache=HashMap::new();
+        assert!(!image_missing_in(&cache,path));
+        for p in crate::native_texture::candidates(path){cache.insert(p.into_owned(),None);}
+        assert!(image_missing_in(&cache,path));
+        cache.insert("image/body.dds".into(),Some(128));
+        assert!(!image_missing_in(&cache,path));
+        cache.insert("image/body.dds".into(),None);
+        assert!(image_missing_in(&cache,path));
+        invalidate_file_size_path(&mut cache,"image/body.dds");
+        assert!(!image_missing_in(&cache,path));
+        cache.clear();assert!(!image_missing_in(&cache,path));
     }
 }

@@ -98,6 +98,20 @@ pub(crate) fn decode_luma(decoder:impl image::ImageDecoder,limit:usize)->Option<
 pub extern "C" fn art3m1s_resource_ledger_version()->u32 {3}
 #[unsafe(no_mangle)]
 pub extern "C" fn art3m1s_resource_ledger_audio_version()->u32 {3}
+/// Coherent observation of all instrumented regions, not process memory usage.
+/// Header: version, events, faults, region count. Each region: live, reserved,
+/// retired (subset of live), peak, then eleven owner live/reserved/retired triples.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn art3m1s_resource_memory_snapshot(out:*mut u64,count:usize)->i32 {
+    if out.is_null()||count<115{return 0;}
+    let s=*LEDGER.lock().unwrap_or_else(|e|e.into_inner());
+    let mut v=[0u64;115];v[..4].copy_from_slice(&[1,s.events,s.faults,3]);
+    for r in 0..REGIONS {
+        let b=4+r*37;let c=s.totals[r];v[b..b+4].copy_from_slice(&[c.live,c.reserved,c.retired,c.peak]);
+        for o in 0..OWNERS {let c=s.cells[r][o];let i=b+4+o*3;v[i..i+3].copy_from_slice(&[c.live,c.reserved,c.retired]);}
+    }
+    unsafe{std::ptr::copy_nonoverlapping(v.as_ptr(),out,v.len());}1
+}
 /// Read-only, versioned CDRAM usage for the optional performance overlay.
 /// This is instrumented engine ownership, not total driver/system usage.
 #[unsafe(no_mangle)]
@@ -121,6 +135,16 @@ pub extern "C" fn art3m1s_resource_report(){
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn full_snapshot_validates_size_and_keeps_regions_separate(){
+        let mut out=[u64::MAX;120];
+        assert_eq!(unsafe{art3m1s_resource_memory_snapshot(out.as_mut_ptr(),114)},0);
+        assert_eq!(out,[u64::MAX;120]);
+        assert_eq!(unsafe{art3m1s_resource_memory_snapshot(std::ptr::null_mut(),115)},0);
+        assert_eq!(unsafe{art3m1s_resource_memory_snapshot(out.as_mut_ptr(),120)},1);
+        assert_eq!(out[0],1);
+        for r in 0..3 {let base=4+r*37; assert_eq!(out[base],(0..11).map(|o|out[base+4+o*3]).sum::<u64>()); assert!(out[base+2]<=out[base]);}
+        assert_eq!(&out[115..],&[u64::MAX;5]);
+    }
     #[test] fn gpu_snapshot_validates_capacity_and_preserves_tail(){
         let mut out=[u64::MAX;5];
         assert_eq!(unsafe {art3m1s_resource_gpu_snapshot(std::ptr::null_mut(),3)},0);

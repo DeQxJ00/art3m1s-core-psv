@@ -198,7 +198,7 @@ pub struct MessageTextSnapshot {
     #[serde(default)]
     pub layers: Vec<MessageLayerTextSnapshot>,
     #[serde(default)]
-    pub input_handlers: Option<Vec<(String, String, crate::compositor::reduce::InputHandler)>>,
+    pub input_handlers: Option<crate::compositor::reduce::InputSnapshot>,
     #[serde(default)]
     pub history: Option<HistorySnapshot>,
     /// Absent in legacy files, which retain the definitions built by the script.
@@ -211,10 +211,23 @@ pub type TextTweenDefinitions =
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistorySnapshot {
-    pub pages: Vec<crate::text::backlog::BacklogPage>,
+    pub pages: Vec<std::sync::Arc<crate::text::backlog::BacklogPage>>,
     pub settings: crate::text::backlog::BacklogSettings,
     pub write_mode: bool,
     pub max_pages: usize,
+}
+
+impl HistorySnapshot {
+    pub(crate) fn capture(backlog: &crate::text::backlog::Backlog) -> Self {
+        Self {
+            // Stored pages are immutable. Share them across checkpoints instead
+            // of copying and freeing the entire dialogue history every line.
+            pages: backlog.snapshot_pages().cloned().collect(),
+            settings: backlog.settings.clone(),
+            write_mode: backlog.write_mode,
+            max_pages: backlog.max_pages,
+        }
+    }
 }
 
 /// Permission and policy only; held keys and active skip modes are transient.
@@ -256,7 +269,7 @@ pub struct GameplayCheckpoint {
     pub scene: crate::compositor::Scene,
     pub message_text: Option<MessageTextSnapshot>,
     pub skip_config: SkipConfigSnapshot,
-    pub input_handlers: Vec<(String, String, crate::compositor::reduce::InputHandler)>,
+    pub input_handlers: crate::compositor::reduce::InputSnapshot,
     pub script: String,
     pub line: usize,
     pub call_stack: Vec<CallFrameSnapshot>,
@@ -445,7 +458,7 @@ impl SaveData {
 }
 
 fn local_variable_snapshot(interpreter: &asb_interpreter::Interpreter) -> VariableStore {
-    interpreter.variables().local_snapshot()
+    interpreter.variables_handle().lock().unwrap().local_snapshot()
 }
 
 #[cfg(test)]
@@ -624,7 +637,7 @@ mod tests {
             scene: crate::compositor::Scene::new(),
             message_text: None,
             skip_config: SkipConfigSnapshot { allow: true, unread: false },
-            input_handlers: Vec::new(),
+            input_handlers: Default::default(),
             script: "macro.iet".into(),
             line: 1626,
             input_wait_from_queue: true,
@@ -901,10 +914,10 @@ mod tests {
         data.message_text = Some(MessageTextSnapshot {
             skip_config: Some(SkipConfigSnapshot { allow: true, unread: true }),
             input_handlers: Some(vec![("push".into(), "38".into(),
-                crate::compositor::reduce::InputHandler { label: Some("history".into()), ..Default::default() })]),
+                crate::compositor::reduce::InputHandler { label: Some("history".into()), ..Default::default() })].into()),
             history: Some(HistorySnapshot { pages: vec![crate::text::backlog::BacklogPage {
                 tags: vec![crate::text::BacklogTag::Text("Earlier dialogue".into())], ..Default::default()
-            }], settings: Default::default(), write_mode: true, max_pages: 100 }),
+            }.into()], settings: Default::default(), write_mode: true, max_pages: 100 }),
             active_layer: Some("dialogue".into()),
             layer_stack: Some(vec!["0".into()]),
             layers: vec![MessageLayerTextSnapshot { id: "dialogue".into(), page_font: Default::default(),
@@ -912,6 +925,17 @@ mod tests {
                 tags: vec![crate::text::BacklogTag::IndentModify(1), crate::text::BacklogTag::Text("Restored text".into())] }],
             text_tweens: None,
         });
+        let text = data.message_text.as_ref().unwrap();
+        let copied = text.clone();
+        assert!(std::sync::Arc::ptr_eq(text.input_handlers.as_ref().unwrap(),
+            copied.input_handlers.as_ref().unwrap()));
+        // The shared in-memory representation must retain the legacy array format.
+        let handlers = text.input_handlers.as_ref().unwrap();
+        let legacy_array = serde_json::to_value(handlers.as_ref()).unwrap();
+        assert_eq!(serde_json::to_value(handlers).unwrap(), legacy_array);
+        let shared: crate::compositor::reduce::InputSnapshot =
+            serde_json::from_value(legacy_array).unwrap();
+        assert_eq!(&shared[..], &handlers[..]);
         let mut json = serde_json::to_value(&data).unwrap();
         let restored: SaveData = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(restored.input_wait_from_queue, Some(false));

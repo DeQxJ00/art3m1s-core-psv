@@ -59,7 +59,10 @@ impl CoreRuntime {
         let timeline_us = prepare_started.elapsed().as_micros() as u64;
         // Lua has already selected these images and staged them for image_loop.
         // Complete that cache request without scanning unexecuted story tags.
+        let mut path_parts=[0u64;7];
+        let path_started=crate::profile_clock::Instant::now();
         let staged=self.interpreter.query_staged_images();
+        path_parts[0]=path_started.elapsed().as_micros() as u64;
         let staged_order:Vec<_>=staged.iter()
             .filter(|p|crate::native_texture::file_image_reference(p))
             .map(|p|self.texture_provider.canonical_image_name(p))
@@ -71,6 +74,7 @@ impl CoreRuntime {
             super::surface_loader::bind(path,true,self.png_comments.clone());
         }
         if !newly_staged.is_empty(){crate::core_info!("[staged-image-prefetch] added={} pending={} lookahead_required=0",newly_staged.len(),staged.len());}
+        path_parts[1]=path_started.elapsed().as_micros() as u64;
         let mut paths_us = 0;
         let mut images_us = 0;
         if self.frame_visual_dirty || self.last_submitted_frame.is_none() || self.texture_provider.needs_upload_retry() {
@@ -80,6 +84,7 @@ impl CoreRuntime {
             let mut files=self.compositor.scene().collect_files();
             files.extend(RenderPipeline::new(&self.compositor).retained_files());
             let hidden=self.compositor.scene().hidden_image_files();
+            path_parts[2]=path_started.elapsed().as_micros() as u64;
             let visible:std::collections::HashSet<_>=files.difference(&hidden)
                 .map(|p|self.texture_provider.canonical_image_name(p)).collect();
             let mut deferred:std::collections::HashSet<_>=hidden.iter()
@@ -88,19 +93,18 @@ impl CoreRuntime {
             deferred.retain(|p|!visible.contains(p));
             let current:std::collections::HashSet<_>=files.iter()
                 .map(|p|self.texture_provider.canonical_image_name(p))
-                .map(|p|super::magic_path::resolve_path(&self.magic_paths,&p)).collect();
-            let stale:Vec<_>=self.hidden_surface_bindings.difference(&current).cloned().collect();
-            for p in stale {super::surface_loader::unbind(&p);self.hidden_surface_bindings.remove(&p);}
-            for p in &deferred {
-                let path=super::magic_path::resolve_path(&self.magic_paths,p);
-                if self.hidden_surface_bindings.insert(path.clone()) {
-                    super::surface_loader::bind(&path,true,self.png_comments.clone());
-                }
-            }
+                .collect();
+            path_parts[3]=path_started.elapsed().as_micros() as u64;
+            self.hidden_surface_bindings.sync(&self.magic_paths,&current,&deferred,
+                |path|super::surface_loader::try_bind_hidden(path,self.png_comments.clone()),
+                super::surface_loader::try_unbind_hidden);
+            path_parts[4]=path_started.elapsed().as_micros() as u64;
             // Hidden cache layers must not outrank the currently visible face.
             let visible_files=files.difference(&hidden).cloned().collect();
             let paths=self.scene_paths.resolve(&self.magic_paths,&visible_files);
+            path_parts[5]=path_started.elapsed().as_micros() as u64;
             super::surface_loader::prioritize_scene(paths);
+            path_parts[6]=path_started.elapsed().as_micros() as u64;
             let mut previous=std::collections::HashSet::new();
             if (RenderPipeline::new(&self.compositor).needs_trans_capture()
                 || RenderPipeline::new(&self.compositor).is_transition_in_progress())
@@ -112,6 +116,10 @@ impl CoreRuntime {
                 for group in &frame.shader_groups{previous.extend(group.effect.mask_texture);previous.extend(group.effect.user_texture);}
             }
             paths_us = prepare_started.elapsed().as_micros() as u64 - timeline_us;
+            if paths_us>=20000 {
+                crate::core_info!("[prepare-path-spike] total_us={} staged_query_us={} staged_bind_us={} collect_us={} canonical_us={} hidden_bind_us={} resolve_us={} priority_us={} files={} hidden={} new_staged={}",
+                    paths_us,path_parts[0],path_parts[1]-path_parts[0],path_parts[2]-path_parts[1],path_parts[3]-path_parts[2],path_parts[4]-path_parts[3],path_parts[5]-path_parts[4],path_parts[6]-path_parts[5],files.len(),hidden.len(),newly_staged.len());
+            }
             self.texture_provider.prepare_image_files_except(&files,&previous,&deferred);
             images_us = prepare_started.elapsed().as_micros() as u64 - timeline_us - paths_us;
         }
@@ -449,6 +457,7 @@ impl CoreRuntime {
             // is already inside text/scene wall time and must not be added.
             p.frame_emote_ns=emote_setup_ns+crate::profiler::FrameProfile::elapsed(join_started);
         }
+        let retain_wall = crate::profile_clock::Instant::now();
         let retain_started = profile.as_ref().and_then(|p| p.mark());
         let mut used_files = scene_snapshot
             .map(|(scene, _)| scene.collect_files())
@@ -460,10 +469,17 @@ impl CoreRuntime {
         for file in RenderPipeline::new(&self.compositor).retained_files() {
             used_files.insert(file);
         }
+        let retain_collect_us = retain_wall.elapsed().as_micros();
         self.texture_provider.set_save_image_directory(&self.savepath);
         self.texture_provider.retain_frame(&used_files,&frame,RenderPipeline::new(&self.compositor).is_transition_in_progress());
+        let retain_provider_us = retain_wall.elapsed().as_micros();
         super::surface_loader::retain_menu_images_resolving(||
             used_files.iter().map(|p|super::magic_path::resolve_path(&self.magic_paths,p)).collect());
+        let retain_total_us = retain_wall.elapsed().as_micros();
+        if retain_total_us > 16000 {
+            crate::core_info!("[retain-slow] collect_us={} provider_us={} loader_us={} names={}",
+                retain_collect_us, retain_provider_us-retain_collect_us, retain_total_us-retain_provider_us, used_files.len());
+        }
         if let Some(p) = profile.as_deref_mut() {
             p.frame_retain_ns = crate::profiler::FrameProfile::elapsed(retain_started);
         }

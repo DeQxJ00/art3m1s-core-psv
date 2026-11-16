@@ -895,11 +895,7 @@ impl CoreRuntime {
                 .filter(|(_, layer)| !layer.scetween.is_empty())
                 .map(|(id, layer)| (id.clone(), layer.scetween.iter().map(ScetweenConfig::definition).collect()))
                 .collect()),
-            history: include_history.then(|| crate::save::HistorySnapshot {
-                pages: state.backlog.snapshot_pages().map(|page| page.as_ref().clone()).collect(),
-                settings: state.backlog.settings.clone(), write_mode: state.backlog.write_mode,
-                max_pages: state.backlog.max_pages,
-            }),
+            history: include_history.then(|| crate::save::HistorySnapshot::capture(&state.backlog)),
         })
     }
 
@@ -926,7 +922,7 @@ impl CoreRuntime {
             let backlog = &mut renderer.font_state_mut().backlog;
             backlog.clear();
             backlog.max_pages = history.max_pages;
-            for page in &history.pages { backlog.push_page(page.clone()); }
+            for page in &history.pages { backlog.push_page(page.as_ref().clone()); }
             backlog.settings = history.settings.clone();
             backlog.write_mode = history.write_mode;
         }

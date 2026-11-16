@@ -299,19 +299,54 @@ impl CoreRuntime {
             // 菜单/对话框里的等待是从点击等待 call 出去的，不能覆盖原检查点。
             return;
         }
-        self.gameplay_save_checkpoint = Some(crate::save::GameplayCheckpoint {
-            scene: self.compositor.scene_snapshot(),
-            message_text: self.capture_message_text_snapshot(),
-            skip_config: self.capture_skip_config(),
-            input_handlers: self.compositor.input_snapshot(),
+        let started = crate::profile_clock::Instant::now();
+        let scene = self.compositor.scene_snapshot();
+        let scene_us = started.elapsed().as_micros();
+        let message_text = self.capture_message_text_snapshot();
+        let text_us = started.elapsed().as_micros();
+        let skip_config = self.capture_skip_config();
+        let skip_us = started.elapsed().as_micros();
+        let input_handlers = self.compositor.input_snapshot();
+        let input_us = started.elapsed().as_micros();
+        let handle=self.interpreter.variables_handle();
+        let store=handle.lock().unwrap();
+        let vars_locked_us=started.elapsed().as_micros();
+        let variables = store.local_snapshot();
+        drop(store);
+        let vars_us = started.elapsed().as_micros();
+        let next = crate::save::GameplayCheckpoint {
+            scene,
+            message_text,
+            skip_config,
+            input_handlers,
             script: script.to_string(),
             line: self.interpreter.current_line(),
             call_stack,
-            variables: self.interpreter.variables().local_snapshot(),
+            variables,
             waiting_for_input: true,
             input_wait_from_queue: self.interpreter.input_wait_is_queued(),
             input_wait_reason: crate::save::InputWaitSnapshot::capture(self.wait_reason.as_ref()),
-        });
+        };
+        let build_us=started.elapsed().as_micros();
+        let old=self.gameplay_save_checkpoint.replace(next);
+        let swapped_us=started.elapsed().as_micros();
+        let mut drops=[0u128;4];
+        if let Some(old)=old {
+            // Preserve synchronous retirement; these spans only identify which
+            // owned snapshot allocations cause a slow replacement.
+            let crate::save::GameplayCheckpoint{scene,message_text,skip_config,input_handlers,
+                script,call_stack,variables,input_wait_reason,..}=old;
+            let phase=crate::profile_clock::Instant::now();drop(scene);drops[0]=phase.elapsed().as_micros();
+            let phase=crate::profile_clock::Instant::now();drop(message_text);drops[1]=phase.elapsed().as_micros();
+            let phase=crate::profile_clock::Instant::now();drop((skip_config,input_handlers,script,call_stack));drops[2]=phase.elapsed().as_micros();
+            let phase=crate::profile_clock::Instant::now();drop((variables,input_wait_reason));drops[3]=phase.elapsed().as_micros();
+        }
+        let total=started.elapsed().as_micros();
+        if total >= 5_000 {
+            crate::core_info!("[checkpoint-slow] total_us={} scene_us={} text_us={} skip_us={} input_us={} vars_lock_us={} vars_copy_us={} build_us={} swap_us={} drop_scene_us={} drop_text_us={} drop_input_meta_us={} drop_vars_wait_us={}; exclusive wall spans",
+                total,scene_us,text_us-scene_us,skip_us-text_us,input_us-skip_us,vars_locked_us-input_us,
+                vars_us-vars_locked_us,build_us-vars_us,swapped_us-build_us,drops[0],drops[1],drops[2],drops[3]);
+        }
     }
 
     /// 处理 [load]：经宿主读回调读取 JSON → 恢复变量与执行位置 → 触发 onLoad

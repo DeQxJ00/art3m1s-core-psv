@@ -213,6 +213,85 @@ mod tests {
     use asb_interpreter::event::LayerEvent;
 
     #[test]
+    #[ignore = "requires external audited position Lua block"]
+    fn scoped_position_query_matches_audited_calculation() {
+        use asb_interpreter::{Interpreter, InterpreterConfig};
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        let source = std::fs::read_to_string(std::env::var("ART3M1S_POSITION_QUERY_AUDIT").unwrap()).unwrap();
+        let run = |fast: bool, missing: u8, left: i32, reverse: &str, existing: bool| {
+            let state = Arc::new(Mutex::new(LayerQueryState::default()));
+            for (id, props) in [
+                ("10.1", vec![("left", "423".to_owned())]),
+                ("10.1.0.0.1.a.1", vec![("width", if missing == 4 { "0" } else { "513" }.into()), ("height", "807".into())]),
+                ("10.1.0.0.1", vec![("left", left.to_string()), ("top", "-31".into())]),
+                ("10.1.0.0.0", vec![("visible", "1".into())]),
+            ] {
+                if missing == 1 || (missing == 2 && id.ends_with(".a.1")) || (missing == 3 && id == "10.1.0.0.0") { continue; }
+                let mut s = state.lock().unwrap();
+                s.observe(&Event::Layer(LayerEvent::Create { id: id.into(), file: String::new() }));
+                s.observe(&Event::Layer(LayerEvent::SetProperties { id: id.into(),
+                    properties: props.into_iter().map(|(k, v)| (k.into(), v)).collect() }));
+            }
+            // These unrelated assets must never be probed by the scoped path.
+            for n in 0..60 {
+                state.lock().unwrap().observe(&Event::Layer(LayerEvent::Create {
+                    id: format!("90.{n}"), file: format!("unrelated/{n}"),
+                }));
+            }
+            let mut it = Interpreter::new(InterpreterConfig::default());
+            it.set_engine_callbacks(Box::new(super::super::callbacks::FfiCallbacks {
+                input: Default::default(), magic_paths: Default::default(), layer_info: Arc::clone(&state),
+                png_comments: Default::default(), savepath: "save".into(), volumes: Default::default(),
+                debug_skip_active: Default::default(), script_status: Default::default(),
+                script_status_request: Arc::new(std::sync::atomic::AtomicU16::new(crate::runtime::NO_SCRIPT_STATUS_REQUEST)),
+                emote: Default::default(),
+            }));
+            it.load_script("position", &format!("[lua]\n{source}\n[/lua]\n[stop]\n")).unwrap();
+            if !fast { it.lua().load(&source).exec().unwrap(); }
+            for (k, v) in [("g.screen_width", "960"), ("g.screen_height", "544"),
+                ("fg_eyelv", "34"), ("f_id", "10.1"), ("fg_name", "actor"),
+                ("fg_pos.actor", if existing { "277" } else { "0" }),
+                ("mode", "0"), ("now", "now"), ("reverse", reverse),
+                ("pos_rout", if existing { "960" } else { "0" })] {
+                it.set_variable(k, asb_interpreter::Value::String(v.into()));
+            }
+            it.lua().load("getPosCalc(__engine)").exec().unwrap();
+            let globals: BTreeMap<_, _> = it.variables().iter_local().map(|(k, v)| (k.clone(), v.to_string())).collect();
+            let queried: BTreeMap<_, _> = it.variables().iter_temp()
+                .filter(|(k, _)| ["10.1", "10.1.0.0.1.a.1", "10.1.0.0.1", "10.1.0.0.0"].iter()
+                    .any(|id| k.strip_prefix(&format!("l.li.{id}.")).is_some_and(|prop| !prop.contains('.'))))
+                .map(|(k, v)| (k.clone(), v.to_string())).collect();
+            let tags = Arc::new(Mutex::new(Vec::new()));
+            let emitted = Arc::clone(&tags);
+            it.set_callback(move |event| {
+                if let Event::Layer(LayerEvent::SetProperties { id, properties }) = event {
+                    emitted.lock().unwrap().push((id, properties.into_iter().collect::<BTreeMap<_, _>>()));
+                } else { panic!("unexpected position event: {event:?}"); }
+                asb_interpreter::CallbackResult::Continue
+            });
+            it.drain_queued_tags_only().unwrap();
+            let tags = tags.lock().unwrap().clone();
+            if fast {
+                assert!(state.lock().unwrap().dimensions.is_empty(), "must not probe unrelated assets");
+            } else {
+                assert_eq!(state.lock().unwrap().dimensions.len(), 60, "baseline enumerates unrelated assets");
+            }
+            (globals, queried, tags)
+        };
+        for missing in 0..5 {
+            for left in [-53, 0, 47] {
+                for reverse in ["none", "1"] {
+                    for existing in [false, true] {
+                        assert_eq!(run(false, missing, left, reverse, existing), run(true, missing, left, reverse, existing),
+                            "missing={missing} left={left} reverse={reverse} existing={existing}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn lua_creation_and_next_lua_query_work_in_one_interpreter_run() {
         use asb_interpreter::{CallbackResult, Interpreter, InterpreterConfig};
         use std::sync::{Arc, Mutex};

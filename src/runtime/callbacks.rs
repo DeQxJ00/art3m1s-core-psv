@@ -393,6 +393,7 @@ impl InputSnapshot {
 }
 
 impl EngineCallbacks for FfiCallbacks {
+    fn scoped_layer_query_enabled(&self) -> bool { true }
     fn capture_memory_scene(&self) -> Result<Option<serde_json::Value>, String> {
         let scene = self.layer_info.lock().unwrap().memory_scene();
         serde_json::to_value(scene).map(Some).map_err(|error| error.to_string())
@@ -407,6 +408,12 @@ impl EngineCallbacks for FfiCallbacks {
     }
 
     fn enqueue_tag(&self, _tag: String, _params: HashMap<String, String>) {}
+    fn tag_notifications_enabled(&self) -> bool { false }
+    fn plain_var_fast_path_enabled(&self) -> bool { true }
+    fn deferred_bgm_recovery_enabled(&self) -> bool { true }
+    fn voice_recovery_snapshot(&self) -> Option<asb_interpreter::tags::var_handler::SoundInfoSnapshot> {
+        Some(super::media::sound_info_snapshot())
+    }
     fn observe_immediate_tag(&self, tag: &str, params: &HashMap<String, String>) -> Option<String> {
         self.layer_info.lock().unwrap().observe_tag(tag, params);
         super::text::observe_immediate_text(tag, params)

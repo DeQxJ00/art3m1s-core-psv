@@ -155,10 +155,16 @@ impl CoreRuntime {
         // Scripts can reference files via `:name/rest` notation; the
         // default loader (from create_interpreter) doesn't resolve these.
         let magic_paths_loader = Arc::clone(&self.magic_paths);
+        let small_files=std::sync::Mutex::new(super::script_file_cache::SmallFiles::default());
+        let savepath=self.savepath.clone();
         self.interpreter
             .set_file_loader(Box::new(move |name: &str| {
                 let resolved = magic_path::resolve_path(&magic_paths_loader, name);
-                crate::ffi::request_file(&resolved).map_err(|m| {
+                let read=||crate::ffi::request_file(&resolved);
+                let result=if crate::ui_image_lifetime::image_in_save_directory(&resolved,&savepath){read()}
+                    else{super::script_file_cache::SmallFiles::read(&small_files,&resolved,
+                        crate::ffi::file_size_epoch,read)};
+                result.map_err(|m| {
                     asb_interpreter::Error::IoError(std::io::Error::new(
                         if m.starts_with("not found: ") {
                             std::io::ErrorKind::NotFound

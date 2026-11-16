@@ -286,11 +286,10 @@ impl GxmTextureProvider {
         if requested==0{return 0;}
         let cache=self.cache_budget.clone();let mut account=cache.as_ref().map(|b|b.lock().unwrap());
         let mut idle:Vec<_>=self.entries.iter().filter(|(_,e)|e.cacheable&&e.reclaimable)
-            .map(|(n,e)|(e.last_used,n.clone())).collect();
-        idle.sort_unstable_by(|a,b|(!self.low_priority_idle(&a.1),a.0,&a.1)
-            .cmp(&(!self.low_priority_idle(&b.1),b.0,&b.1)));
+            .map(|(n,e)|(!self.low_priority_idle(n),e.last_used,n.clone())).collect();
+        idle.sort_unstable();
         let mut released=0usize;let mut count=0;
-        for (_,name) in idle {
+        for (ordinary,_,name) in idle {
             if released>=requested{break;}
             let cdram=if cdram_only{unsafe{art3m1s_gxm_texture_cdram_bytes(self.entries[&name].id.0)}}else{0};
             if cdram_only&&cdram==0{continue;}
@@ -299,7 +298,7 @@ impl GxmTextureProvider {
             unsafe{art3m1s_gxm_delete_texture(e.id.0)};
             let gpu=e.gpu_bytes();
             released=released.saturating_add(if cdram_only{cdram}else{(gpu+0x3ffff)&!0x3ffff});count+=1;
-            if self.low_priority_idle(&name) {
+            if !ordinary {
                 self.decoded.remove(&name);self.encoded.remove(&name);self.cache_evictions+=1;
             } else if !e.rgba.is_empty(){
                 self.decoded.insert(name,DecodedEntry { gray:e.gray, info:e.info,rgba:e.rgba,last_used:e.last_used});self.gpu_demotions+=1;
@@ -812,9 +811,12 @@ impl GxmTextureProvider {
             .map(|n|sparse::source_name(n).to_owned()).collect();
         // Keep admission serialized with loader publication. No loader calls
         // (or waits for loader tickets) occur while this budget lock is held.
+        let retain_started=Instant::now();
         self.cancel_warm_under_pressure();
+        let warm_us=retain_started.elapsed().as_micros();
         let cache=self.cache_budget.clone();
         let mut account=cache.as_ref().map(|b|b.lock().unwrap());
+        let budget_us=retain_started.elapsed().as_micros();
         let idle_limit=account.as_ref().map_or(self.idle_budget,|b|b.idle_limit(self.idle_budget));
         let wall_us = elapsed_us(self.timing_started);
         if wall_us >= 5000000 {
@@ -866,6 +868,9 @@ impl GxmTextureProvider {
         let mut idle_gpu=self.warm.parts().gpu+self.entries.values().filter(|e|e.reclaimable)
             .map(|e|e.cache_bytes()-e.rgba.capacity()).sum::<usize>();
         let gpu_limit=IDLE_GPU_BUDGET.min(idle_limit);
+        let scan_us=retain_started.elapsed().as_micros();
+        let mut sort_us=0;
+        let mut eviction_us=0;
         // Do not allocate/clone/sort the eviction queue when no eviction is
         // needed. Pinning, budget accounting, diagnostics and physical-memory
         // pressure handling below still run on every frame.
@@ -883,11 +888,17 @@ impl GxmTextureProvider {
         // A known-size nearby decode first borrows replaceable CPU backups.
         // Keep GPU surfaces warm when these copies alone satisfy the claim.
         let tier_order=|tier|if near_claim{match tier{1|3=>0,0=>1,_=>2}}else{usize::from(tier==2)};
-        reclaim.sort_unstable_by(|a,b|(!self.low_priority_idle(&a.1),tier_order(a.2),a.0,&a.1,a.2)
-            .cmp(&(!self.low_priority_idle(&b.1),tier_order(b.2),b.0,&b.1,b.2)));
-        for (_,name,tier,gpu_bytes) in reclaim {
+        // Classify paths once per candidate, not on every comparison. Large
+        // decoded caches otherwise repeat path parsing thousands of times
+        // under the shared admission lock during each eviction frame.
+        let mut reclaim:Vec<_>=reclaim.into_iter().map(|(used,name,tier,bytes)|
+            (!self.low_priority_idle(&name),tier_order(tier),used,name,tier,bytes)).collect();
+        reclaim.sort_unstable();
+        let sorted_us=retain_started.elapsed().as_micros();
+        sort_us=sorted_us-scan_us;
+        for (ordinary,_,_,name,tier,gpu_bytes) in reclaim {
             if idle_bytes<=idle_limit&&idle_gpu<=gpu_limit {break;}
-            if !names.contains(&name)&&self.low_priority_idle(&name) {
+            if !names.contains(&name)&&!ordinary {
                 // Discard all idle tiers together instead of demoting menu
                 // pixels while another scene is asking for memory.
                 if let Some(e)=self.entries.get(&name) {
@@ -942,6 +953,7 @@ impl GxmTextureProvider {
                     idle_limit,self.decoded.contains_key(&name),names.len(),self.reclaim_samples);
             }
         }
+        eviction_us=retain_started.elapsed().as_micros()-sorted_us;
         }
         self.retain_count += 1;
         if let Some(b)=account.as_mut(){b.set_idle(idle_bytes);}
@@ -954,7 +966,8 @@ impl GxmTextureProvider {
                     self.encoded_hits,self.cache_misses,self.cache_evictions,b.ready_goal as u64,
                     b.mask_parts.total() as u64,b.animation_parts.total() as u64,
                     b.script_preload.planned as u64,b.script_preload.completed as u64,
-                    b.script_preload.pixels as u64,b.script_preload.encoded as u64]);
+                    b.script_preload.pixels as u64,b.script_preload.encoded as u64,
+                    b.script_preload.bound as u64,b.script_preload.pending as u64,b.script_preload.missing as u64]);
             }
         }
         if self.retain_count % 120 == 0 {
@@ -978,6 +991,8 @@ impl GxmTextureProvider {
         let requested=std::mem::take(&mut self.upload_reclaim_bytes);
         drop(account);
         if requested>0 {self.reclaim_idle_gpu_cache(requested,"texture-pressure-reclaim");}
+        let total_us=retain_started.elapsed().as_micros();
+        if total_us>=8000 {crate::core_info!("[retain-provider-slow] warm_us={} budget_wait_us={} maintain_us={} entries={} decoded={} encoded={} reclaim_bytes={} scan_us={} sort_us={} eviction_us={} finish_us={}",warm_us,budget_us-warm_us,total_us-budget_us,self.entries.len(),self.decoded.len(),self.encoded.len(),requested,scan_us-budget_us,sort_us,eviction_us,total_us-scan_us-sort_us-eviction_us);}
         }
 }
 

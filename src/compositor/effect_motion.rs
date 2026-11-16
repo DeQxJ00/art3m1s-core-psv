@@ -32,6 +32,26 @@ fn visible(layer: &Layer, now: u64) -> bool {
     shown && alpha > 0.
 }
 
+/// Ordinary finite image translations, including motion inherited from groups.
+/// Looping indicators are excluded; filtered and particle loops have their own policies.
+pub(crate) fn has_scene_pan(scene: &Scene, now: u64) -> bool {
+    if !scene.root_props().is_visible() || scene.root_props().alpha == Some(0) { return false; }
+    let finite_pan = |t: &Tween| !t.infinite_loop && t.loop_count.is_none() && moving(t, now);
+    if !scene.all_layers().any(|l| l.tweens.iter().any(finite_pan)) { return false; }
+    scene.all_layers().filter(|l| l.file.as_deref().is_some_and(|f| !f.is_empty())).any(|leaf| {
+        let mut pan = false;
+        let mut id = Some(leaf.id.as_str());
+        while let Some(current) = id {
+            if let Some(layer) = scene.get(current) {
+                if layer.host_hidden || !visible(layer, now) { return false; }
+                pan |= layer.tweens.iter().any(finite_pan);
+            }
+            id = current.rsplit_once('.').map(|(parent, _)| parent);
+        }
+        pan
+    })
+}
+
 pub(crate) fn has_effect_pan(scene: &Scene, now: u64) -> bool {
     if !scene.root_props().is_visible() || scene.root_props().alpha == Some(0) { return false; }
     // Particle-only motion cannot activate a filter boost. Reject it before
@@ -171,6 +191,23 @@ mod tests {
         let mut s=Scene::new();s.set_file("1.0",Some("image.png".into()));
         s.get_mut("1").unwrap().props.shader=Some("blur".into());
         s.get_mut("1.0").unwrap().tweens.push(pan());s
+    }
+    #[test] fn ordinary_pan_clocks_follow_visible_image_branches() {
+        let mut s=Scene::new();s.set_file("1.0",Some("background.png".into()));
+        s.get_mut("1").unwrap().tweens.push(pan());
+        assert!(!has_scene_pan(&s,99));assert!(has_scene_pan(&s,200));
+        assert!(!has_scene_pan(&s,1100));
+        s.get_mut("1").unwrap().host_hidden=true;assert!(!has_scene_pan(&s,200));
+        s.get_mut("1").unwrap().host_hidden=false;
+        s.get_mut("1.0").unwrap().props.alpha=Some(0);assert!(!has_scene_pan(&s,200));
+        s.get_mut("1.0").unwrap().props.alpha=None;
+        s.get_mut("1").unwrap().tweens[0].infinite_loop=true;
+        assert!(!has_scene_pan(&s,200)); // Looping UI indicators are not scene pans.
+        s.get_mut("1").unwrap().tweens[0].infinite_loop=false;
+        s.get_mut("1").unwrap().tweens[0].param="alpha".into();
+        assert!(!has_scene_pan(&s,200));
+        s.get_mut("1").unwrap().tweens[0].param="left".into();
+        s.set_file("1.0",None);assert!(!has_scene_pan(&s,200));
     }
     #[test] fn ordinary_image_with_moving_borders_is_an_aperture() {
         let mut s=Scene::new();s.set_file("1.8.0",Some(":cg/shape.png".into()));

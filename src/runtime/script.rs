@@ -7,6 +7,20 @@ use asb_interpreter::{Event, ExecutionResult};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+#[derive(Default)]
+struct AdvanceTimings {
+    prepare:u128, queued:u128, run:u128, checkpoint:u128, autosave:u128, wait:u128,
+    vm:u128, vm_calls:usize,
+}
+
+fn report_advance_timing()->bool {
+    static WINDOW:std::sync::Mutex<(Option<crate::profile_clock::Instant>,u32)>=std::sync::Mutex::new((None,0));
+    let mut window=WINDOW.lock().unwrap();
+    if window.0.is_none_or(|start|start.elapsed().as_secs()>=1){*window=(Some(crate::profile_clock::Instant::now()),0);}
+    if window.1>=8{return false;}
+    window.1+=1;true
+}
+
 impl CoreRuntime {
     pub(super) fn advance_script(
         &mut self,
@@ -14,6 +28,23 @@ impl CoreRuntime {
         delta_ms: u64,
         profile: &mut crate::profiler::FrameProfile,
     ) {
+        let started=crate::profile_clock::Instant::now();
+        let events_before=profile.events_ns;
+        let mut parts=AdvanceTimings::default();
+        self.advance_script_measured(tick,delta_ms,profile,&mut parts);
+        let total=started.elapsed().as_micros();
+        if total>=20_000&&report_advance_timing(){
+            let measured=parts.prepare+parts.queued+parts.run+parts.checkpoint+parts.autosave+parts.wait;
+            crate::core_info!("[script-advance-parts] total_us={} prepare_us={} queued_us={} run_us={} checkpoint_us={} autosave_us={} wait_us={} other_us={} vm_us={} vm_calls={} nested_events_us={} line={}; phases exclusive; vm subset of run, events overlap phases; wall time",
+                total,parts.prepare,parts.queued,parts.run,parts.checkpoint,parts.autosave,parts.wait,
+                total.saturating_sub(measured),parts.vm,parts.vm_calls,
+                profile.events_ns.saturating_sub(events_before)/1000,self.interpreter.current_line());
+        }
+    }
+
+    fn advance_script_measured(&mut self,tick:InputTick,delta_ms:u64,
+        profile:&mut crate::profiler::FrameProfile,parts:&mut AdvanceTimings) {
+        let phase=crate::profile_clock::Instant::now();
         // 安装 var system=file_*/get_sound_info 的宿主查询钩子（每 runtime 一次；
         // 放在这里保证 load_project 之后、脚本第一次执行之前完成）。
         self.ensure_host_query_hooks();
@@ -35,12 +66,15 @@ impl CoreRuntime {
             }
         }
 
+        parts.prepare=phase.elapsed().as_micros();
+        let phase=crate::profile_clock::Instant::now();
         // Explicit status stops scenario fallthrough, not registered events.
         // A menu preview may restore status 3 after issuing a zero-time wait.
         // Keep draining queued UI/timer handlers just as for [stop]; otherwise
         // restoring that status permanently strands every menu button.
         if self.script_forced_stop {
             if !self.has_queued_tags() {
+                parts.queued=phase.elapsed().as_micros();
                 return;
             }
             let saved_wait = self.wait_reason.clone();
@@ -48,6 +82,7 @@ impl CoreRuntime {
                 saved_wait.clone().unwrap_or(WaitReason::Stop { reason: None }), profile);
             if self.wait_reason.is_some() {
                 self.wait_reason = saved_wait;
+                parts.queued=phase.elapsed().as_micros();
                 return;
             }
             // A queued jump/call has explicitly transferred execution. Ordinary
@@ -70,21 +105,30 @@ impl CoreRuntime {
             }
         }
 
+        parts.queued=phase.elapsed().as_micros();
         if self.wait_reason.is_none() {
+            let phase=crate::profile_clock::Instant::now();
             self.maybe_restore_loaded_message_text();
-            self.run_until_wait_or_complete(profile);
+            self.run_until_wait_or_complete(profile,parts);
+            parts.run=phase.elapsed().as_micros();
             // [autosave allow=2]：每次进入用户输入等待时自动保存。
             // Only click/key waits. Trans/menu `wait input=1` would otherwise
             // freeze the checkpoint on [adv] with sysbtn_mode=hide and skip the
             // later `@` wait that actually owns the message window.
             if wait_reason_is_input_wait(self.wait_reason.as_ref()) {
+                let phase=crate::profile_clock::Instant::now();
                 self.capture_gameplay_save_checkpoint();
+                parts.checkpoint=phase.elapsed().as_micros();
             }
             if wait_reason_is_input_wait(self.wait_reason.as_ref()) {
+                let phase=crate::profile_clock::Instant::now();
                 self.maybe_autosave_on_input_wait();
+                parts.autosave=phase.elapsed().as_micros();
             }
         } else {
+            let phase=crate::profile_clock::Instant::now();
             self.advance_wait_state(tick, delta_ms, profile);
+            parts.wait=phase.elapsed().as_micros();
         }
     }
 
@@ -112,12 +156,15 @@ impl CoreRuntime {
         !ctx.lock().unwrap().tag_queue.is_empty()
     }
 
-    fn run_until_wait_or_complete(&mut self, profile: &mut crate::profiler::FrameProfile) {
+    fn run_until_wait_or_complete(&mut self, profile: &mut crate::profiler::FrameProfile, parts:&mut AdvanceTimings) {
         let mut skip_batch_started = None;
         let mut skip_batch_waits = 0;
         loop {
             self.maybe_restore_loaded_message_text();
-            match self.interpreter.run() {
+            let vm_started=crate::profile_clock::Instant::now();
+            let result=self.interpreter.run();
+            parts.vm+=vm_started.elapsed().as_micros();parts.vm_calls+=1;
+            match result {
                 Ok(ExecutionResult::Wait(event))
                     if super::events::event_requires_state_sync(&event) =>
                 {

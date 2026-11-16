@@ -58,6 +58,32 @@ pub struct LayerProps {
 }
 
 impl LayerProps {
+    // Conservative no-op check for frequently repeated position/UI fields.
+    // Unknown properties keep the normal reducer path. Compare live typed
+    // values, not the last script assignment: animation can change them.
+    pub(crate) fn matches_raw(&self, key:&str, value:&str)->bool {
+        let v=value.trim();
+        let number=match key {
+            "left"|"x"=>Some(self.left),"top"|"y"=>Some(self.top),
+            "width"=>Some(self.width),"height"=>Some(self.height),
+            "anchorx"=>Some(self.anchor_x),"anchory"=>Some(self.anchor_y),
+            "xscale"=>Some(self.x_scale),"yscale"=>Some(self.y_scale),
+            "rotate"=>Some(self.rotate),_=>None,
+        };
+        if let Some(current)=number{return parse_f32(v).is_none_or(|n|current==Some(n));}
+        match key {
+            "zoom"=>parse_f32(v).is_none_or(|n|self.x_scale==Some(n)&&self.y_scale==Some(n)),
+            "alpha"=>parse_u8(v).is_none_or(|n|self.alpha==Some(n)),
+            "visible"=>self.visible==Some(value!="0"),
+            "reversex"=>self.reverse_x==Some(value!="0"),
+            "reversey"=>self.reverse_y==Some(value!="0"),
+            "grayscale"=>self.grayscale==Some(value!="0"),
+            "negative"=>self.negative==Some(value!="0"),
+            "clip"=>parse_clip(v).is_none_or(|n|self.clip==Some(n)),
+            "file"=>true,
+            _=>false,
+        }
+    }
     /// 从解释器传来的原始属性 map 解析出 typed 属性。
     pub fn from_raw(raw: &HashMap<String, String>) -> Self {
         let mut props = LayerProps::default();

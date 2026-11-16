@@ -40,6 +40,7 @@ mod magic_path;
 mod media;
 mod png_comments;
 mod project;
+mod script_file_cache;
 #[cfg(not(all(target_os = "vita", feature = "gxm-backend")))]
 mod render;
 #[cfg(all(target_os = "vita", feature = "gxm-backend"))]
@@ -61,7 +62,8 @@ impl CoreRuntime {
     }
     pub fn effect_pan_active(&self) -> bool {
         !self.video.is_fullscreen_playing()
-            && crate::compositor::effect_motion::has_effect_pan(self.compositor.scene(), self.compositor.clock_ms())
+            && (crate::compositor::effect_motion::has_scene_pan(self.compositor.scene(), self.compositor.clock_ms())
+                || crate::compositor::effect_motion::has_effect_pan(self.compositor.scene(), self.compositor.clock_ms()))
     }
 }
 
@@ -127,7 +129,7 @@ pub struct CoreRuntime {
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     scene_paths: magic_path::ScenePaths,
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
-    hidden_surface_bindings: std::collections::HashSet<String>,
+    hidden_surface_bindings: magic_path::HiddenImageBindings,
     #[cfg(all(target_os="vita",feature="gxm-backend"))]
     staged_surface_bindings: std::collections::HashSet<String>,
     text_renderer: Option<Box<dyn TextRenderer>>,
