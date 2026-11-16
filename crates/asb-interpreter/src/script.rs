@@ -281,7 +281,7 @@ pub(crate) enum LineSegment {
 fn append_tag_line(line: &str, output: &mut String, in_tag: &mut bool, in_quote: &mut bool) {
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
-        if *in_quote && ch == '\\' && chars.peek() == Some(&'"') {
+        if *in_tag && ch == '\\' && chars.peek().is_some() {
             output.push(ch);
             output.push(chars.next().unwrap());
             continue;
@@ -316,7 +316,7 @@ pub(crate) fn split_line_segments(line: &str) -> Vec<LineSegment> {
 
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
-        if in_quote && ch == '\\' && chars.peek() == Some(&'"') {
+        if in_tag && ch == '\\' && chars.peek().is_some() {
             current.push(ch);
             current.push(chars.next().unwrap());
             continue;
@@ -370,6 +370,40 @@ fn parse_instruction(content: &str, line: usize) -> Result<Instruction> {
     let params = parse_params(params_str, line)?;
 
     Ok(Instruction { tag, params, line })
+}
+
+// Track the existing spaced-expression extension without swallowing following
+// bare parameters. State is fed after tag-level escape decoding.
+#[derive(Default)]
+struct ExpressionBoundary {
+    quoted: bool,
+    escaped: bool,
+    depth: usize,
+    last: Option<char>,
+}
+
+impl ExpressionBoundary {
+    fn push(&mut self, ch: char) {
+        if self.quoted {
+            if self.escaped { self.escaped = false; }
+            else if ch == '\\' { self.escaped = true; }
+            else if ch == '\'' { self.quoted = false; }
+        } else {
+            match ch {
+                '\'' => self.quoted = true,
+                '(' => self.depth += 1,
+                ')' => self.depth = self.depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if !ch.is_whitespace() { self.last = Some(ch); }
+    }
+
+    fn continues_before(&self, next: Option<char>) -> bool {
+        let operator = |c| matches!(c, '+' | '-' | '*' | '/' | '%' | '=' | '!' | '<' | '>' | '&' | '|');
+        self.quoted || self.depth > 0 || self.last.is_some_and(|c| operator(c) || c == '$')
+            || next.is_some_and(operator)
+    }
 }
 
 /// 解析参数字符串
@@ -430,7 +464,7 @@ fn parse_params(params_str: &str, line: usize) -> Result<HashMap<String, String>
             loop {
                 match chars.next() {
                     Some('"') => break,
-                    Some('\\') if chars.peek() == Some(&'"') => {
+                    Some('\\') if chars.peek().is_some() => {
                         value.push(chars.next().unwrap());
                     }
                     Some(c) => value.push(c),
@@ -450,14 +484,21 @@ fn parse_params(params_str: &str, line: usize) -> Result<HashMap<String, String>
             // `$t.lydialog.id + '.999'`）。普通未加引号参数仍按空白分隔，
             // 避免把后续的位置参数误并入当前值。
             let expression_value = chars.peek() == Some(&'$');
+            let mut boundary = ExpressionBoundary::default();
             while let Some(&c) = chars.peek() {
+                if c == '\\' && chars.clone().nth(1).is_some() {
+                    chars.next();
+                    let escaped = chars.next().unwrap();
+                    boundary.push(escaped);
+                    value.push(escaped);
+                    continue;
+                }
                 if c.is_whitespace() {
                     if !expression_value {
                         break;
                     }
-                    // 参数值中的空格是合法的（最重要的是未加双引号的表达式，
-                    // 如 `$t.lydialog.id + '.999'`）。只有当空白之后紧跟着
-                    // 一个新的 `key=` 参数时，才把它视为当前值的边界。
+                    // Keep spaces inside expressions, but end before another
+                    // operand (a bare parameter) or a new named field.
                     let mut lookahead = chars.clone();
                     while lookahead
                         .peek()
@@ -466,24 +507,27 @@ fn parse_params(params_str: &str, line: usize) -> Result<HashMap<String, String>
                     {
                         lookahead.next();
                     }
+                    if !boundary.continues_before(lookahead.peek().copied()) { break; }
                     let mut next_key = false;
                     let mut key_chars = 0usize;
                     while let Some(&next) = lookahead.peek() {
                         if next == '=' {
-                            next_key = key_chars > 0;
+                            next_key = key_chars > 0 && lookahead.clone().nth(1) != Some('=');
                             break;
                         }
-                        if next.is_whitespace() {
+                        if next.is_whitespace() || matches!(next, '\'' | '"' | '!' | '<' | '>' | '+' | '*' | '/' | '%' | '&' | '|') {
                             break;
                         }
                         key_chars += 1;
                         lookahead.next();
                     }
-                    if next_key {
+                    if next_key && !boundary.quoted {
                         break;
                     }
                 }
-                value.push(chars.next().unwrap());
+                let decoded = chars.next().unwrap();
+                boundary.push(decoded);
+                value.push(decoded);
             }
             value
         };
@@ -495,7 +539,8 @@ fn parse_params(params_str: &str, line: usize) -> Result<HashMap<String, String>
             params.insert(key, value);
         }
 
-        param_index += 1;
+        // Named fields do not occupy a positional slot. A trailing bare
+        // argument remains "0" even after fields such as st= and time=.
     }
 
     Ok(params)
@@ -577,6 +622,49 @@ mod tests {
     }
 
     #[test]
+    fn escaped_value_delimiters_preserve_following_fields_and_commands() {
+        let source = r#"[custom path="folder\\" note="a\"[]/*data*/b" suffix="\n" file=image/one\ two\].png 25]/* removed */[stop]"#;
+        let script = Script::parse("sample", source).unwrap();
+        assert_eq!(script.instructions.len(), 2);
+        let command = &script.instructions[0];
+        assert_eq!(command.tag, "custom");
+        assert_eq!(command.get("path"), Some("folder\\"));
+        assert_eq!(command.get("note"), Some("a\"[]/*data*/b"));
+        assert_eq!(command.get("suffix"), Some("n"));
+        assert_eq!(command.get("file"), Some("image/one two].png"));
+        assert_eq!(command.get("0"), Some("25"));
+        assert_eq!(script.instructions[1].tag, "stop");
+    }
+
+    #[test]
+    fn named_params_do_not_consume_positional_indices() {
+        for content in [
+            r#"[deferred st="sample/1" time="300" 9100 tail]"#,
+            r#"[deferred 9100 st="sample/1" tail time="300"]"#,
+            r#"[deferred st=sample/1 9100 time=300 tail]"#,
+        ] {
+            let script = Script::parse("sample", content).unwrap();
+            let instruction = &script.instructions[0];
+            assert_eq!(instruction.get("0"), Some("9100"), "{content}");
+            assert_eq!(instruction.get("1"), Some("tail"), "{content}");
+            assert_eq!(instruction.get("st"), Some("sample/1"));
+            assert_eq!(instruction.get("time"), Some("300"));
+            assert_eq!(instruction.params.len(), 4);
+        }
+    }
+
+    #[test]
+    fn unquoted_expression_does_not_consume_trailing_positional_values() {
+        for expression in ["$delay", "$delay + 1", "$'actor label'", "$actor.($i + 1)", "$'key= value'"] {
+            let script = Script::parse("sample", &format!("[deferred time={expression} 9100 tail]" )).unwrap();
+            let command = &script.instructions[0];
+            assert_eq!(command.get("time"), Some(expression));
+            assert_eq!(command.get("0"), Some("9100"));
+            assert_eq!(command.get("1"), Some("tail"));
+        }
+    }
+
+    #[test]
     fn test_parse_unquoted_expression_keeps_internal_spaces() {
         let script = Script::parse(
             "test",
@@ -591,6 +679,11 @@ mod tests {
         );
         assert_eq!(instruction.get("type"), Some("click"));
         assert_eq!(instruction.get("mode"), Some("enable"));
+        for expression in ["$mode != 'none'", "$mode == 0", "$name + 'a=b'"] {
+            let script = Script::parse("sample", &format!("[custom value={expression} tail=ok]")).unwrap();
+            assert_eq!(script.instructions[0].get("value"), Some(expression));
+            assert_eq!(script.instructions[0].get("tail"), Some("ok"));
+        }
     }
 
     #[test]

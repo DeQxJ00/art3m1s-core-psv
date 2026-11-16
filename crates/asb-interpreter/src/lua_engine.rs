@@ -822,6 +822,8 @@ impl UserData for EngineApi {
                 // Lua 脚本传参经常带布尔字段（se=false 等），必须跳过而非中断。
                 for pair in t.pairs::<mlua::Value, mlua::Value>() {
                     if let Ok((k, v)) = pair {
+                        // Numeric 1 names the tag; string "1" remains a parameter.
+                        if k == Value::Integer(1) { continue; }
                         let key_str = match k {
                             Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                             Value::Integer(i) => Some(i.to_string()),
@@ -860,8 +862,6 @@ impl UserData for EngineApi {
                         }
                     }
                 }
-                // 移除数字键 1 (tag name)
-                params.remove("1");
                 let mut ctx = this.ctx.lock().unwrap();
                 if tag_name == "chgmsg" {
                     if let Some(variables) = &ctx.variables {
@@ -940,6 +940,8 @@ impl UserData for EngineApi {
                 let mut params = HashMap::new();
                 for pair in t.pairs::<Value, Value>() {
                     if let Ok((k, v)) = pair {
+                        // Numeric 1 names the tag; string "1" remains a parameter.
+                        if k == Value::Integer(1) { continue; }
                         let key_str = match &k {
                             Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                             Value::Integer(i) => Some(i.to_string()),
@@ -970,7 +972,6 @@ impl UserData for EngineApi {
                         }
                     }
                 }
-                params.remove("1");
                 // enqueueTag is deliberately always deferred. In particular,
                 // calllua must not recurse into Lua here; it is appended to the
                 // same FIFO queue and consumed only after the caller returns.
@@ -2048,6 +2049,24 @@ pub fn init_lua_engine_api(lua: &Lua, ctx: Arc<Mutex<EngineContext>>) -> LuaResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_index_one_is_a_parameter_not_the_lua_tag_name_slot() {
+        for method in ["tag", "enqueueTag"] {
+            let lua = Lua::new();
+            let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(ShellProbe::default()))));
+            init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
+            lua.load(format!(r#"__engine:{method}{{'custom',['0']='first',['1']='second',id='001',empty=''}}"#))
+                .exec().unwrap();
+            let guard = ctx.lock().unwrap();
+            let (tag, params) = &guard.tag_queue[0];
+            assert_eq!(tag, "custom");
+            assert_eq!(params.get("0").map(String::as_str), Some("first"));
+            assert_eq!(params.get("1").map(String::as_str), Some("second"), "{method}");
+            assert_eq!(params.get("id").map(String::as_str), Some("001"));
+            assert_eq!(params.get("empty").map(String::as_str), Some(""));
+        }
+    }
 
     #[test]
     #[ignore = "requires local portrait scripts and chapter via ARTEMIS_PORTRAIT_AUDIT"]

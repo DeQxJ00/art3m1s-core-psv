@@ -33,6 +33,10 @@ fn strip_dollar_signs(expr: &str) -> String {
                 result.push('\'');
                 loop {
                     match chars.next() {
+                        Some('\\') => {
+                            result.push('\\');
+                            if let Some(escaped) = chars.next() { result.push(escaped); }
+                        }
                         Some('\'') => {
                             result.push('\'');
                             break;
@@ -84,12 +88,10 @@ impl<'a> ExpressionEvaluator<'a> {
             // 去除内部的 $ 前缀（表达式中的变量引用）
             // 注意：不能去除字符串字面量中的 $
             let expr = strip_dollar_signs(&value[1..]);
-            self.evaluate(&expr).map_err(|error| match error {
-                Error::ExpressionError(message) => {
-                    Error::ExpressionError(format!("{message}; raw={value:?}; expr={expr:?}"))
-                }
-                other => other,
-            })
+            // Native command dispatch converts a failed computation to an
+            // empty parameter. Keep evaluate() strict for diagnostics, but do
+            // not strand an active macro on the same invalid condition.
+            Ok(self.evaluate(&expr).unwrap_or_else(|_| Value::String(String::new())))
         } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
             Ok(Value::String(value[1..value.len() - 1].to_string()))
         } else {
@@ -116,14 +118,7 @@ impl<'a> ExpressionEvaluator<'a> {
     pub fn resolve_param_str(&self, value: &str) -> Result<String> {
         if value.starts_with('$') {
             let expr = strip_dollar_signs(&value[1..]);
-            self.evaluate(&expr)
-                .map(|value| value.as_string())
-                .map_err(|error| match error {
-                    Error::ExpressionError(message) => {
-                        Error::ExpressionError(format!("{message}; raw={value:?}; expr={expr:?}"))
-                    }
-                    other => other,
-                })
+            Ok(self.evaluate(&expr).map(|value| value.as_string()).unwrap_or_default())
         } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
             Ok(value[1..value.len() - 1].to_string())
         } else {
@@ -136,7 +131,11 @@ impl<'a> ExpressionEvaluator<'a> {
         let mut lexer = Lexer::new(expr);
         let tokens = lexer.tokenize()?;
         let mut parser = Parser::new(tokens, self.variables);
-        parser.parse_expression()
+        let value = parser.parse_expression()?;
+        if let Some(token) = parser.peek() {
+            return Err(Error::ExpressionError(format!("表达式尾部有多余标记: {token:?}")));
+        }
+        Ok(value)
     }
 }
 
@@ -279,6 +278,10 @@ impl<'a> Lexer<'a> {
                     let mut s = String::new();
                     loop {
                         match self.input.next() {
+                            Some('\\') => match self.input.next() {
+                                Some(escaped) => s.push(escaped),
+                                None => return Err(Error::ExpressionError("未闭合的字符串".to_string())),
+                            },
                             Some('\'') => break,
                             Some(c) => s.push(c),
                             None => {
@@ -780,6 +783,45 @@ mod tests {
     }
 
     #[test]
+    fn native_string_escape_quotes_next_character_without_expanding_it() {
+        let vars = VariableStore::new();
+        let evaluator = ExpressionEvaluator::new(&vars);
+        for (source, expected) in [
+            (r"$'a\'$name'", "a'$name"),
+            (r"$'a\\b'", r"a\b"),
+            (r"$'a\nb'", "anb"),
+            (r"$'a\tb'", "atb"),
+            (r"$'a\'b' + 'c'", "a'bc"),
+        ] {
+            assert_eq!(evaluator.resolve_param_str(source).unwrap(), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn native_parameter_failure_is_empty_but_evaluation_remains_strict() {
+        let mut vars = VariableStore::new();
+        vars.set("mode", Value::String("none".into()));
+        let evaluator = ExpressionEvaluator::new(&vars);
+        for expr in ["mode ~= 'none'", "mode ~= 0", "1 2", "1 +", ""] {
+            assert!(evaluator.evaluate(expr).is_err(), "{expr}");
+            let raw = format!("${expr}");
+            assert_eq!(evaluator.resolve_param_str(&raw).unwrap(), "", "{raw}");
+            assert_eq!(evaluator.resolve_param(&raw).unwrap(), Value::String(String::new()), "{raw}");
+        }
+        assert_eq!(evaluator.resolve_param_str("$mode != 'none'").unwrap(), "0");
+        assert_eq!(evaluator.resolve_param_str("$'literal ~= value'").unwrap(), "literal ~= value");
+        assert_eq!(evaluator.resolve_param_str("$missing").unwrap(), "0");
+    }
+
+    #[test]
+    fn evaluation_rejects_a_valid_prefix_followed_by_extra_operands() {
+        for expr in ["1 2", "'actor' 'other'", "1) + 2", "1 (2)"] {
+            assert!(eval(expr).is_err(), "{expr}");
+        }
+        assert_eq!(eval("(1 + 2) * 3").unwrap(), Value::Int(9));
+    }
+
+    #[test]
     fn trailing_group_can_end_at_eof_without_relaxing_dynamic_names() {
         let mut vars = VariableStore::new();
         vars.set("choice.pushed", Value::Int(2));
@@ -811,7 +853,7 @@ mod tests {
         assert_eq!(eval.resolve_param("$$'missing_' + suffix").unwrap(), Value::Int(0));
         assert_eq!(eval.resolve_param_str("$$'path_' + suffix").unwrap(), "movie/intro.ogv");
         assert_eq!(eval.resolve_param("$'literal $suffix'").unwrap(), Value::String("literal $suffix".into()));
-        assert!(eval.resolve_param("$$'seen_' +").is_err());
+        assert_eq!(eval.resolve_param_str("$$'seen_' +").unwrap(), "");
     }
 
     #[test]

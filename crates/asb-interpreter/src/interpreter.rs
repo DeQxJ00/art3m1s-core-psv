@@ -1872,7 +1872,7 @@ impl Interpreter {
                 for (key, value) in &instruction.params {
                     if key != "function" {
                         extra_params
-                            .insert(key.clone(), evaluator.resolve_param(value)?.as_string());
+                            .insert(key.clone(), evaluator.resolve_param_str(value)?);
                     }
                 }
                 (function_name, extra_params)
@@ -2870,6 +2870,72 @@ impl Default for Interpreter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn calllua_preserves_literal_identifiers_across_dispatch_paths() {
+        for command in [
+            r#"[calllua function="capture_ids" id="001" layer="1.0" empty=""]"#,
+            "[lua]\n__engine:tag{'calllua', ['function']='capture_ids',id='001',layer='1.0',empty=''}\n[/lua]",
+            "[lua]\n__engine:enqueueTag{'calllua', ['function']='capture_ids',id='001',layer='1.0',empty=''}\n[/lua]",
+        ] {
+            let mut it = Interpreter::new(InterpreterConfig::default());
+            it.lua().load(r#"
+                function capture_ids(e, p)
+                    assert(p.id == '001' and p.layer == '1.0' and p.empty == '')
+                    captured = true
+                end
+            "#).exec().unwrap();
+            it.load_script("sample", &format!("{command}\n[stop]")).unwrap();
+            it.start("sample", "").unwrap();
+            it.run().unwrap();
+            assert!(it.lua().globals().get::<bool>("captured").unwrap());
+        }
+    }
+
+    #[test]
+    fn invalid_native_condition_returns_from_macro_before_next_voice_lookup() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.set_file_loader(Box::new(|_| Ok(br#"
+*motion
+[if estimate="$mode ~= 'none'"]
+[var name="t.wrong_branch" data="1"]
+[/if]
+[return]
+"#.to_vec())));
+        it.load_macro_file("helpers.iet").unwrap();
+        it.lua().load("function check_voice(e) assert(e:var('id') == 'actor'); resumed=true end").exec().unwrap();
+        it.load_script("sample", concat!(
+            "[var name=\"id\" data=\"actor\"]\n",
+            "[motion id=\"1\" mode=\"none\"]\n",
+            "[calllua function=\"check_voice\"]\n[stop]",
+        )).unwrap();
+        it.start("sample", "").unwrap();
+        it.run().unwrap();
+        assert!(it.lua().globals().get::<bool>("resumed").unwrap());
+        assert!(it.get_variable("t.wrong_branch").is_none());
+        assert!(it.call_stack().is_empty());
+    }
+
+    #[test]
+    fn trailing_positional_delay_reaches_lua_filter() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            __engine:setTagFilter({deferred = function(e, p)
+                assert(p["0"] == "9100", "missing positional delay")
+                assert(p.st == "sample/1" and p.time == "300")
+                e:enqueueTag({"var", name="scheduled_delay", data=p["0"]})
+                return 1
+            end})
+        "#).exec().unwrap();
+        it.load_script("sample", concat!(
+            "[deferred st=\"sample/1\" time=\"300\" 9100]\n",
+            "[var name=\"continued\" data=\"yes\"]\n[stop]",
+        )).unwrap();
+        it.start("sample", "").unwrap();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("scheduled_delay").unwrap().as_string(), "9100");
+        assert_eq!(it.get_variable("continued").unwrap().as_string(), "yes");
+    }
+
     #[test]
     fn staged_image_ownership_survives_lua_queue_handoff_and_call_barriers() {
         let mut it=super::Interpreter::new(Default::default());

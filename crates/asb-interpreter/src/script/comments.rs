@@ -40,6 +40,11 @@ pub(super) fn strip_blocks(content: &str) -> Result<Cow<'_, str>> {
                 block_start=Some(index+1);offset+=2;removed=true;out.push(' ');continue;
             }
             let c=rest.chars().next().unwrap();offset+=c.len_utf8();
+            if tag_start.is_some() && c=='\\' {
+                if let Some(escaped)=line[offset..].chars().next() {
+                    out.push(c);out.push(escaped);offset+=escaped.len_utf8();continue;
+                }
+            }
             if let Some(start)=tag_start {
                 if let Some(q)=quote {
                     if c==q { quote=None; }
