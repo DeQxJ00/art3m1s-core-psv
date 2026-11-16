@@ -70,14 +70,31 @@ fn with_host_hooks<R>(f: impl FnOnce(&HostQueryHooks) -> R) -> Option<R> {
 
 /// 标签参数是否为"开"（`1`/`true`/`on`/`yes`，缺省 false）。
 pub(crate) fn param_is_on(value: Option<&String>) -> bool {
-    value
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
-        .unwrap_or(false)
+    value.is_some_and(|v| param_text_is_on(v))
+}
+
+pub(crate) fn param_text_is_on(value: &str) -> bool {
+    let value = value.trim();
+    ["1", "true", "on", "yes"].iter().any(|on| value.eq_ignore_ascii_case(on))
+}
+
+/// Shared plain assignment semantics; callers establish the write scope.
+/// Literal destinations can be borrowed, and dynamic destinations need no map copy.
+pub(crate) fn apply_plain_var_assignment(
+    name: &str,
+    data: &str,
+    variables: &mut VariableStore,
+) -> Result<()> {
+    use std::borrow::Cow;
+    let evaluator = ExpressionEvaluator::new(variables);
+    let name = if name.starts_with('$') || (name.starts_with('\'') && name.ends_with('\'') && name.len() >= 2) {
+        Cow::Owned(evaluator.resolve_param_str(name)?)
+    } else {
+        Cow::Borrowed(name)
+    };
+    let value = evaluator.resolve_param(data)?;
+    variables.set(&name, value);
+    Ok(())
 }
 
 /// 把字符串序列落成伪数组：`name.0..N-1` = 各元素，`name.size` = 个数。
@@ -111,6 +128,13 @@ fn apply_var_tag_inner(
     params: &HashMap<String, String>,
     variables: &mut VariableStore,
 ) -> Result<()> {
+    if !params.contains_key("system") {
+        return apply_plain_var_assignment(
+            params.get("name").map_or("", String::as_str),
+            params.get("data").map_or("", String::as_str),
+            variables,
+        );
+    }
     // Variable destinations are expressions too.  Compiled Artemis macros
     // commonly use names such as `$'slider.' + id + '.file'` to create a
     // per-instance value.  Resolving only `data` (the old behaviour) stores

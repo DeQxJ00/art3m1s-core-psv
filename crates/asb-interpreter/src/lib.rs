@@ -53,6 +53,8 @@ pub mod event;
 pub mod expression;
 pub mod interpreter;
 pub mod lua_engine;
+mod bgm_recovery;
+mod position_query;
 mod preload_hints;
 mod portrait_preload;
 mod surface_timeline;
@@ -105,4 +107,6 @@ pub use variable::{Value, VariableStore};
 /// 库版本
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod surface_bindings;
+#[cfg(target_os="vita")]
+mod script_api_profile;
 mod deleted_cg;

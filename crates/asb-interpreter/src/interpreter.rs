@@ -14,6 +14,12 @@ use mlua::Lua;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "vita")]
+fn script_profile_time_us() -> u64 {
+    unsafe extern "C" { fn sceKernelGetProcessTimeWide() -> u64; }
+    unsafe { sceKernelGetProcessTimeWide() }
+}
+
 /// Artemis 兼容：字符串算术强制转换。
 ///
 /// 大量游戏脚本（如 mulpos）依赖 `"off" * 5 → 0`、`"100" + 20 → 120` 等行为。
@@ -734,6 +740,8 @@ impl Interpreter {
                 .set_name(name)
                 .exec()
                 .map_err(Error::LuaError)?;
+            crate::bgm_recovery::after_block(&self.lua, name, &code)?;
+            crate::position_query::after_block(&self.lua, &code)?;
             self.executed_lua_blocks.insert((name.to_string(), idx));
         }
         Ok(())
@@ -808,6 +816,7 @@ impl Interpreter {
 
     /// 设置起始标签并开始执行
     pub fn start(&mut self, script: &str, label: &str) -> Result<()> {
+        self.engine_ctx.lock().unwrap().bgm_recovery.cancel();
         // 确保脚本已加载
         if !self.scripts.contains_key(script) {
             self.load_external_script(script)?;
@@ -867,6 +876,7 @@ impl Interpreter {
         // its own Lua tables.
         let mut ctx = self.engine_ctx.lock().unwrap();
         ctx.tag_queue.clear();
+        ctx.bgm_recovery.cancel();
         ctx.immediate_tag_count = 0;
         ctx.event_handlers.clear();
         ctx.event_filter = None;
@@ -996,6 +1006,8 @@ impl Interpreter {
                     if let Err(e) = self.lua.load(code).exec() {
                         return Err(Error::LuaError(e));
                     }
+                    crate::bgm_recovery::after_block(&self.lua, &script_name, code)?;
+                    crate::position_query::after_block(&self.lua, code)?;
                     self.executed_lua_blocks.insert(key);
                 }
                 self.current_line += 1;
@@ -1604,6 +1616,7 @@ impl Interpreter {
             // 空数组：无处可去，忽略（脚本至少要留 1 帧）。
             return Ok(());
         };
+        self.engine_ctx.lock().unwrap().bgm_recovery.cancel();
         for (file, _) in &frames {
             self.load_external_script(file)?;
         }
@@ -1807,8 +1820,73 @@ impl Interpreter {
         apply_tag_filter: bool,
         from_scenario: bool,
     ) -> Result<TagResult> {
+        #[cfg(target_os = "vita")]
+        let started = script_profile_time_us();
+        #[cfg(target_os = "vita")]
+        let api_before=crate::script_api_profile::snapshot();
+        let result = self.execute_tag_inner(instruction, apply_tag_filter, from_scenario);
+        let invalidates_recovery = match &result {
+            Ok(TagResult::Emit(Event::VoicePlay { id, .. })) =>
+                id.as_deref().is_none_or(crate::bgm_recovery::relevant_voice),
+            Ok(TagResult::Emit(Event::SePlay { id, .. })) => crate::bgm_recovery::relevant_voice(id),
+            Ok(TagResult::Emit(Event::BgmPlay { .. } | Event::BgmStop { .. } | Event::BgmCrossFade { .. })) => true,
+            Ok(TagResult::Jump(_) | TagResult::JumpExternal { .. }) => instruction.tag == "jump",
+            _ => false,
+        };
+        if invalidates_recovery { self.engine_ctx.lock().unwrap().bgm_recovery.cancel(); }
+        #[cfg(target_os = "vita")]
+        self.report_slow_script_command("tag", &instruction.tag,
+            instruction.get("function").unwrap_or("-"), started,api_before);
+        result
+    }
+
+    #[cfg(target_os = "vita")]
+    fn report_slow_script_command(&self, phase: &str, tag: &str, function: &str, started: u64,before:crate::script_api_profile::Snapshot) {
+        let now = script_profile_time_us();
+        let elapsed = now.saturating_sub(started);
+        if elapsed < 5_000 { return; }
+        // Inclusive command times; filter spans are nested inside tag spans.
+        // Bound output independently of the number of queued skip commands.
+        static WINDOW: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
+        let emit = {
+            let mut window = WINDOW.lock().unwrap();
+            if now.saturating_sub(window.0) >= 1_000_000 { *window = (now, 0); }
+            let emit = window.1 < 16;
+            window.1 += 1;
+            emit
+        };
+        if emit {
+            let ctx = self.engine_ctx.lock().unwrap();
+            ctx.callbacks.debug(0, &format!(
+                "[script-command-slow] phase={} tag={} function={} elapsed_us={} queue={} api_count_us={} api_spans=inclusive",
+                phase, tag, function, elapsed, ctx.tag_queue.len(),crate::script_api_profile::snapshot().since(before)), false);
+        }
+    }
+
+    fn execute_tag_inner(
+        &mut self,
+        instruction: &Instruction,
+        apply_tag_filter: bool,
+        from_scenario: bool,
+    ) -> Result<TagResult> {
         let script_name = self.current_script.clone().unwrap_or_default();
         let current_line = self.current_line;
+        if instruction.tag == crate::bgm_recovery::COMMIT_TAG {
+            let token = instruction.get("token").and_then(|s| s.parse::<u64>().ok());
+            let mut ctx = self.engine_ctx.lock().unwrap();
+            if !crate::bgm_recovery::is_installed(&self.lua) { ctx.bgm_recovery.cancel(); }
+            let file = token.and_then(|token| {
+                let sound = ctx.callbacks.voice_recovery_snapshot()?;
+                ctx.bgm_recovery.finish(token, &sound, &self.variables.lock().unwrap())
+            });
+            ctx.callbacks.debug(0, if file.is_some() { "[bgm-recovery] complete rechecked=21" }
+                else { "[bgm-recovery] discarded stale or active voice" }, false);
+            return Ok(match file {
+                Some(file) => TagResult::Call { file: Some(file), label: "bgm_fade_up".into(),
+                    return_line: current_line + 1, return_script: script_name },
+                None => TagResult::Continue,
+            });
+        }
         if instruction.tag == "\u{b}goto" {
             return instruction
                 .get("\u{b}index")
@@ -2136,6 +2214,10 @@ impl Interpreter {
             let mut ctx = self.engine_ctx.lock().unwrap();
             std::mem::take(&mut ctx.immediate_tag_count)
         };
+        #[cfg(target_os = "vita")]
+        let filter_started = script_profile_time_us();
+        #[cfg(target_os = "vita")]
+        let api_before=crate::script_api_profile::snapshot();
         let result: mlua::Result<mlua::Value> = match engine {
             mlua::Value::UserData(ud) => func.call((ud, param_table)),
             _ => func.call((param_table,)),
@@ -2144,6 +2226,8 @@ impl Interpreter {
             let mut ctx = self.engine_ctx.lock().unwrap();
             ctx.immediate_tag_count += pending_immediate;
         }
+        #[cfg(target_os = "vita")]
+        self.report_slow_script_command("filter", tag, "-", filter_started,api_before);
         let result = result?;
 
         Ok(if lua_filter_consumes(&result) {
@@ -2183,6 +2267,28 @@ impl Interpreter {
         if let Some(func) = handler {
             self.sync_script_state_to_engine();
             crate::tags::call_lua_function(self.lua(), &func, &HashMap::new())?;
+        }
+        {
+            let mut ctx = self.engine_ctx.lock().unwrap();
+            if ctx.bgm_recovery.is_pending() {
+                if !crate::bgm_recovery::is_installed(&self.lua) {
+                    ctx.bgm_recovery.cancel();
+                    return Ok(());
+                }
+                if let Some(sound) = ctx.callbacks.voice_recovery_snapshot() {
+                    let started = std::time::Instant::now();
+                    let frame = ctx.frame_number;
+                    let token = ctx.bgm_recovery.tick(frame, &sound, &mut self.variables.lock().unwrap());
+                    if let Some(token) = token {
+                        ctx.tag_queue.push((crate::bgm_recovery::COMMIT_TAG.into(),
+                            HashMap::from([("token".into(), token.to_string())])));
+                    }
+                    let elapsed = started.elapsed().as_micros();
+                    if token.is_some() || elapsed >= 2_000 {
+                        ctx.callbacks.debug(0, &format!("[bgm-recovery] tick_us={elapsed} ready={}", token.is_some()), false);
+                    }
+                } else { ctx.bgm_recovery.cancel(); }
+            }
         }
         Ok(())
     }
@@ -2548,6 +2654,7 @@ impl Interpreter {
     ///
     /// 使用方解析 system.ini 后，直接将 BOOT 对应的脚本路径传入此方法即可。
     pub fn boot(&mut self, script: &str) -> Result<()> {
+        self.engine_ctx.lock().unwrap().bgm_recovery.cancel();
         self.load_external_script(script)?;
 
         // 默认宏定义文件（docs/spec/macro.md：宏写在 macro.iet；其他文件用
@@ -2582,6 +2689,7 @@ impl Interpreter {
 
     /// 恢复变量状态（用于读档）
     pub fn restore_variables(&mut self, store: VariableStore) {
+        self.engine_ctx.lock().unwrap().bgm_recovery.cancel();
         *self.variables.lock().unwrap() = store;
     }
 
@@ -2603,6 +2711,7 @@ impl Interpreter {
         stack: Vec<CallFrame>,
         preserve_queue: bool,
     ) -> Result<()> {
+        self.engine_ctx.lock().unwrap().bgm_recovery.cancel();
         // Lua's getScriptBlock can inspect any restored caller immediately,
         // before control returns to it. Load the entire saved stack first.
         self.load_external_script(script)?;
@@ -2870,72 +2979,6 @@ impl Default for Interpreter {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn calllua_preserves_literal_identifiers_across_dispatch_paths() {
-        for command in [
-            r#"[calllua function="capture_ids" id="001" layer="1.0" empty=""]"#,
-            "[lua]\n__engine:tag{'calllua', ['function']='capture_ids',id='001',layer='1.0',empty=''}\n[/lua]",
-            "[lua]\n__engine:enqueueTag{'calllua', ['function']='capture_ids',id='001',layer='1.0',empty=''}\n[/lua]",
-        ] {
-            let mut it = Interpreter::new(InterpreterConfig::default());
-            it.lua().load(r#"
-                function capture_ids(e, p)
-                    assert(p.id == '001' and p.layer == '1.0' and p.empty == '')
-                    captured = true
-                end
-            "#).exec().unwrap();
-            it.load_script("sample", &format!("{command}\n[stop]")).unwrap();
-            it.start("sample", "").unwrap();
-            it.run().unwrap();
-            assert!(it.lua().globals().get::<bool>("captured").unwrap());
-        }
-    }
-
-    #[test]
-    fn invalid_native_condition_returns_from_macro_before_next_voice_lookup() {
-        let mut it = Interpreter::new(InterpreterConfig::default());
-        it.set_file_loader(Box::new(|_| Ok(br#"
-*motion
-[if estimate="$mode ~= 'none'"]
-[var name="t.wrong_branch" data="1"]
-[/if]
-[return]
-"#.to_vec())));
-        it.load_macro_file("helpers.iet").unwrap();
-        it.lua().load("function check_voice(e) assert(e:var('id') == 'actor'); resumed=true end").exec().unwrap();
-        it.load_script("sample", concat!(
-            "[var name=\"id\" data=\"actor\"]\n",
-            "[motion id=\"1\" mode=\"none\"]\n",
-            "[calllua function=\"check_voice\"]\n[stop]",
-        )).unwrap();
-        it.start("sample", "").unwrap();
-        it.run().unwrap();
-        assert!(it.lua().globals().get::<bool>("resumed").unwrap());
-        assert!(it.get_variable("t.wrong_branch").is_none());
-        assert!(it.call_stack().is_empty());
-    }
-
-    #[test]
-    fn trailing_positional_delay_reaches_lua_filter() {
-        let mut it = Interpreter::new(InterpreterConfig::default());
-        it.lua().load(r#"
-            __engine:setTagFilter({deferred = function(e, p)
-                assert(p["0"] == "9100", "missing positional delay")
-                assert(p.st == "sample/1" and p.time == "300")
-                e:enqueueTag({"var", name="scheduled_delay", data=p["0"]})
-                return 1
-            end})
-        "#).exec().unwrap();
-        it.load_script("sample", concat!(
-            "[deferred st=\"sample/1\" time=\"300\" 9100]\n",
-            "[var name=\"continued\" data=\"yes\"]\n[stop]",
-        )).unwrap();
-        it.start("sample", "").unwrap();
-        it.run().unwrap();
-        assert_eq!(it.get_variable("scheduled_delay").unwrap().as_string(), "9100");
-        assert_eq!(it.get_variable("continued").unwrap().as_string(), "yes");
-    }
-
     #[test]
     fn staged_image_ownership_survives_lua_queue_handoff_and_call_barriers() {
         let mut it=super::Interpreter::new(Default::default());
@@ -3218,6 +3261,71 @@ mod tests {
     }
 
     #[test]
+    fn deferred_recovery_returns_to_the_queued_dialogue_wait() {
+        let mut it = queued_stop_fixture();
+        let pc = it.current_line();
+        it.set_engine_callbacks(Box::new(TestCallbacks { writes: Default::default() }));
+        it.load_script("audio", "*bgm_fade_up\n[var name=recovered data=1]\n[return]\n").unwrap();
+        it.lua().load("tagFilters = {}; function tagFilters.se_sound_info() end; function bgmFadeUpBacklog() fallback = true end").exec().unwrap();
+        crate::bgm_recovery::install_for_test(it.lua(), "audio");
+        it.lua().load("bgmFadeUpBacklog(__engine, {})").exec().unwrap();
+        it.fire_enter_frame().unwrap();
+        assert!(it.get_variable("recovered").is_none());
+        for _ in 0..21 {
+            it.begin_frame();
+            it.fire_enter_frame().unwrap();
+            if it.engine_ctx.lock().unwrap().tag_queue.iter().any(|(t, _)| t == crate::bgm_recovery::COMMIT_TAG) { break; }
+        }
+        assert!(it.drain_queued_tags_only().unwrap().saw_call);
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait { .. })));
+        assert_eq!(it.get_variable("recovered"), Some(Value::Int(1)));
+        assert_eq!(it.current_script(), Some("story"));
+        assert_eq!(it.current_line(), pc);
+        assert!(it.get_variable("after_wait").is_none());
+        assert!(it.get_variable("after_pc").is_none());
+        it.advance_line();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("after_wait"), Some(Value::Int(1)));
+        assert_eq!(it.get_variable("after_pc"), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn deferred_recovery_cancels_if_project_replaces_helper() {
+        let mut it = queued_stop_fixture();
+        it.set_engine_callbacks(Box::new(TestCallbacks { writes: Default::default() }));
+        it.load_script("audio", "*bgm_fade_up\n[return]\n").unwrap();
+        it.lua().load("tagFilters = {}; function tagFilters.se_sound_info() end; function bgmFadeUpBacklog() fallback = true end").exec().unwrap();
+        crate::bgm_recovery::install_for_test(it.lua(), "audio");
+        it.lua().load("bgmFadeUpBacklog(__engine, {}); tagFilters.se_sound_info = function() end").exec().unwrap();
+        it.begin_frame();
+        it.fire_enter_frame().unwrap();
+        assert!(!it.engine_ctx.lock().unwrap().bgm_recovery.is_pending());
+        it.lua().load("bgmFadeUpBacklog(__engine, {}); assert(fallback)").exec().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires external audited Lua blocks"]
+    fn deferred_recovery_audited_blocks() {
+        let root = std::path::PathBuf::from(std::env::var("ART3M1S_VOICE_RECOVERY_AUDIT").unwrap());
+        let mut it = queued_stop_fixture();
+        it.set_engine_callbacks(Box::new(TestCallbacks { writes: Default::default() }));
+        it.load_script("audio", "*bgm_fade_up\n[var name=recovered data=1]\n[return]\n").unwrap();
+        it.lua().load("tagFilters = {}").exec().unwrap();
+        for name in ["chara_v-block.lua", "sound-block.lua"] {
+            let code = std::fs::read_to_string(root.join(name)).unwrap();
+            it.lua().load(&code).exec().unwrap();
+            crate::bgm_recovery::after_block(it.lua(), "audio", &code).unwrap();
+        }
+        assert!(crate::bgm_recovery::is_installed(it.lua()));
+        it.lua().load("bgmFadeUpBacklog(__engine, {})").exec().unwrap();
+        assert!(it.engine_ctx.lock().unwrap().bgm_recovery.is_pending());
+        for _ in 0..21 { it.begin_frame(); it.fire_enter_frame().unwrap(); }
+        assert!(it.drain_queued_tags_only().unwrap().saw_call);
+        it.run().unwrap();
+        assert_eq!(it.get_variable("recovered"), Some(Value::Int(1)));
+    }
+
+    #[test]
     fn frame_number_changes_only_at_host_tick_boundary() {
         let mut it = Interpreter::new(InterpreterConfig::default());
         let read = |it: &Interpreter| {
@@ -3471,6 +3579,72 @@ mod tests {
         let script = interpreter.get_script("main.iet").unwrap();
         assert_eq!(script.instructions[0].tag, "__text");
         assert_eq!(script.instructions[0].get("text"), Some("これはテストです"));
+    }
+
+    #[test]
+    fn calllua_preserves_literal_identifiers_across_dispatch_paths() {
+        for command in [
+            r#"[calllua function="capture_ids" id="001" layer="1.0" empty=""]"#,
+            "[lua]\n__engine:tag{'calllua', ['function']='capture_ids',id='001',layer='1.0',empty=''}\n[/lua]",
+            "[lua]\n__engine:enqueueTag{'calllua', ['function']='capture_ids',id='001',layer='1.0',empty=''}\n[/lua]",
+        ] {
+            let mut it = Interpreter::new(InterpreterConfig::default());
+            it.lua().load(r#"
+                function capture_ids(e, p)
+                    assert(p.id == '001' and p.layer == '1.0' and p.empty == '')
+                    captured = true
+                end
+            "#).exec().unwrap();
+            it.load_script("sample", &format!("{command}\n[stop]")).unwrap();
+            it.start("sample", "").unwrap();
+            it.run().unwrap();
+            assert!(it.lua().globals().get::<bool>("captured").unwrap());
+        }
+    }
+
+    #[test]
+    fn invalid_native_condition_returns_from_macro_before_next_voice_lookup() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.set_file_loader(Box::new(|_| Ok(br#"
+*motion
+[if estimate="$mode ~= 'none'"]
+[var name="t.wrong_branch" data="1"]
+[/if]
+[return]
+"#.to_vec())));
+        it.load_macro_file("helpers.iet").unwrap();
+        it.lua().load("function check_voice(e) assert(e:var('id') == 'actor'); resumed=true end").exec().unwrap();
+        it.load_script("sample", concat!(
+            "[var name=\"id\" data=\"actor\"]\n",
+            "[motion id=\"1\" mode=\"none\"]\n",
+            "[calllua function=\"check_voice\"]\n[stop]",
+        )).unwrap();
+        it.start("sample", "").unwrap();
+        it.run().unwrap();
+        assert!(it.lua().globals().get::<bool>("resumed").unwrap());
+        assert!(it.get_variable("t.wrong_branch").is_none());
+        assert!(it.call_stack().is_empty());
+    }
+
+    #[test]
+    fn trailing_positional_delay_reaches_lua_filter() {
+        let mut it = Interpreter::new(InterpreterConfig::default());
+        it.lua().load(r#"
+            __engine:setTagFilter({deferred = function(e, p)
+                assert(p["0"] == "9100", "missing positional delay")
+                assert(p.st == "sample/1" and p.time == "300")
+                e:enqueueTag({"var", name="scheduled_delay", data=p["0"]})
+                return 1
+            end})
+        "#).exec().unwrap();
+        it.load_script("sample", concat!(
+            "[deferred st=\"sample/1\" time=\"300\" 9100]\n",
+            "[var name=\"continued\" data=\"yes\"]\n[stop]",
+        )).unwrap();
+        it.start("sample", "").unwrap();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("scheduled_delay").unwrap().as_string(), "9100");
+        assert_eq!(it.get_variable("continued").unwrap().as_string(), "yes");
     }
 
     #[test]
@@ -5003,6 +5177,10 @@ mod tests {
     }
 
     impl EngineCallbacks for TestCallbacks {
+        fn deferred_bgm_recovery_enabled(&self) -> bool { true }
+        fn voice_recovery_snapshot(&self) -> Option<crate::tags::var_handler::SoundInfoSnapshot> {
+            Some(Default::default())
+        }
         fn debug(&self, _level: i32, _data: &str, _raw: bool) {}
         fn enqueue_tag(&self, _tag: String, _params: HashMap<String, String>) {}
         fn set_event_handler(&self, _handlers: HashMap<String, String>) {}

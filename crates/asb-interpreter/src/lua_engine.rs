@@ -65,11 +65,24 @@ fn unsupported_emote() -> crate::Error {
 ///
 /// 宿主应用实现此 trait 来响应 engine 对象的方法调用。
 pub trait EngineCallbacks: Send + Sync {
+    /// Opt into read-set specialization of a fingerprinted position helper.
+    /// Custom hosts retain all-layer enumeration and observer behavior.
+    fn scoped_layer_query_enabled(&self) -> bool { false }
     /// 输出调试日志
     fn debug(&self, level: i32, data: &str, raw: bool);
 
     /// 执行标签（返回标签名和参数）
     fn enqueue_tag(&self, tag: String, params: HashMap<String, String>);
+
+    /// Hosts with no tag observer can avoid an otherwise discarded deep copy.
+    /// This does not disable the interpreter execution queue.
+    fn tag_notifications_enabled(&self) -> bool { true }
+
+    /// Immutable host capability: plain var assignments have no observer side
+    /// effects. Opt-in only; custom hosts keep the full notification path.
+    fn plain_var_fast_path_enabled(&self) -> bool { false }
+    fn deferred_bgm_recovery_enabled(&self) -> bool { false }
+    fn voice_recovery_snapshot(&self) -> Option<crate::tags::var_handler::SoundInfoSnapshot> { None }
 
     /// Mirror immediate mutations for synchronous Lua queries. A message
     /// switch/pop returns the new value of s.current_message_layer.
@@ -402,6 +415,7 @@ impl EngineCallbacks for DefaultEngineCallbacks {
 
 /// 共享的引擎上下文
 pub struct EngineContext {
+    pub(crate) bgm_recovery: crate::bgm_recovery::Scheduler,
     /// Logical host ticks, independent of whether a frame is rendered.
     pub(crate) frame_number: u64,
     pub callbacks: Box<dyn EngineCallbacks + Send + Sync>,
@@ -502,6 +516,7 @@ impl EngineContext {
 
     pub fn new(callbacks: Box<dyn EngineCallbacks + Send + Sync>) -> Self {
         Self {
+            bgm_recovery: Default::default(),
             frame_number: 0,
             callbacks,
             tag_queue: Vec::new(),
@@ -528,10 +543,44 @@ impl EngineContext {
 
 /// Engine API 对象（注入到 Lua 的第一个参数）
 pub struct EngineApi {
-    ctx: Arc<Mutex<EngineContext>>,
+    pub(crate) ctx: Arc<Mutex<EngineContext>>,
 }
 
 pub(crate) const RESTORE_MEMORY_TAG: &str = "\u{b}restore_memory";
+
+fn try_apply_plain_lua_var(
+    table: &mlua::Table,
+    store: &mut crate::variable::VariableStore,
+) -> LuaResult<bool> {
+    // raw_get matches the generic pairs traversal: do not invoke __index.
+    // System queries and binary payloads retain the generic path.
+    if !matches!(table.raw_get::<Value>("system")?, Value::Nil) { return Ok(false); }
+    let name = table.raw_get::<Value>("name")?;
+    let data = table.raw_get::<Value>("data")?;
+    let local = table.raw_get::<Value>("writelocal")?;
+    if [&name, &data, &local].iter().any(|v| matches!(v, Value::String(s) if s.to_str().is_err())) {
+        return Ok(false);
+    }
+    with_lua_tag_text(name, |name| with_lua_tag_text(data, |data| with_lua_tag_text(local, |local| {
+        store.with_local_writes(crate::tags::var_handler::param_text_is_on(local), |store| {
+            crate::tags::var_handler::apply_plain_var_assignment(name, data, store)
+                .map_err(|e| mlua::Error::external(format!("var 标签执行失败: {e}")))
+        })
+    })))?;
+    Ok(true)
+}
+
+fn with_lua_tag_text<R>(value: Value, f: impl FnOnce(&str) -> R) -> R {
+    match value {
+        Value::String(s) => f(&s.to_str().expect("validated tag text")),
+        // Keep the existing numeric representation. This optimization must not
+        // also change numeric compatibility or round fractional values.
+        Value::Integer(n) => f(&n.to_string()),
+        Value::Number(n) => f(&n.to_string()),
+        Value::Boolean(b) => f(if b { "true" } else { "false" }),
+        _ => f(""),
+    }
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MemorySave {
@@ -786,8 +835,19 @@ impl UserData for EngineApi {
 
         // e:tag{"lyc", id="0", file="bg"}
         methods.add_method("tag", |lua, this, args: mlua::MultiValue| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(0);
             if let Some(t) = tag_argument_table(lua, args)? {
                 let tag_name: String = t.get(1).unwrap_or_default();
+                if tag_name == "var"
+                    && matches!(t.raw_get::<Value>("system")?, Value::Nil)
+                {
+                    #[cfg(target_os="vita")] let _plain = crate::script_api_profile::span(13);
+                    let ctx = this.ctx.lock().unwrap();
+                    if ctx.callbacks.plain_var_fast_path_enabled() && !ctx.callbacks.tag_notifications_enabled()
+                        && let Some(vars) = &ctx.variables {
+                        if try_apply_plain_lua_var(&t, &mut vars.lock().unwrap())? { return Ok(()); }
+                    }
+                }
                 // Immediate callbacks can consume temporary Lua state which the
                 // caller clears before returning. Do not defer them or hold the
                 // context mutex across re-entry. enqueueTag remains deferred.
@@ -815,20 +875,20 @@ impl UserData for EngineApi {
                     return crate::tags::lua::call_lua_function_with_table(lua,&function,params)
                         .map_err(mlua::Error::external);
                 }
+                #[cfg(target_os="vita")] let conversion=crate::script_api_profile::span(8);
                 let mut params = HashMap::new();
                 let mut binary_data = None;
                 // 用 Value 迭代，再手动转 String。mlua 的 `pairs::<String,String>()`
                 // 一旦遇到非字符串值（如 boolean）就会终止迭代，后面的键全部丢失。
                 // Lua 脚本传参经常带布尔字段（se=false 等），必须跳过而非中断。
-                for pair in t.pairs::<mlua::Value, mlua::Value>() {
-                    if let Ok((k, v)) = pair {
-                        // Numeric 1 names the tag; string "1" remains a parameter.
-                        if k == Value::Integer(1) { continue; }
+                t.for_each::<Value, Value>(|k, v| {
+                        if k == Value::Integer(1) { return Ok(()); }
                         let key_str = match k {
                             Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                             Value::Integer(i) => Some(i.to_string()),
                             _ => None,
                         };
+                        if key_str.is_none() { return Ok(()); }
                         let val_str = match v {
                             // Preserve the supported Lua boolean extension while
                             // the renderer uses native literal-string visibility.
@@ -860,9 +920,13 @@ impl UserData for EngineApi {
                         if let (Some(ks), Some(vs)) = (key_str, val_str) {
                             params.insert(ks, vs);
                         }
-                    }
-                }
+                        Ok(())
+                })?;
+                #[cfg(target_os="vita")] drop(conversion);
+                #[cfg(target_os="vita")] let locking=crate::script_api_profile::span(9);
                 let mut ctx = this.ctx.lock().unwrap();
+                #[cfg(target_os="vita")] drop(locking);
+                #[cfg(target_os="vita")] let observing=crate::script_api_profile::span(10);
                 if tag_name == "chgmsg" {
                     if let Some(variables) = &ctx.variables {
                         let variables = variables.lock().unwrap();
@@ -883,13 +947,17 @@ impl UserData for EngineApi {
                         );
                     }
                 }
-                ctx.callbacks.enqueue_tag(tag_name.clone(), params.clone());
+                if ctx.callbacks.tag_notifications_enabled() {
+                    ctx.callbacks.enqueue_tag(tag_name.clone(), params.clone());
+                }
 
                 // var 标签不产出事件，且脚本常在同一 Lua 函数内紧接着用 e:var 读回
                 // 刚设的值。若只入队、等 calllua 返回后才 flush，就会读到 nil。故 var
                 // 在此同步落值到共享存储，并且不入队（入队 flush 只会重复落值，对
                 // random 等有副作用的变体反而有害）。其余标签照常入队走事件管线。
+                #[cfg(target_os="vita")] drop(observing);
                 if tag_name == "var" {
+                    #[cfg(target_os="vita")] let _variables=crate::script_api_profile::span(11);
                     if let Some(vars) = &ctx.variables {
                         let mut store = vars.lock().unwrap();
                         if let Some(bytes) = binary_data.filter(|_| !params.contains_key("system")) {
@@ -916,6 +984,7 @@ impl UserData for EngineApi {
                         }
                     }
                 } else {
+                    #[cfg(target_os="vita")] let _queue=crate::script_api_profile::span(12);
                     ctx.observe_control_stack(&tag_name, &params);
                     let insert_at = ctx.immediate_tag_count.min(ctx.tag_queue.len());
                     ctx.tag_queue.insert(insert_at, (tag_name, params));
@@ -940,7 +1009,8 @@ impl UserData for EngineApi {
                 let mut params = HashMap::new();
                 for pair in t.pairs::<Value, Value>() {
                     if let Ok((k, v)) = pair {
-                        // Numeric 1 names the tag; string "1" remains a parameter.
+                        // Numeric 1 is the command name; string "1" is an
+                        // independent positional parameter in native Lua tags.
                         if k == Value::Integer(1) { continue; }
                         let key_str = match &k {
                             Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
@@ -997,7 +1067,9 @@ impl UserData for EngineApi {
                     params.insert("__art3m1s_params_key".to_string(), key);
                 }
                 let mut ctx = this.ctx.lock().unwrap();
-                ctx.callbacks.enqueue_tag(tag_name.clone(), params.clone());
+                if ctx.callbacks.tag_notifications_enabled() {
+                    ctx.callbacks.enqueue_tag(tag_name.clone(), params.clone());
+                }
                 ctx.tag_queue.push((tag_name, params));
             }
             Ok(())
@@ -1157,6 +1229,7 @@ impl UserData for EngineApi {
         // docs/lua/engine/var.txt: 所有值均返回 string，包括数字和 1/0。
         // 脚本会直接调用 :gsub() 或与 "0" 比较；不能按 Rust 存储类型返回数字。
         methods.add_method("var", |lua, this, name: String| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(1);
             use crate::variable::Value as V;
             let ctx = this.ctx.lock().unwrap();
             let Some(vars) = &ctx.variables else {
@@ -1254,6 +1327,7 @@ impl UserData for EngineApi {
         methods.add_method("file", |lua, this, args: mlua::MultiValue| {
             match args.into_iter().next() {
                 Some(Value::String(path)) => {
+                    #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(14);
                     let path = lua_file_path(&path)?;
                     let reader = {
                         let ctx = this.ctx.lock().unwrap();
@@ -1285,6 +1359,7 @@ impl UserData for EngineApi {
 
         // e:isFileExists("path")
         methods.add_method("isFileExists", |_lua, this, path: mlua::String| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(2);
             let path = lua_file_path(&path)?;
             let ctx = this.ctx.lock().unwrap();
             Ok(ctx.callbacks.is_file_exists(&path))
@@ -1328,6 +1403,7 @@ impl UserData for EngineApi {
         // 数据源是解释器共享进 EngineContext 的脚本视图（宿主没有这份数据，
         // 不走宿主回调）。docs/lua/engine/getScriptBlock.txt。
         methods.add_method("getScriptBlock", |lua, this, args: mlua::MultiValue| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(3);
             let (file, index) = match args.into_iter().next() {
                 Some(Value::Table(t)) => (
                     t.get::<Option<String>>("file")
@@ -1362,6 +1438,7 @@ impl UserData for EngineApi {
 
         // Same instruction-index domain as getScriptBlock, not source line count.
         methods.add_method("getScriptSize", |_lua, this, file: String| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(7);
             let ctx = this.ctx.lock().unwrap();
             Ok(ctx.scripts_view.get(&file).map_or(0, |script| script.len()))
         });
@@ -1703,6 +1780,7 @@ impl UserData for EngineApi {
 
         // e:loadPngComments(path) -> { comment=... } | nil
         methods.add_method("loadPngComments", |lua, this, path: String| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(6);
             let ctx = this.ctx.lock().unwrap();
             match ctx.callbacks.load_png_comments(&path) {
                 Some(map) => {
@@ -1718,6 +1796,7 @@ impl UserData for EngineApi {
 
         // e:bindSurface(key)
         methods.add_method("bindSurface", |lua, this, key: mlua::Value| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(4);
             let key = lua_value_to_key(&key);
             let ctx = this.ctx.lock().unwrap();
             let key = crate::surface_bindings::bind(lua, &key, |p| ctx.callbacks.is_file_exists(p))?;
@@ -1732,6 +1811,7 @@ impl UserData for EngineApi {
         });
 
         methods.add_method("bindSurfaceAsync", |lua, this, key: mlua::Value| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(4);
             let key = lua_value_to_key(&key);
             let ctx = this.ctx.lock().unwrap();
             let key = crate::surface_bindings::bind(lua, &key, |p| ctx.callbacks.is_file_exists(p))?;
@@ -1741,6 +1821,7 @@ impl UserData for EngineApi {
 
         // e:unbindSurface(key)
         methods.add_method("unbindSurface", |lua, this, key: mlua::Value| {
+            #[cfg(target_os="vita")] let _profile=crate::script_api_profile::span(5);
             let key = lua_value_to_key(&key);
             let ctx = this.ctx.lock().unwrap();
             let key = crate::surface_bindings::lookup(lua, &key, true)?;
@@ -1916,7 +1997,7 @@ pub fn convert_encoding_default(from: &str, to: &str, source: &[u8]) -> Vec<u8> 
 }
 
 /// 把字符串值写入变量存储：可解析为数字则按 Float，否则按 String。
-fn set_var_auto(store: &mut crate::variable::VariableStore, name: &str, value: String) {
+pub(crate) fn set_var_auto(store: &mut crate::variable::VariableStore, name: &str, value: String) {
     let value = value
         .parse::<f64>()
         .map(crate::variable::Value::Float)
@@ -2051,20 +2132,120 @@ mod tests {
     use super::*;
 
     #[test]
-    fn string_index_one_is_a_parameter_not_the_lua_tag_name_slot() {
-        for method in ["tag", "enqueueTag"] {
+    fn plain_lua_var_matches_generic_and_reads_changed_values() {
+        let lua = Lua::new();
+        let table: mlua::Table = lua.load("return {'var',name=\"$'result.' + index\",data='$source + 1'}").eval().unwrap();
+        let mut fast = crate::VariableStore::new();
+        let mut generic = crate::VariableStore::new();
+        for index in 1..4 {
+            for store in [&mut fast, &mut generic] {
+                store.set("index", crate::variable::Value::Int(index));
+                store.set("source", crate::variable::Value::Int(index * 10));
+            }
+            assert!(try_apply_plain_lua_var(&table, &mut fast).unwrap());
+            let params = HashMap::from([
+                ("name".into(), "$'result.' + index".into()),
+                ("data".into(), "$source + 1".into()),
+            ]);
+            crate::tags::var_handler::apply_var_tag(&params, &mut generic).unwrap();
+            assert_eq!(fast.get(&format!("result.{index}")), generic.get(&format!("result.{index}")));
+        }
+        // Editing the same table must change the next assignment immediately.
+        table.set("name", "changed").unwrap();
+        table.set("data", -1.25).unwrap();
+        assert!(try_apply_plain_lua_var(&table, &mut fast).unwrap());
+        assert_eq!(fast.get("changed"), Some(&crate::variable::Value::Float(-1.25)));
+        table.set("system", "random").unwrap();
+        assert!(!try_apply_plain_lua_var(&table, &mut fast).unwrap());
+        assert_eq!(fast.get("changed"), Some(&crate::variable::Value::Float(-1.25)));
+        table.set("system", Value::Nil).unwrap();
+        table.set("data", lua.create_string([0xff, 0]).unwrap()).unwrap();
+        assert!(!try_apply_plain_lua_var(&table, &mut fast).unwrap());
+    }
+
+    #[test]
+    fn plain_lua_var_preserves_scope_journal_and_fallbacks() {
+        for fast in [false, true] {
             let lua = Lua::new();
-            let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(ShellProbe::default()))));
-            init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
-            lua.load(format!(r#"__engine:{method}{{'custom',['0']='first',['1']='second',id='001',empty=''}}"#))
-                .exec().unwrap();
-            let guard = ctx.lock().unwrap();
-            let (tag, params) = &guard.tag_queue[0];
-            assert_eq!(tag, "custom");
-            assert_eq!(params.get("0").map(String::as_str), Some("first"));
-            assert_eq!(params.get("1").map(String::as_str), Some("second"), "{method}");
-            assert_eq!(params.get("id").map(String::as_str), Some("001"));
-            assert_eq!(params.get("empty").map(String::as_str), Some(""));
+            let variables = Arc::new(Mutex::new(crate::VariableStore::new()));
+            let mut state = EngineContext::new(Box::new(EmoteProbe {
+                suppress_notices: true, fast_plain_vars: fast, ..Default::default()
+            }));
+            state.variables = Some(variables.clone());
+            let ctx = Arc::new(Mutex::new(state));
+            init_lua_engine_api(&lua, ctx.clone()).unwrap();
+            {
+                let mut store = variables.lock().unwrap();
+                store.set("global_value", 9.into());
+                store.push_macro_scope(1, &HashMap::new());
+                store.begin_save_writes();
+            }
+            lua.load(r#"
+                local e=__engine
+                local t={'var',name='global_value',data=3,writelocal=' YES '}
+                e:tag(t)
+                assert(e:var('global_value') == '3')
+                t.name='saved'; t.data="'001'"; t.writelocal=false; e:tag(t)
+                assert(e:var('saved') == '001')
+                t.name='fraction'; t.data=-1.25; e:tag(t)
+                assert(e:var('fraction') == '-1.25')
+                t.name='flag'; t.data=false; e:tag(t)
+                assert(e:var('flag') == 'false')
+                e:tag{'var',name='binary',data=string.char(255,0,128)}
+                e:tag{'var',name='length',system='length',source='abcd'}
+                assert(e:var('length') == '4')
+                e:tag(setmetatable({'var',name='raw'}, {__index=function() error('must not read inherited parameters') end}))
+                assert(e:var('raw') == '')
+                assert(pcall(function() e:tag{'var',name='bad',data='$(' ,writelocal=true} end))
+                assert(e:var('bad') == '')
+                e:tag{'var',name='after_error',data=5}
+                e:enqueueTag{'var',name='later',data=1}
+                assert(e:var('later') == '0')
+            "#).exec().unwrap();
+            let mut store = variables.lock().unwrap();
+            assert_eq!(store.get("binary"), Some(&crate::variable::Value::Bytes(vec![255,0,128])));
+            assert!(!store.contains_macro_local("after_error"));
+            let journal = store.finish_save_writes();
+            assert_eq!(journal.get("saved"), Some(&Some(crate::variable::Value::String("001".into()))));
+            assert!(!journal.contains_key("global_value"));
+            store.retain_macro_scopes(0);
+            assert_eq!(store.get("global_value"), Some(&crate::variable::Value::Int(9)));
+            assert_eq!(ctx.lock().unwrap().tag_queue.len(), 1);
+        }
+    }
+
+    #[test]
+    fn plain_lua_var_keeps_opted_in_notifications() {
+        let lua = Lua::new();
+        let probe = EmoteProbe { fast_plain_vars: true, ..Default::default() };
+        let notices = probe.notices.clone();
+        let mut ctx = EngineContext::new(Box::new(probe));
+        ctx.variables = Some(Arc::new(Mutex::new(crate::VariableStore::new())));
+        init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
+        lua.load("__engine:tag{'var',name='value',data=1}").exec().unwrap();
+        assert_eq!(*notices.lock().unwrap(), vec!["var"]);
+    }
+
+    #[test]
+    #[ignore = "manual timing comparison; not a latency assertion"]
+    fn plain_lua_var_timing_comparison() {
+        for fast in [false, true, false, true] {
+            let lua = Lua::new();
+            let mut ctx = EngineContext::new(Box::new(EmoteProbe {
+                suppress_notices: true, fast_plain_vars: fast, ..Default::default()
+            }));
+            ctx.variables = Some(Arc::new(Mutex::new(crate::VariableStore::new())));
+            init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
+            let run = lua.load(r#"return function()
+                for i=1,50000 do
+                    __engine:tag{'var',name='gain',data=i}
+                    __engine:tag{'var',name='next_gain',data='$gain + 1'}
+                end
+                assert(__engine:var('next_gain') == '50001')
+            end"#).eval::<mlua::Function>().unwrap();
+            let start = std::time::Instant::now();
+            run.call::<()>(()).unwrap();
+            println!("plain_var fast={fast} calls=100000 elapsed_us={}", start.elapsed().as_micros());
         }
     }
 
@@ -2274,6 +2455,9 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct EmoteProbe {
+        suppress_notices: bool,
+        fast_plain_vars: bool,
+        notices: Arc<Mutex<Vec<String>>>,
         preload_hints: bool,
         surface_binds: Arc<Mutex<Vec<String>>>,
         logs: Arc<Mutex<Vec<String>>>,
@@ -2292,7 +2476,9 @@ mod tests {
         fn debug(&self, _level: i32, data: &str, _raw: bool) {
             self.logs.lock().unwrap().push(data.to_owned());
         }
-        fn enqueue_tag(&self, _tag: String, _params: HashMap<String, String>) {}
+        fn tag_notifications_enabled(&self)->bool { !self.suppress_notices }
+        fn plain_var_fast_path_enabled(&self)->bool { self.fast_plain_vars }
+        fn enqueue_tag(&self, tag: String, _params: HashMap<String, String>) { self.notices.lock().unwrap().push(tag); }
         fn set_event_handler(&self, _handlers: HashMap<String, String>) {}
         fn get_script_status(&self) -> u8 {
             0
@@ -2697,6 +2883,28 @@ mod tests {
     }
 
     #[test]
+    fn optional_tag_notifications_preserve_execution_queue() {
+        for suppress in [false,true] {
+            let lua=Lua::new();
+            let probe=EmoteProbe{suppress_notices:suppress,..Default::default()};
+            let notices=probe.notices.clone();
+            let ctx=Arc::new(Mutex::new(EngineContext::new(Box::new(probe))));
+            init_lua_engine_api(&lua,ctx.clone()).unwrap();
+            lua.load(r#"for i=1,100 do
+                __engine:tag{'lyprop',id='1',left=i}
+                __engine:enqueueTag{'lyprop',id='2',top=i}
+            end"#).exec().unwrap();
+            assert_eq!(notices.lock().unwrap().len(),if suppress{0}else{200});
+            let state=ctx.lock().unwrap();
+            assert_eq!(state.tag_queue.len(),200);
+            for i in 0..100 {
+                assert_eq!(state.tag_queue[i].1["left"],(i+1).to_string());
+                assert_eq!(state.tag_queue[i+100].1["top"],(i+1).to_string());
+            }
+        }
+    }
+
+    #[test]
     fn immediate_control_flow_updates_stack_seen_by_later_lua_queries() {
         let lua = Lua::new();
         let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(EmoteProbe::default()))));
@@ -2904,6 +3112,24 @@ mod tests {
         assert!(ctx.tag_queue[0].1.is_empty());
         assert!(ctx.tag_queue[2].1.is_empty());
         assert_eq!(ctx.tag_queue[1].1.get("left").map(String::as_str), Some("20"));
+    }
+
+    #[test]
+    fn string_index_one_is_a_parameter_not_the_lua_tag_name_slot() {
+        for method in ["tag", "enqueueTag"] {
+            let lua = Lua::new();
+            let ctx = Arc::new(Mutex::new(EngineContext::new(Box::new(ShellProbe::default()))));
+            init_lua_engine_api(&lua, Arc::clone(&ctx)).unwrap();
+            lua.load(format!(r#"__engine:{method}{{'custom',['0']='first',['1']='second',id='001',empty=''}}"#))
+                .exec().unwrap();
+            let guard = ctx.lock().unwrap();
+            let (tag, params) = &guard.tag_queue[0];
+            assert_eq!(tag, "custom");
+            assert_eq!(params.get("0").map(String::as_str), Some("first"));
+            assert_eq!(params.get("1").map(String::as_str), Some("second"), "{method}");
+            assert_eq!(params.get("id").map(String::as_str), Some("001"));
+            assert_eq!(params.get("empty").map(String::as_str), Some(""));
+        }
     }
 
     #[test]

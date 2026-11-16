@@ -179,7 +179,8 @@ impl TagHandler for GlyphHandler {
     fn execute(&self, ctx: &mut ExecutionContext<'_>) -> Result<TagResult> {
         let mut settings = HashMap::new();
         for (key, value) in &ctx.instruction.params {
-            settings.insert(key.clone(), value.clone());
+            // Resolve flags/offsets without changing literal dotted layer IDs.
+            settings.insert(key.clone(), ctx.evaluator().resolve_param_str(value)?);
         }
         Ok(TagResult::Emit(Event::GlyphConfig(settings)))
     }
@@ -539,6 +540,15 @@ mod tests {
 
     /// 用给定参数执行单个标签处理器，返回 TagResult
     fn exec(handler: &dyn TagHandler, tag: &str, params: &[(&str, &str)]) -> TagResult {
+        exec_with_variables(handler, tag, params, &[])
+    }
+
+    fn exec_with_variables(
+        handler: &dyn TagHandler,
+        tag: &str,
+        params: &[(&str, &str)],
+        values: &[(&str, &str)],
+    ) -> TagResult {
         let lua = mlua::Lua::new();
         let instruction = Instruction {
             tag: tag.into(),
@@ -549,6 +559,9 @@ mod tests {
             line: 1,
         };
         let mut variables = VariableStore::new();
+        for (name, value) in values {
+            variables.set(name, crate::Value::String((*value).to_string()));
+        }
         let get_script = |_name: &str| None;
         let mut ctx = ExecutionContext {
             variables: &mut variables,
@@ -559,6 +572,39 @@ mod tests {
             get_script: &get_script,
         };
         handler.execute(&mut ctx).unwrap()
+    }
+
+    #[test]
+    fn glyph_resolves_variable_homing_layer_and_offsets() {
+        let TagResult::Emit(Event::GlyphConfig(settings)) = exec_with_variables(
+            &GlyphHandler, "glyph",
+            &[("homing", "$glyph.3"), ("layer", "$wait.layer"),
+              ("left", "$glyph.0"), ("top", "$glyph.1"),
+              ("rplayer", "$wait.page"), ("rpleft", "$2+3"), ("rptop", "-4")],
+            &[("glyph.3", "1"), ("wait.layer", "90"),
+              ("glyph.0", "5"), ("glyph.1", "-2"), ("wait.page", "90.0.1")],
+        ) else { panic!("expected glyph config") };
+        assert_eq!(settings["homing"], "1");
+        assert_eq!(settings["layer"], "90");
+        assert_eq!(settings["left"], "5");
+        assert_eq!(settings["top"], "-2");
+        assert_eq!(settings["rplayer"], "90.0.1");
+        assert_eq!(settings["rpleft"], "5");
+        assert_eq!(settings["rptop"], "-4");
+    }
+
+    #[test]
+    fn glyph_preserves_fixed_position_and_literal_layer_ids() {
+        let TagResult::Emit(Event::GlyphConfig(settings)) = exec(
+            &GlyphHandler, "glyph",
+            &[("homing", "0"), ("layer", "90.0"), ("rplayer", ""),
+              ("left", "12"), ("top", "34")],
+        ) else { panic!("expected glyph config") };
+        assert_eq!(settings["homing"], "0");
+        assert_eq!(settings["layer"], "90.0");
+        assert_eq!(settings["rplayer"], "");
+        assert_eq!(settings["left"], "12");
+        assert_eq!(settings["top"], "34");
     }
 
     #[test]
