@@ -16,13 +16,22 @@ impl CoreRuntime {
     pub fn host_action_key(&self, action: &str) -> u32 {
         let key = resolve_host_action_key(&self.compositor, action);
         if key != 0 { return key; }
-        legacy_host_action_key(&self.interpreter, &self.compositor, action)
+        let key = legacy_host_action_key(&self.interpreter, &self.compositor, action);
+        if key == 0 && action == "MENU" {
+            return self.legacy_square_menu_key();
+        }
+        key
     }
 
     #[cfg(feature = "gxm-menu-key-alias")]
     pub fn has_native_host_menu(&self) -> bool {
-        has_native_menu_definition(&self.interpreter)
-            && self.host_action_key("MENU") != 0
+        self.legacy_square_menu_key() != 0
+            || (has_native_menu_definition(&self.interpreter) && self.host_action_key("MENU") != 0)
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    fn legacy_square_menu_key(&self) -> u32 {
+        legacy_square_menu_key(&self.interpreter, &self.compositor, self.control.menu_keys())
     }
 
     #[cfg(feature = "gxm-menu-key-alias")]
@@ -34,8 +43,9 @@ impl CoreRuntime {
         // mode API. Only expose the host menu at a real dialogue input wait.
         matches!(self.wait_reason, Some(asb_interpreter::event::WaitReason::Generic | asb_interpreter::event::WaitReason::Generic0))
             && self.pending_dialog.is_none() && !self.script_forced_stop
-            && legacy_host_action_key(&self.interpreter, &self.compositor, "SAVE") != 0
-            && legacy_host_action_key(&self.interpreter, &self.compositor, "LOAD") != 0
+            && (self.legacy_square_menu_key() != 0
+                || (legacy_host_action_key(&self.interpreter, &self.compositor, "SAVE") != 0
+                    && legacy_host_action_key(&self.interpreter, &self.compositor, "LOAD") != 0))
     }
 
     pub fn feed_mouse(&self, x: i32, y: i32) {
@@ -1116,6 +1126,25 @@ mod tests {
 
     #[cfg(feature = "gxm-menu-key-alias")]
     #[test]
+    fn legacy_square_reuses_the_registered_right_button_menu() {
+        let interpreter = Interpreter::default();
+        interpreter.lua().load(r#"
+            csv={ui_menu={{com='btn',exec='save'}}}
+            function menu_init() end
+        "#).exec().unwrap();
+        let mut compositor = Compositor::new();
+        compositor.apply_event(&Event::SetEventHandler {
+            event_name: "push".into(), file: Some("menu.iet".into()),
+            label: Some("top".into()), call: true, handler: None,
+            extra_params: HashMap::from([("key".into(), "2".into())]),
+        });
+        assert_eq!(super::legacy_square_menu_key(&interpreter, &compositor, &[2, 113, 139]), 2);
+        assert_eq!(super::legacy_square_menu_key(&interpreter, &compositor, &[2]), 0);
+        assert_eq!(super::legacy_square_menu_key(&interpreter, &Compositor::new(), &[2, 113]), 0);
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
     fn host_menu_context_supports_legacy_predicate_without_bypassing_guards() {
         let interpreter = Interpreter::new(InterpreterConfig::default());
         assert!(!super::host_menu_context_available(&interpreter));
@@ -2169,6 +2198,20 @@ fn host_menu_context_available(interpreter: &asb_interpreter::Interpreter) -> bo
 fn has_host_mode_api(interpreter: &asb_interpreter::Interpreter) -> bool {
     interpreter.lua().load("return type(rawget(_G, 'getGameMode')) == 'function' or type(rawget(_G, 'get_gamemode')) == 'function' or (type(rawget(_G,'scr')) == 'table' and type(rawget(rawget(_G,'scr'),'adv')) == 'table' and type(rawget(rawget(rawget(_G,'scr'),'adv'),'mode')) == 'boolean' and type(rawget(rawget(rawget(_G,'scr'),'adv'),'level')) == 'number')")
         .eval::<bool>().unwrap_or(true)
+}
+
+#[cfg(feature = "gxm-menu-key-alias")]
+fn legacy_square_menu_key(interpreter: &asb_interpreter::Interpreter, compositor: &Compositor, menu_keys: &[u32]) -> u32 {
+    // Older Vita scripts declare Square (113) and the right mouse button
+    // together in role 1. Only the right-button path needs a push handler.
+    if menu_keys.contains(&113) && menu_keys.contains(&2)
+        && has_native_menu_definition(interpreter)
+        && compositor.get_input_handler("push", "2").is_some_and(|handler|
+            handler.handler.as_deref() != Some("dummy") && (handler.handler.is_some() || handler.label.is_some()))
+    {
+        return 2;
+    }
+    0
 }
 
 #[cfg(feature = "gxm-menu-key-alias")]

@@ -106,6 +106,8 @@ fn default_keymap() -> HashMap<i32, Vec<u32>> {
 
 // keyconfig 的 role 取值（docs/tag/system/keyconfig.md）
 const ROLE_ADVANCE: i32 = 0;
+#[cfg(feature = "gxm-menu-key-alias")]
+const ROLE_MENU: i32 = 1;
 const ROLE_HIDE_IN: i32 = 3;
 const ROLE_HIDE_OUT: i32 = 4;
 const ROLE_BACKLOG_IN: i32 = 5;
@@ -160,6 +162,11 @@ impl Default for RuntimeControlState {
 }
 
 impl RuntimeControlState {
+    #[cfg(feature = "gxm-menu-key-alias")]
+    pub(super) fn menu_keys(&self) -> &[u32] {
+        self.keymap.get(&ROLE_MENU).map(Vec::as_slice).unwrap_or_default()
+    }
+
     pub(super) fn skip_active(&self) -> bool {
         (self.skip_allowed && self.skip_active) || self.control_skip_effective()
     }

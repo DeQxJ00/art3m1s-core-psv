@@ -2199,11 +2199,31 @@ impl Interpreter {
         if tag == "print" && !params.contains_key("data") {
             param_table.set("data", "")?;
         }
+        // Included Lua runs on the original bytes. Its string lengths,
+        // prefixes and table keys must also match the strings from the script.
+        let legacy_encoding = if params.values().any(|value| !value.is_ascii() || value.starts_with('$')) {
+            let ctx = self.engine_ctx.lock().unwrap();
+            if ctx.legacy_lua_sources.is_empty() {
+                None
+            } else {
+                func.info().source.and_then(|source| ctx.legacy_lua_sources.get(&source).copied())
+            }
+        } else {
+            None
+        };
         {
             let variables = self.variables.lock().unwrap();
             let evaluator = ExpressionEvaluator::new(&variables);
             for (k, v) in params {
-                param_table.set(k.as_str(), evaluator.resolve_param_str(v)?)?;
+                let value = evaluator.resolve_param_str(v)?;
+                if let Some(encoding) = legacy_encoding.filter(|_| !value.is_ascii()) {
+                    let (bytes, _, had_errors) = encoding.encode(&value);
+                    if !had_errors {
+                        param_table.set(k.as_str(), self.lua.create_string(bytes.as_ref())?)?;
+                        continue;
+                    }
+                }
+                param_table.set(k.as_str(), value)?;
             }
         }
 
@@ -3668,6 +3688,62 @@ mod tests {
         let script = interpreter.get_script("main.iet").unwrap();
         assert_eq!(script.instructions[0].tag, "__text");
         assert_eq!(script.instructions[0].get("text"), Some("これはテストです"));
+    }
+
+    #[test]
+    fn legacy_tag_filters_receive_strings_in_their_source_encoding() {
+        let mut it = Interpreter::default();
+        let legacy = encoding_rs::SHIFT_JIS.encode(r#"
+            local chapters = {['第一話'] = 'route'}
+            function legacy_filter(e, p)
+                assert(chapters[string.sub(p.storage, 1, 6)] == 'route')
+                redirected = true
+                return 1
+            end
+        "#).0.into_owned();
+        // A legacy Lua source may be included alongside UTF-8 sources.
+        it.set_file_loader(Box::new(move |_| Ok(legacy.clone())));
+        it.lua().load(r#"
+            __engine:include('filters.lua')
+            __engine:setTagFilter({next=legacy_filter, caption=function(e, p)
+                assert(p.data == '次の行')
+                caption_seen = true
+                return 1
+            end})
+        "#).exec().unwrap();
+        it.load_script("scenario", "[next storage=\"第一話02.asb\"]\n[caption data=\"次の行\"]\n[stop]").unwrap();
+        it.start("scenario", "").unwrap();
+        it.run().unwrap();
+        assert!(it.lua().globals().get::<bool>("redirected").unwrap());
+        assert!(it.lua().globals().get::<bool>("caption_seen").unwrap());
+    }
+
+    #[test]
+    fn lua_legacy_resource_paths_and_print_text_reach_engine_events() {
+        let mut it = Interpreter::default();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        it.set_callback(move |event| {
+            captured.lock().unwrap().push(event);
+            CallbackResult::Continue
+        });
+        it.lua().load(r#"
+            function queue(e)
+                local file = e:convertEncoding{from='utf8', to='sjis', source='voice/第一話/line'}
+                local caption = e:convertEncoding{from='utf8', to='sjis', source='次の行'}
+                e:enqueueTag{'seplay', id='100.1', file=file}
+                e:tag{'print', data=caption}
+                e:tag{'rp'}
+            end
+        "#).exec().unwrap();
+        it.load_script("scenario", "[calllua function=queue]\n[stop]").unwrap();
+        it.start("scenario", "").unwrap();
+        it.run().unwrap();
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(event,
+            Event::SePlay { file, .. } if file == "voice/第一話/line")));
+        assert!(events.iter().any(|event| matches!(event,
+            Event::ScenarioText { content, .. } if content == "次の行")));
     }
 
     #[test]

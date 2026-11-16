@@ -446,6 +446,7 @@ pub struct EngineContext {
     /// 闭包用 mlua 传入的 `lua` 句柄重入执行。宿主通过
     /// [`Interpreter::set_file_loader`](crate::Interpreter::set_file_loader) 注入。
     pub file_reader: Option<FileReader>,
+    pub(crate) legacy_lua_sources: HashMap<String, &'static encoding_rs::Encoding>,
     /// 共享的变量存储，供 `e:var(name)` 读取解释器写入的变量。
     ///
     /// 与 [`Interpreter`](crate::Interpreter) 持有同一个 `Arc<Mutex<_>>`。
@@ -527,6 +528,7 @@ impl EngineContext {
             log_filter: None,
             debug_http_response: Vec::new(),
             file_reader: None,
+            legacy_lua_sources: HashMap::new(),
             variables: None,
             script_stack: Vec::new(),
             memory_anonymous_script: None,
@@ -903,9 +905,8 @@ impl UserData for EngineApi {
                             // through lyprop. Preserve an explicit clear there.
                             Value::Boolean(false)
                                 if tag_name == "lyprop" && key_str.as_deref() == Some("mask") => Some(String::new()),
-                            Value::String(s)
-                                if matches!(tag_name.as_str(), "call" | "jump") && key_str.as_deref() == Some("file") =>
-                                    Some(lua_file_path(&s)?),
+                            Value::String(s) if tag_param_has_legacy_text(&tag_name, key_str.as_deref().unwrap_or_default()) =>
+                                Some(lua_file_path(&s)?),
                             Value::String(s) => match s.to_str() {
                                 Ok(text) => Some(text.to_string()),
                                 Err(_) => {
@@ -1031,9 +1032,8 @@ impl UserData for EngineApi {
                                             if matches!(tag_name.as_str(), "lyc" | "anime") && ks == "mask" => None,
                                         Value::Boolean(false)
                                             if tag_name == "lyprop" && ks == "mask" => Some(String::new()),
-                                        Value::String(s)
-                                            if matches!(tag_name.as_str(), "call" | "jump") && ks == "file" =>
-                                                Some(lua_file_path(&s)?),
+                                        Value::String(s) if tag_param_has_legacy_text(&tag_name, &ks) =>
+                                            Some(lua_file_path(&s)?),
                                         Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                                         Value::Integer(i) => Some(i.to_string()),
                                         Value::Number(n) => Some(n.to_string()),
@@ -1195,6 +1195,15 @@ impl UserData for EngineApi {
             let source = language.as_deref().unwrap_or(source);
             let warmup=hints.then(||crate::emote_cache_warmup::repair_source(&path,source)).flatten();
             if warmup.is_some(){this.ctx.lock().unwrap().callbacks.debug(1,"[emote-warmup] disposable desktop players replaced with bounded PSB prefetch",true);}
+            if !source.starts_with(b"\x1bLua") {
+                let encoding = detect_encoding(source).filter(|encoding| *encoding != encoding_rs::UTF_8);
+                let mut ctx = this.ctx.lock().unwrap();
+                if let Some(encoding) = encoding {
+                    ctx.legacy_lua_sources.insert(path.clone(), encoding);
+                } else {
+                    ctx.legacy_lua_sources.remove(&path);
+                }
+            }
             lua.load(warmup.as_deref().unwrap_or(source))
                 .set_name(path.as_str())
                 .exec()
@@ -1943,6 +1952,14 @@ fn lua_file_path(path: &mlua::String) -> LuaResult<String> {
     // the host boundary; e:file must still return arbitrary binary data intact.
     let utf8 = convert_encoding_default("", "utf8", path.as_bytes().as_ref());
     String::from_utf8(utf8).map_err(mlua::Error::external)
+}
+
+fn tag_param_has_legacy_text(tag: &str, key: &str) -> bool {
+    matches!((tag, key),
+        ("call" | "jump", "file" | "label")
+        | ("lyc" | "lyc2" | "anime" | "seplay" | "bgmplay", "file")
+        | ("lyc" | "lyprop" | "anime", "mask")
+        | ("print", "data"))
 }
 
 fn lua_value_to_key(v: &mlua::Value) -> String {
