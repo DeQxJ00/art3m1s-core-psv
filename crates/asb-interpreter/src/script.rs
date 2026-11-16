@@ -129,15 +129,36 @@ impl Script {
             // [onlinehead]text[onlineend] 也依赖此规则）
             if line.contains('[') {
                 let mut joined = String::new();
-                let mut in_tag = false;
+                let mut tag_start = None;
                 let mut in_quote = false;
-                append_tag_line(line, &mut joined, &mut in_tag, &mut in_quote);
                 // Attribute lists may span physical lines. Comments outside
                 // quoted values end at the physical line, not the whole tag.
-                while in_tag && line_idx + 1 < lines.len() {
+                loop {
+                    let closed_in_quote = append_tag_line(
+                        lines[line_idx],
+                        &mut joined,
+                        &mut tag_start,
+                        &mut in_quote,
+                    );
+                    let Some(start) = tag_start else { break };
+                    // A closing bracket with an unmatched quote before a new
+                    // command or label is a malformed tag. Keep that boundary
+                    // so the broken tag cannot swallow the rest of the script.
+                    if closed_in_quote
+                        && lines[line_idx + 1..]
+                            .iter()
+                            .map(|line| line.trim())
+                            .find(|line| {
+                                !line.is_empty() && !line.starts_with("//") && !line.starts_with(';')
+                            })
+                            .is_none_or(|line| line.starts_with(['[', '*']))
+                    {
+                        joined.truncate(start);
+                        break;
+                    }
+                    if line_idx + 1 == lines.len() { break; }
                     line_idx += 1;
                     joined.push('\n');
-                    append_tag_line(lines[line_idx], &mut joined, &mut in_tag, &mut in_quote);
                 }
                 let segments = split_line_segments(&joined);
 
@@ -278,10 +299,17 @@ pub(crate) enum LineSegment {
     Text(String),
 }
 
-fn append_tag_line(line: &str, output: &mut String, in_tag: &mut bool, in_quote: &mut bool) {
+fn append_tag_line(
+    line: &str,
+    output: &mut String,
+    tag_start: &mut Option<usize>,
+    in_quote: &mut bool,
+) -> bool {
+    let mut closed_in_quote = false;
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
-        if *in_tag && ch == '\\' && chars.peek().is_some() {
+        if tag_start.is_some() && ch == '\\' && chars.peek().is_some() {
+            closed_in_quote = false;
             output.push(ch);
             output.push(chars.next().unwrap());
             continue;
@@ -289,14 +317,18 @@ fn append_tag_line(line: &str, output: &mut String, in_tag: &mut bool, in_quote:
         if !*in_quote && ch == '/' && chars.peek() == Some(&'/') {
             break;
         }
+        if !ch.is_whitespace() {
+            closed_in_quote = ch == ']' && *in_quote;
+        }
         match ch {
-            '[' if !*in_tag => *in_tag = true,
-            '"' if *in_tag => *in_quote = !*in_quote,
-            ']' if *in_tag && !*in_quote => *in_tag = false,
+            '[' if tag_start.is_none() => *tag_start = Some(output.len()),
+            '"' if tag_start.is_some() => *in_quote = !*in_quote,
+            ']' if !*in_quote => *tag_start = None,
             _ => {}
         }
         output.push(ch);
     }
+    closed_in_quote
 }
 
 /// 把一行文本按出现顺序切分成标签段与文本段（支持一行多个标签、
@@ -579,6 +611,15 @@ mod tests {
         assert_eq!(script.instructions[2].tag, "__lua_block");
         assert_eq!(script.instructions[3].tag, "return");
     }
+
+    #[test]
+    fn multiline_quoted_value_can_contain_a_bracket_at_the_end_of_a_line() {
+        let script = super::Script::parse("sample", "[print data=\"first ]\nsecond\"]\n[return]").unwrap();
+        assert_eq!(script.instructions[0].get("data"), Some("first ]\nsecond"));
+        assert_eq!(script.instructions[1].tag, "return");
+        assert_eq!(script.instructions[1].line, 3);
+    }
+
     use super::*;
 
     #[test]

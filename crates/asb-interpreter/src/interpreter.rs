@@ -3479,6 +3479,41 @@ mod tests {
     }
 
     #[test]
+    fn queued_call_finds_label_after_malformed_tag() {
+        let mut interpreter = Interpreter::new(InterpreterConfig::default());
+        interpreter
+            .load_script(
+                "helper.iet",
+                concat!(
+                    "*other\n",
+                    "[var name=\"unused data=\"0\"]\n",
+                    "// The next label is independently callable.\n",
+                    "*last\n",
+                    "[var name=visited data=yes]\n",
+                    "[return]\n",
+                ),
+            )
+            .unwrap();
+        interpreter
+            .load_script(
+                "main.iet",
+                concat!(
+                    "[lua]\n",
+                    "function preload(e)\n",
+                    "    e:enqueueTag{'call', file='helper.iet', label='last'}\n",
+                    "end\n",
+                    "[/lua]\n",
+                    "[calllua function=preload]\n",
+                    "[stop]\n",
+                ),
+            )
+            .unwrap();
+        interpreter.start("main.iet", "").unwrap();
+        interpreter.run().unwrap();
+        assert_eq!(interpreter.get_variable("visited").unwrap().as_string(), "yes");
+    }
+
+    #[test]
     fn call_and_jump_resolve_dynamic_files_and_labels() {
         let mut it = Interpreter::new(InterpreterConfig::default());
         it.load_script(
