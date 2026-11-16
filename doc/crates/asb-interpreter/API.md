@@ -714,7 +714,7 @@ e:getTouchPoint(index)
 
 -- 时间
 e:now()  -- 毫秒
-e:random()  -- 0.0-1.0
+e:random()  -- 0 到 65535 的整数
 
 -- 文件
 e:include("path")

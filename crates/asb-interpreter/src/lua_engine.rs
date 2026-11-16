@@ -1112,7 +1112,7 @@ impl UserData for EngineApi {
         });
 
         // e:random()
-        methods.add_method("random", |_lua, _this, _: ()| Ok(rand_i64()));
+        methods.add_method("random", |_lua, _this, _: ()| Ok(random_u16()));
 
         // e:now()
         methods.add_method("now", |_lua, _this, _: ()| Ok(now_millis()));
@@ -2100,13 +2100,9 @@ fn apply_system_var_query_inner(
     }
 }
 
-/// 随机整数（非负 31 位），对应 Artemis 的 `e:random()`。
-///
-/// 注意：游戏脚本里清一色是 `e:random() % N + 1` 的整数取模用法（见
-/// sysvo/macro/user/config 等），因此必须返回**整数**而非 [0,1) 浮点，
-/// 否则 `% N` 会得到小数、`tbl[小数]` 取到 nil，触发
-/// "attempt to get length of field '?'" 之类崩溃。
-fn rand_i64() -> i64 {
+/// Artemis scripts use the default integer range 0..=65535 for both
+/// modulo indexing and rejection sampling.
+fn random_u16() -> u16 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0);
     // 用毫秒时间播种一次，之后靠原子计数推进，保证同毫秒内连续调用也不同。
@@ -2116,8 +2112,7 @@ fn rand_i64() -> i64 {
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
     STATE.store(x, Ordering::Relaxed);
-    // 取高位做 31 位非负整数
-    ((x >> 33) & 0x7fff_ffff) as i64
+    (x >> 48) as u16
 }
 
 /// 初始化 Lua 环境，注入 engine 对象
@@ -2400,6 +2395,22 @@ mod tests {
         init_lua_engine_api(&lua, Arc::new(Mutex::new(ctx))).unwrap();
         lua.load("assert(__engine:dumpMemoryStatus() == nil)").exec().unwrap();
         assert_eq!(*logs.lock().unwrap(), ["memory status"]);
+    }
+
+    #[test]
+    fn lua_random_uses_native_unsigned_16_bit_range() {
+        let interpreter = crate::Interpreter::new(crate::InterpreterConfig::default());
+        interpreter.lua().load(r#"
+            local first = __engine:random()
+            local varied = false
+            for i = 1, 256 do
+                local value = __engine:random()
+                assert(value >= 0 and value <= 65535 and value == math.floor(value),
+                       "random result outside unsigned 16-bit range: " .. value)
+                varied = varied or value ~= first
+            end
+            assert(varied)
+        "#).exec().unwrap();
     }
 
     #[test]
