@@ -903,6 +903,9 @@ impl UserData for EngineApi {
                             // through lyprop. Preserve an explicit clear there.
                             Value::Boolean(false)
                                 if tag_name == "lyprop" && key_str.as_deref() == Some("mask") => Some(String::new()),
+                            Value::String(s)
+                                if matches!(tag_name.as_str(), "call" | "jump") && key_str.as_deref() == Some("file") =>
+                                    Some(lua_file_path(&s)?),
                             Value::String(s) => match s.to_str() {
                                 Ok(text) => Some(text.to_string()),
                                 Err(_) => {
@@ -1028,6 +1031,9 @@ impl UserData for EngineApi {
                                             if matches!(tag_name.as_str(), "lyc" | "anime") && ks == "mask" => None,
                                         Value::Boolean(false)
                                             if tag_name == "lyprop" && ks == "mask" => Some(String::new()),
+                                        Value::String(s)
+                                            if matches!(tag_name.as_str(), "call" | "jump") && ks == "file" =>
+                                                Some(lua_file_path(&s)?),
                                         Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
                                         Value::Integer(i) => Some(i.to_string()),
                                         Value::Number(n) => Some(n.to_string()),

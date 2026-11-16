@@ -3479,6 +3479,39 @@ mod tests {
     }
 
     #[test]
+    fn lua_control_tags_open_shift_jis_script_paths() {
+        for method in ["tag", "enqueueTag"] {
+            for command in ["call", "jump"] {
+                let mut interpreter = Interpreter::new(InterpreterConfig::default());
+                interpreter
+                    .load_script(
+                        "scenario/日.iet",
+                        "*entry\n[var name=visited data=yes]\n[return]\n",
+                    )
+                    .unwrap();
+                interpreter
+                    .load_script(
+                        "launch.iet",
+                        &format!(
+                            "[lua]\nfunction launch(e)\n\
+                             local path = 'scenario/' .. string.char(0x93, 0xfa) .. '.iet'\n\
+                             e:{method}{{'{command}', file=path, label='entry'}}\n\
+                             end\n[/lua]\n[calllua function=launch]\n[stop]\n",
+                        ),
+                    )
+                    .unwrap();
+                interpreter.start("launch.iet", "").unwrap();
+                interpreter.run().unwrap();
+                assert_eq!(
+                    interpreter.get_variable("visited").unwrap().as_string(),
+                    "yes",
+                    "{method} {command}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn queued_call_finds_label_after_malformed_tag() {
         let mut interpreter = Interpreter::new(InterpreterConfig::default());
         interpreter
