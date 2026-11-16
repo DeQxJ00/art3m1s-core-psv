@@ -951,9 +951,8 @@ impl CoreRuntime {
                     if let Some(layered) = layer.layered {
                         state_layer.layered = layered;
                     }
+                    state_layer.clear_page();
                     state_layer.page_font.clone_from(&layer.page_font);
-                    state_layer.page_tags.clear();
-                    state_layer.text_buffer.clear();
                 }
                 if !layer.page_font.is_empty() {
                     renderer.apply_font_settings(&layer.page_font);
@@ -1005,6 +1004,7 @@ impl CoreRuntime {
                 state.layer_stack.push(crate::text::glyph::DEFAULT_MESSAGE_LAYER.into());
             }
         }
+        self.control.active_message_layer = self.active_message_layer_id();
         self.sync_script_message_layer();
         self.sync_immediate_text();
     }

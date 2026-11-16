@@ -175,6 +175,13 @@ impl CoreRuntime {
                     self.flush_host_events(profile);
                 }
                 Ok(ExecutionResult::Wait(Event::Wait { reason })) => {
+                    if wait_reason_is_input_wait(Some(&reason))
+                        && self.pending_load_resume.as_ref().is_some_and(|resume|
+                            load_reconstruction_reached_wait(resume, &self.interpreter))
+                    {
+                        self.pending_load_resume = None;
+                        self.restore_pending_message_text();
+                    }
                     self.maybe_restore_loaded_message_text();
                     match &reason {
                         WaitReason::Timed { milliseconds, .. } => {
@@ -814,6 +821,18 @@ fn trans_input_skip_requested(
 /// 是否属于"用户输入等待"（[autosave allow=2] 的自动保存触发点）：
 /// 点击等待（Generic/Generic0）与按键等待（exkey）算；
 /// 定时/停止/媒体同步类等待不算。
+fn load_reconstruction_reached_wait(
+    resume: &super::PendingLoadResume,
+    interpreter: &asb_interpreter::Interpreter,
+) -> bool {
+    // An onLoad helper can jump back to the saved wait instead of returning.
+    // Its call frame still points to the checkpoint that started the helper.
+    interpreter.current_script() == Some(resume.script.as_str())
+        && interpreter.current_line() == resume.line
+        && interpreter.call_stack().get(resume.stack_len).is_some_and(|frame|
+            frame.script == resume.script && frame.return_line == resume.line)
+}
+
 pub(crate) fn wait_reason_is_input_wait(reason: Option<&WaitReason>) -> bool {
     matches!(
         reason,
@@ -851,6 +870,30 @@ mod tests {
     use asb_interpreter::event::WaitReason;
     use asb_interpreter::{CallFrame, CallbackResult, Event, ExecutionResult, InterpreterConfig};
     use std::collections::HashMap;
+
+    #[test]
+    fn load_can_restore_text_when_reconstruction_jumps_back_to_the_saved_wait() {
+        let mut it = asb_interpreter::Interpreter::default();
+        it.load_script("story", "*saved\n[@]\n").unwrap();
+        it.load_script("load-ui", "*rebuild\n[jump file=story label=saved]\n").unwrap();
+        it.boot("story").unwrap();
+        it.hold_restored_input_wait(false);
+        let resume = crate::runtime::PendingLoadResume {
+            script: "story".into(),
+            line: 0,
+            stack_len: 0,
+        };
+        it.set_callback(|event| match event {
+            Event::Wait { .. } => CallbackResult::Pause,
+            _ => CallbackResult::Continue,
+        });
+        it.lua().load("__engine:enqueueTag{'call', file='load-ui', label='rebuild'}").exec().unwrap();
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait { reason: WaitReason::Generic })));
+        assert_eq!(it.call_stack().len(), 1);
+        assert!(super::load_reconstruction_reached_wait(&resume, &it));
+        it.restore_position("story", 0, vec![CallFrame { script: "load-ui".into(), return_line: 0 }]).unwrap();
+        assert!(!super::load_reconstruction_reached_wait(&resume, &it));
+    }
 
     #[test]
     fn indexed_replay_recognizes_zero_time_history_checkpoints() {
