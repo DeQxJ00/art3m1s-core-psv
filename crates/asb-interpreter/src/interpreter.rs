@@ -232,6 +232,8 @@ fn lua_filter_consumes(value: &mlua::Value) -> bool {
 pub struct Interpreter {
     /// 配置
     config: InterpreterConfig,
+    // Host preference, deliberately outside script variables and checkpoints.
+    hide_secondary_language: bool,
     /// 已加载的脚本
     ///
     /// 用 `Arc<Script>` 持有：同一份脚本同时挂进
@@ -555,6 +557,7 @@ impl Interpreter {
 
         Self {
             config,
+            hide_secondary_language: false,
             scripts: HashMap::new(),
             tag_ini: crate::script::TagIni::default(),
             variables,
@@ -2204,6 +2207,20 @@ impl Interpreter {
             }
         }
 
+        // Preserve the original language boundary before a game filter can
+        // relabel secondary dialogue as primary. Keep lang/endlang execution
+        // balanced; the existing filter still owns timing and text routing.
+        if self.hide_secondary_language && tag == "lang" {
+            let language: Option<String> = param_table.get("0")?;
+            let primary = self.get_variable("g.language").map(|v| v.as_string());
+            if let (Some(language), Some(primary)) = (language, primary) {
+                let primary = if primary == "0" { "ja" } else { primary.as_str() };
+                if !primary.is_empty() && !language.is_empty() && language != primary {
+                    param_table.set("0", "__art3_hidden_secondary__")?;
+                }
+            }
+        }
+
         // 获取 engine 对象
         let engine: mlua::Value = self.lua.globals().get("__engine")?;
 
@@ -2646,6 +2663,10 @@ impl Interpreter {
     }
 
     /// 获取解释器配置（包含从 system.ini 读取的环境变量）
+    pub fn set_hide_secondary_language(&mut self, enabled: bool) {
+        self.hide_secondary_language = enabled;
+    }
+
     pub fn config(&self) -> &InterpreterConfig {
         &self.config
     }
@@ -4562,6 +4583,48 @@ mod tests {
                 .any(|e| matches!(e, Event::Custom { tag, .. } if tag == "chara_a")),
             "宏命中后不得回退为 Custom 事件"
         );
+    }
+
+    #[test]
+    fn host_language_hiding_precedes_relabeling_without_skipping_control_flow() {
+        for (hide, primary, expected) in [(false,"cn","ChineseJapanese"),
+            (true,"cn","Chinese"), (true,"ja","Japanese")] {
+            let mut it = Interpreter::default();
+            it.set_hide_secondary_language(hide);
+            it.set_variable("g.language", Value::String(primary.into()));
+            it.lua().load(r#"
+                __engine:setTagFilter({
+                    lang=function(e,p)
+                        local lang=p["0"]
+                        if lang=="ja" and e:var("g.language")=="cn" then lang="cn" end
+                        e:tag{"var",name="target",data=lang}
+                        return 1
+                    end,
+                    ["/lang"]=function(e,p)
+                        e:tag{"var",name="target",data="0"}
+                        return 1
+                    end,
+                    print=function(e,p)
+                        if e:var("target")~=e:var("g.language") then p.data=nil end
+                        p[1]="print"; e:tag(p); return 1
+                    end
+                })
+            "#).exec().unwrap();
+            it.load_script("language-test", "[var name=g.sublanguage data=ja]\n[lang cn]Chinese\n[/lang]\n[lang ja]Japanese\n[/lang]\n[var name=continued data=1]\n").unwrap();
+            it.boot("language-test").unwrap();
+            let seen=std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let output=seen.clone();
+            it.set_callback(move |event| {
+                if let Event::ScenarioText {content,..}=event {output.lock().unwrap().push_str(&content);}
+                CallbackResult::Continue
+            });
+            assert!(matches!(it.run().unwrap(),ExecutionResult::Completed));
+            assert_eq!(*seen.lock().unwrap(),expected);
+            assert_eq!(it.get_variable("continued"),Some(Value::Int(1)));
+            assert_eq!(it.get_variable("g.sublanguage"),Some(Value::String("ja".into())));
+            it.set_hide_secondary_language(false);
+            assert!(!it.hide_secondary_language);
+        }
     }
 
     #[test]

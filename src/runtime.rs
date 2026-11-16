@@ -768,7 +768,7 @@ impl CoreRuntime {
     pub fn set_message_position(&mut self, value: crate::text::message_position::MessagePosition) -> bool {
         self.sync_message_font_roles();
         let ok = self.text_renderer.as_mut().is_some_and(|r| r.set_message_position(value));
-        if ok { self.frame_visual_dirty = true; self.pointer_hit_test_dirty = true; }
+        if ok { self.interpreter.set_hide_secondary_language(value.hide_subtitle); self.frame_visual_dirty = true; self.pointer_hit_test_dirty = true; }
         ok
     }
 
