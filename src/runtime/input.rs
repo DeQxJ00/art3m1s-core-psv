@@ -949,6 +949,24 @@ mod tests {
 
     #[cfg(feature = "gxm-menu-key-alias")]
     #[test]
+    fn legacy_auto_resolves_direct_game_binding() {
+        let interpreter = Interpreter::default();
+        let mut compositor = Compositor::new();
+        for (function, expected) in [("adv_automode", 114), ("menu_return", 0)] {
+            compositor.apply_event(&Event::SetEventHandler {
+                event_name: "push".into(), file: None, label: None, call: true,
+                handler: Some("calllua".into()), extra_params: HashMap::from([
+                    ("key".into(), "114".into()),
+                    ("function".into(), function.into()),
+                    ("lua".into(), "adv_automode".into()),
+                ]),
+            });
+            assert_eq!(super::legacy_host_action_key(&interpreter, &compositor, "AUTO"), expected);
+        }
+    }
+
+    #[cfg(feature = "gxm-menu-key-alias")]
+    #[test]
     fn legacy_function_keys_require_live_handlers() {
         let mut interpreter = Interpreter::default();
         let mut compositor = Compositor::new();
@@ -2229,8 +2247,10 @@ fn legacy_host_action_key(interpreter: &asb_interpreter::Interpreter, compositor
         for key in 8..=226 {
             if compositor.get_input_handler("push", &key.to_string()).is_some_and(|h|
                 h.handler.as_deref() == Some("calllua")
-                && h.params.get("function").is_some_and(|f| f == "setonpush_call")
-                && h.params.get("lua").is_some_and(|f| f == lua_action)) {
+                && h.params.get("function").is_some_and(|function|
+                    (function == "setonpush_call" && h.params.get("lua").is_some_and(|f| f == lua_action))
+                    // Legacy SELECT bindings call the game automode callback directly.
+                    || (action == "AUTO" && function == lua_action))) {
                 return key;
             }
         }
