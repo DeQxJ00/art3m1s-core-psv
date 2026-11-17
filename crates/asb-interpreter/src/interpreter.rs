@@ -314,7 +314,27 @@ pub struct Interpreter {
     text_macro_files: HashMap<String, String>,
 }
 
-fn json_to_lua_value(lua: &Lua, value: serde_json::Value) -> mlua::Result<mlua::Value> {
+const PLUTO_BYTE_STRINGS_HEADER: &str = "art3m1s:pluto-byte-strings:1\n";
+
+fn pluto_encode_string(value: &mlua::String, byte_strings: &mut bool) -> String {
+    if let Ok(text) = value.to_str() && !text.starts_with('\0') {
+        return text.to_owned();
+    }
+    *byte_strings = true;
+    let bytes = value.as_bytes();
+    std::iter::once('\0').chain(bytes.iter().copied().map(char::from)).collect()
+}
+
+fn pluto_decode_string(lua: &Lua, value: &str, byte_strings: bool) -> mlua::Result<mlua::String> {
+    if byte_strings && let Some(encoded) = value.strip_prefix('\0') {
+        let bytes = encoded.chars().map(|ch| u8::try_from(ch as u32)).collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| mlua::Error::external("invalid Pluto byte string"))?;
+        return lua.create_string(&bytes);
+    }
+    lua.create_string(value)
+}
+
+fn json_to_lua_value(lua: &Lua, value: serde_json::Value, byte_strings: bool) -> mlua::Result<mlua::Value> {
     match value {
         serde_json::Value::Null => Ok(mlua::Value::Nil),
         serde_json::Value::Bool(value) => Ok(mlua::Value::Boolean(value)),
@@ -331,22 +351,22 @@ fn json_to_lua_value(lua: &Lua, value: serde_json::Value) -> mlua::Result<mlua::
                 Ok(mlua::Value::Number(value.as_f64().unwrap_or(0.0)))
             }
         }
-        serde_json::Value::String(value) => Ok(mlua::Value::String(lua.create_string(&value)?)),
+        serde_json::Value::String(value) => Ok(mlua::Value::String(pluto_decode_string(lua, &value, byte_strings)?)),
         serde_json::Value::Array(values) => {
             let table = lua.create_table()?;
             for (index, value) in values.into_iter().enumerate() {
-                table.set((index + 1) as i64, json_to_lua_value(lua, value)?)?;
+                table.set((index + 1) as i64, json_to_lua_value(lua, value, byte_strings)?)?;
             }
             Ok(mlua::Value::Table(table))
         }
         serde_json::Value::Object(values) => {
             let table = lua.create_table()?;
             for (key, value) in values {
-                let value = json_to_lua_value(lua, value)?;
+                let value = json_to_lua_value(lua, value, byte_strings)?;
                 if let Some(key) = parse_canonical_integer_key(&key) {
                     table.set(key, value)?;
                 } else {
-                    table.set(key, value)?;
+                    table.set(pluto_decode_string(lua, &key, byte_strings)?, value)?;
                 }
             }
             Ok(mlua::Value::Table(table))
@@ -369,7 +389,7 @@ fn lua_integer_value(value: i64) -> mlua::Value {
     }
 }
 
-fn lua_value_to_json_value(value: mlua::Value, depth: usize) -> mlua::Result<serde_json::Value> {
+fn lua_value_to_json_value(value: mlua::Value, depth: usize, byte_strings: &mut bool) -> mlua::Result<serde_json::Value> {
     if depth > 128 {
         return Err(mlua::Error::external(
             "JSON encode: Lua table nesting too deep",
@@ -383,13 +403,13 @@ fn lua_value_to_json_value(value: mlua::Value, depth: usize) -> mlua::Result<ser
         mlua::Value::Number(value) => serde_json::Number::from_f64(value)
             .map(serde_json::Value::Number)
             .ok_or_else(|| mlua::Error::external("JSON encode: invalid number")),
-        mlua::Value::String(value) => Ok(serde_json::Value::String(value.to_string_lossy())),
+        mlua::Value::String(value) => Ok(serde_json::Value::String(pluto_encode_string(&value, byte_strings))),
         mlua::Value::Table(table) => {
             let mut object = serde_json::Map::new();
             for pair in table.pairs::<mlua::Value, mlua::Value>() {
                 let (key, value) = pair?;
-                if let Some(key) = lua_key_to_json_key(key) {
-                    object.insert(key, lua_value_to_json_value(value, depth + 1)?);
+                if let Some(key) = lua_key_to_json_key(key, byte_strings) {
+                    object.insert(key, lua_value_to_json_value(value, depth + 1, byte_strings)?);
                 }
             }
             Ok(serde_json::Value::Object(object))
@@ -398,9 +418,9 @@ fn lua_value_to_json_value(value: mlua::Value, depth: usize) -> mlua::Result<ser
     }
 }
 
-fn lua_key_to_json_key(key: mlua::Value) -> Option<String> {
+fn lua_key_to_json_key(key: mlua::Value, byte_strings: &mut bool) -> Option<String> {
     match key {
-        mlua::Value::String(value) => Some(value.to_string_lossy()),
+        mlua::Value::String(value) => Some(pluto_encode_string(&value, byte_strings)),
         mlua::Value::Integer(value) => Some(value.to_string()),
         mlua::Value::Number(value) if value.fract() == 0.0 => Some((value as i64).to_string()),
         mlua::Value::Number(value) => Some(value.to_string()),
@@ -460,19 +480,25 @@ impl Interpreter {
 
         // 注册 JSON 编解码函数
         let encode = lua.create_function(|lua, value: mlua::Value| {
-            let value = lua_value_to_json_value(value, 0)?;
+            let mut byte_strings = false;
+            let value = lua_value_to_json_value(value, 0, &mut byte_strings)?;
             let json = serde_json::to_string(&value)
                 .map_err(|e| mlua::Error::external(format!("JSON encode: {e}")))?;
-            Ok(mlua::Value::String(lua.create_string(json)?))
+            // Leave existing UTF-8-only saves in their original JSON format.
+            // The header permits an escaped byte string or key in new saves.
+            let payload = if byte_strings { format!("{PLUTO_BYTE_STRINGS_HEADER}{json}") } else { json };
+            Ok(mlua::Value::String(lua.create_string(payload)?))
         });
         let decode = lua.create_function(|lua, json_str: mlua::String| {
             let s: String = json_str.to_string_lossy();
             if s.is_empty() {
                 return Ok(mlua::Value::Table(lua.create_table()?));
             }
-            let value: serde_json::Value = serde_json::from_str(&s)
+            let (byte_strings, json) = s.strip_prefix(PLUTO_BYTE_STRINGS_HEADER)
+                .map_or((false, s.as_str()), |json| (true, json));
+            let value: serde_json::Value = serde_json::from_str(json)
                 .map_err(|e| mlua::Error::external(format!("JSON decode: {e}")))?;
-            json_to_lua_value(lua, value)
+            json_to_lua_value(lua, value, byte_strings)
         });
         if let Err(e) = encode.and_then(|f| lua.globals().set("__art3m1s_json_encode", f)) {
             eprintln!("警告: 注册 JSON encode 失败: {:?}", e);
@@ -3956,6 +3982,25 @@ mod tests {
         assert_eq!(restored.get::<i64>("count").unwrap(), 4);
         assert!(check.get::<bool>("save0001").unwrap());
         assert!(check.get::<bool>("save0004").unwrap());
+    }
+
+    #[test]
+    fn pluto_preserves_non_utf8_lua_strings_and_keys() {
+        let interpreter = Interpreter::default();
+        interpreter.lua().load(r#"
+            local caption = string.char(0x81, 0x79, 0x93, 0xfa, 0x81, 0x7a)
+            local binary = string.char(0, 0xff, 0x80)
+            local marker_like = string.char(0) .. 'ffff'
+            local saved = pluto.persist({}, {
+                [caption] = binary, [2] = caption, marker = marker_like, plain = '新しい行',
+            })
+            local loaded = pluto.unpersist({}, saved)
+            assert(loaded[2] == caption)
+            assert(loaded[caption] == binary)
+            assert(loaded.marker == marker_like)
+            assert(loaded.plain == '新しい行')
+            assert(pluto.unpersist({}, [[{"label":"\u0000ffff"}]]).label == marker_like)
+        "#).exec().unwrap();
     }
 
     #[test]
