@@ -905,6 +905,8 @@ impl UserData for EngineApi {
                             // through lyprop. Preserve an explicit clear there.
                             Value::Boolean(false)
                                 if tag_name == "lyprop" && key_str.as_deref() == Some("mask") => Some(String::new()),
+                            Value::String(s) if tag_name == "print" && key_str.as_deref() == Some("data") =>
+                                Some(lua_print_text(&s)),
                             Value::String(s) if tag_param_has_legacy_text(&tag_name, key_str.as_deref().unwrap_or_default()) =>
                                 Some(lua_text(&s)?),
                             Value::String(s) => match s.to_str() {
@@ -1032,6 +1034,8 @@ impl UserData for EngineApi {
                                             if matches!(tag_name.as_str(), "lyc" | "anime") && ks == "mask" => None,
                                         Value::Boolean(false)
                                             if tag_name == "lyprop" && ks == "mask" => Some(String::new()),
+                                        Value::String(s) if tag_name == "print" && ks == "data" =>
+                                            Some(lua_print_text(&s)),
                                         Value::String(s) if tag_param_has_legacy_text(&tag_name, &ks) =>
                                             Some(lua_text(&s)?),
                                         Value::String(s) => s.to_str().ok().map(|s| s.to_string()),
@@ -1952,6 +1956,14 @@ fn lua_text(value: &mlua::String) -> LuaResult<String> {
     String::from_utf8(utf8).map_err(mlua::Error::external)
 }
 
+fn lua_print_text(value: &mlua::String) -> String {
+    // Legacy scripts truncate save captions by byte count. Preserve the
+    // readable part of a malformed caption so the rest of the page can render.
+    lua_text(value).unwrap_or_else(|_| {
+        encoding_rs::SHIFT_JIS.decode(value.as_bytes().as_ref()).0.into_owned()
+    })
+}
+
 fn tag_param_has_legacy_text(tag: &str, key: &str) -> bool {
     matches!((tag, key),
         ("call" | "jump", "file" | "label")
@@ -1959,8 +1971,7 @@ fn tag_param_has_legacy_text(tag: &str, key: &str) -> bool {
         | ("seplay" | "sestop" | "sepan" | "sefade" | "sefadein" | "sefadeout"
             | "voice" | "/voice" | "setonsoundfinish" | "delonsoundfinish", "id")
         | ("wait", "se") | ("automode", "syncse")
-        | ("lyc" | "lyprop" | "anime", "mask")
-        | ("print", "data"))
+        | ("lyc" | "lyprop" | "anime", "mask"))
 }
 
 fn lua_value_to_key(v: &mlua::Value) -> String {

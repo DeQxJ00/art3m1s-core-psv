@@ -3761,6 +3761,34 @@ mod tests {
     }
 
     #[test]
+    fn lua_print_replaces_a_truncated_legacy_character_without_aborting_the_page() {
+        let mut it = Interpreter::default();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        it.set_callback(move |event| {
+            captured.lock().unwrap().push(event);
+            CallbackResult::Continue
+        });
+        it.lua().load(r#"
+            function draw_slots(e)
+                local broken = string.char(0x81, 0x79) .. 'old title' .. string.char(0x81)
+                e:tag{'print', data=broken}
+                e:enqueueTag{'print', data=broken}
+                e:enqueueTag{'print', data='next slot'}
+            end
+        "#).exec().unwrap();
+        it.load_script("menu", "[calllua function=draw_slots]\n[stop]").unwrap();
+        it.start("menu", "").unwrap();
+        it.run().unwrap();
+        let events = events.lock().unwrap();
+        let displayed: Vec<_> = events.iter().filter_map(|event| match event {
+            Event::ScenarioText { content, .. } => Some(content.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(displayed, ["【old title�", "【old title�", "next slot"]);
+    }
+
+    #[test]
     fn calllua_preserves_literal_identifiers_across_dispatch_paths() {
         for command in [
             r#"[calllua function="capture_ids" id="001" layer="1.0" empty=""]"#,
