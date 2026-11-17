@@ -451,6 +451,10 @@ impl CoreRuntime {
         }
         self.reload_persistent_lua_tables()
             .map_err(|e| format!("恢复当前系统存档索引失败: {e}"))?;
+        if waiting {
+            restore_legacy_load_volume(&self.interpreter)
+                .map_err(|e| format!("恢复读档音量失败: {e}"))?;
+        }
         self.apply_system_audio_volume();
         self.sync_message_font_roles();
         if let Some(audio) = &data.audio {
@@ -766,6 +770,20 @@ fn resume_legacy_checkpoint_ui(interpreter: &mut asb_interpreter::Interpreter, s
     Ok(resumed)
 }
 
+fn restore_legacy_load_volume(interpreter: &asb_interpreter::Interpreter) -> Result<(), String> {
+    // A direct checkpoint resume bypasses the fade-in that restores the
+    // configured sound-effects volume after the script muted it for loading.
+    if interpreter.get_variable("s.sevol").and_then(|v| v.as_float()) != Some(0.0) {
+        return Ok(());
+    }
+    interpreter.lua().load(r#"
+        if type(tags)=='table' and type(tags.load_fadeout)=='function'
+            and type(tags.load_broken)=='function' and type(volume_master)=='function' then
+            volume_master()
+        end
+    "#).exec().map_err(|error| error.to_string())
+}
+
 fn prepare_loaded_wait(interpreter: &mut asb_interpreter::Interpreter, data: &crate::save::SaveData) -> bool {
     let waiting = data.waiting_for_input.unwrap_or_else(||saved_position_resumes_input_wait(interpreter));
     if waiting {
@@ -968,6 +986,30 @@ mod tests {
         assert!(super::resume_legacy_checkpoint_ui(&mut it,&crate::compositor::Scene::new()).unwrap());
         it.flush_pending_tags().unwrap();
         assert_eq!(it.lua().globals().get::<String>("order").unwrap(),"input;window;text;");
+    }
+
+    #[test]
+    fn legacy_checkpoint_restores_configured_audio_after_load_fade() {
+        let mut it = Interpreter::default();
+        it.lua().load(r#"
+            tags={load_fadeout=function() end, load_broken=function() end}
+            sys={conf={}}
+            function volume_master()
+                __engine:tag{'var', name='s.sevol', data=sys.conf.master*10}
+            end
+        "#).exec().unwrap();
+        for (setup, current, expected) in [
+            ("sys.conf.master=65", 0, 650),
+            ("sys.conf.master=0", 0, 0),
+            ("sys.conf.master=65", 300, 300),
+            ("sys.conf.master=65; tags.load_broken=nil", 0, 0),
+        ] {
+            it.lua().load(setup).exec().unwrap();
+            it.set_variable("s.sevol", asb_interpreter::Value::Int(current));
+            super::restore_legacy_load_volume(&it).unwrap();
+            it.flush_pending_tags().unwrap();
+            assert_eq!(it.get_variable("s.sevol").and_then(|v| v.as_int()), Some(expected));
+        }
     }
 
     #[test]
