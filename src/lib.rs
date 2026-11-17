@@ -215,7 +215,15 @@ impl ProjectConfig {
             power_saving: self.power_saving,
             no_save: self.no_save,
             savepath: self.savepath.clone(),
-            datapath: project_root.map(|path| path.display().to_string()),
+            // Mounted projects use a relative virtual root. An empty value
+            // would make a script's datapath + '/' join produce an absolute path.
+            datapath: project_root.map(|path| {
+                if path.as_os_str().is_empty() {
+                    ".".to_owned()
+                } else {
+                    path.display().to_string()
+                }
+            }),
             title: None,
             process_id: self.process_id.clone(),
             env: self.raw.clone(),
@@ -595,6 +603,24 @@ fn to_interpreter_error(error: CoreError) -> asb_interpreter::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mounted_project_datapath_builds_a_relative_asset_path() {
+        let project = Project::open_from_bytes(
+            "",
+            b"[WINDOWS]\nWIDTH=960\nHEIGHT=540\nBOOT=boot.iet\n",
+            "WINDOWS",
+        )
+        .unwrap();
+        let variables = project.create_interpreter().variables();
+        let path = asb_interpreter::expression::ExpressionEvaluator::new(&variables)
+            .resolve_param_str("$s.datapath + '/' + 'data.bin'")
+            .unwrap();
+        assert_eq!(
+            resolve_project_path(Path::new("fixture"), &path).unwrap(),
+            Path::new("fixture").join("data.bin")
+        );
+    }
 
     #[test]
     fn project_loads_optional_tag_ini_with_script_charset() {
