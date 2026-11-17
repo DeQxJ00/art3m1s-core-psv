@@ -3717,6 +3717,22 @@ mod tests {
     }
 
     #[test]
+    fn standalone_at_in_text_script_waits_before_the_next_label() {
+        let mut it = Interpreter::default();
+        it.load_script("menu.iet", "*open\n@\n*close\n[var name=closed data=1]\n").unwrap();
+        it.start("menu.iet", "open").unwrap();
+        it.set_callback(|event| match event {
+            Event::Wait { .. } => CallbackResult::Pause,
+            _ => CallbackResult::Continue,
+        });
+        assert!(matches!(it.run().unwrap(), ExecutionResult::Wait(Event::Wait { reason: WaitReason::Generic })));
+        assert!(it.get_variable("closed").is_none());
+        it.advance_line();
+        it.run().unwrap();
+        assert_eq!(it.get_variable("closed"), Some(Value::Int(1)));
+    }
+
+    #[test]
     fn legacy_tag_filters_receive_strings_in_their_source_encoding() {
         let mut it = Interpreter::default();
         let legacy = encoding_rs::SHIFT_JIS.encode(r#"

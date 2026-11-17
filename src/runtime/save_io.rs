@@ -701,6 +701,19 @@ pub(super) fn take_loaded_skip_config(text: &mut Option<crate::save::MessageText
 fn resume_legacy_checkpoint_ui(interpreter: &mut asb_interpreter::Interpreter, scene: &crate::compositor::Scene) -> Result<bool, String> {
     let has_menu = scene.iter_ids().iter().any(|id| id == "500" || id.starts_with("500.") || id == "600" || id.starts_with("600."));
     let (resumed, needs_frames): (bool, Option<bool>) = interpreter.lua().load(r#"
+        -- This style of load_exec unwinds the save menu before restoring
+        -- dialogue keys and showing the message window. A checkpoint has
+        -- already restored the dialogue PC, so only run the UI part.
+        if not ... and type(scr)=='table' and not scr.select
+            and type(scr.adv)=='table' and scr.adv.flag=='adv'
+            and scr.btstop==true and scr.key_mw==true
+            and type(load_exec)=='function'
+            and type(key_start_adv)=='function' and type(msg_show)=='function' then
+            title = nil
+            key_start_adv()
+            msg_show()
+            return true
+        end
         -- Some script generations serialize the save UI but resume at the
         -- gameplay checkpoint. Run their load completion, including text and
         -- input restoration, rather than leaving the serialized UI active.
@@ -955,6 +968,27 @@ mod tests {
         assert!(super::resume_legacy_checkpoint_ui(&mut it,&crate::compositor::Scene::new()).unwrap());
         it.flush_pending_tags().unwrap();
         assert_eq!(it.lua().globals().get::<String>("order").unwrap(),"input;window;text;");
+    }
+
+    #[test]
+    fn checkpoint_without_menu_releases_serialized_input_lock() {
+        let it = Interpreter::default();
+        let lua = it.lua();
+        lua.load(r#"
+            scr={adv={flag='adv'},btstop=true,key_mw=true}
+            title={}; calls=0
+            function load_exec() error('no menu call frame to unwind') end
+            function key_start_adv() assert(title==nil); scr.btstop=nil; calls=calls+1 end
+            function msg_show() assert(scr.btstop==nil); scr.key_mw=false; calls=calls+1 end
+        "#).exec().unwrap();
+        let mut it = it;
+        let mut menu = crate::compositor::Scene::new();
+        menu.create("500.1", Some("menu".into()));
+        assert!(!super::resume_legacy_checkpoint_ui(&mut it, &menu).unwrap());
+        let scene = crate::compositor::Scene::new();
+        assert!(super::resume_legacy_checkpoint_ui(&mut it, &scene).unwrap());
+        assert_eq!(it.lua().globals().get::<i64>("calls").unwrap(), 2);
+        assert!(!super::resume_legacy_checkpoint_ui(&mut it, &scene).unwrap());
     }
 
     #[test]

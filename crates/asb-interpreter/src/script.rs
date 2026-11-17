@@ -113,6 +113,20 @@ impl Script {
                 continue;
             }
 
+            // Artemis text scripts can spell a click wait without brackets.
+            if line.strip_prefix('@').is_some_and(|tail| {
+                let tail = tail.trim_start();
+                tail.is_empty() || tail.starts_with("//")
+            }) {
+                instructions.push(Instruction {
+                    tag: "@".to_string(),
+                    params: HashMap::new(),
+                    line: line_num,
+                });
+                line_idx += 1;
+                continue;
+            }
+
             // 标签定义 (*labelname)
             if let Some(label_name) = line.strip_prefix('*') {
                 let label_name = label_name.trim().to_string();
