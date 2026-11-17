@@ -3732,6 +3732,78 @@ mod tests {
         assert_eq!(it.get_variable("closed"), Some(Value::Int(1)));
     }
 
+    const LEGACY_BACKLOG_SOURCE: &[u8] = br#"
+        function check_backlog_stack()
+            if not log.stack[log.count] then log.stack[log.count] = {text={}} end
+        end
+        function set_backlog_next()
+            if log.count >= tonumber(init.backlog_max) then
+                table.remove(log.stack, 1)
+            else
+                log.count = log.count + 1
+            end
+        end
+        function push_backlog_line(no, page)
+            local tbl = log.stack[no]
+            e:tag{'rp'}
+            for i, val in pairs(tbl.text) do e:tag(val) end
+        end
+        function backlog_init()
+            for page=1,3 do push_backlog_line(page, page) end
+        end
+    "#;
+
+    #[test]
+    fn legacy_backlog_opens_saved_sparse_rows_with_their_original_text_and_voice() {
+        let mut it = Interpreter::default();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        it.set_callback(move |event| {
+            if let Event::ScenarioText { content, .. } = event {
+                captured.lock().unwrap().push(content);
+            }
+            CallbackResult::Continue
+        });
+        it.set_file_loader(Box::new(|_| Ok(LEGACY_BACKLOG_SOURCE.to_vec())));
+        it.lua().load(r#"
+            e=__engine
+            e:include('system/ui/backlog.lua')
+            local source={count=8, stack={
+                [1]={text={{'print',data='Before the gap'}}},
+                [4]={text={{'print',data='Recorded speech'}},voice={'voice clip'}},
+                [6]={text={{'print',data='After the gap'}}}
+            }}
+            log=pluto.unpersist({}, pluto.persist({},source))
+            backlog_init()
+            assert(log.stack[2].voice[1]=='voice clip')
+            assert(log.count == 4)
+        "#).exec().unwrap();
+        it.flush_pending_tags().unwrap();
+        assert_eq!(*events.lock().unwrap(), ["Before the gap", "Recorded speech", "After the gap"]);
+    }
+
+    #[test]
+    fn legacy_backlog_skips_waits_that_did_not_write_a_row() {
+        let mut it = Interpreter::default();
+        it.set_file_loader(Box::new(|_| Ok(LEGACY_BACKLOG_SOURCE.to_vec())));
+        it.lua().load(r#"
+            e=__engine
+            e:include('system/ui/backlog.lua')
+            init={backlog_max=3}
+            log={count=1, stack={}}
+            set_backlog_next()
+            assert(log.count==1)
+            for i=1,3 do
+                check_backlog_stack()
+                log.stack[log.count].text[1]=i
+                set_backlog_next()
+                set_backlog_next()
+            end
+            assert(log.count==3)
+            assert(log.stack[1].text[1]==2 and log.stack[2].text[1]==3)
+        "#).exec().unwrap();
+    }
+
     #[test]
     fn legacy_tag_filters_receive_strings_in_their_source_encoding() {
         let mut it = Interpreter::default();

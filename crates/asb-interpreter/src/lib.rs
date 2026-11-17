@@ -71,6 +71,7 @@ mod optional_startup;
 mod delay_alias;
 mod zero_flash;
 mod layer_language;
+mod legacy_backlog;
 mod platform_resources;
 mod toolbar_roles;
 pub use message_roles::MessageLayerIds;

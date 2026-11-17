@@ -1197,6 +1197,8 @@ impl UserData for EngineApi {
             let language = crate::layer_language::repair_source(&path, source);
             if language.is_some() { this.ctx.lock().unwrap().callbacks.debug(1, "[layer-language] guarded optional startup filename substitution", true); }
             let source = language.as_deref().unwrap_or(source);
+            let backlog = crate::legacy_backlog::repair_source(&path, source);
+            let source = backlog.as_deref().unwrap_or(source);
             let warmup=hints.then(||crate::emote_cache_warmup::repair_source(&path,source)).flatten();
             if warmup.is_some(){this.ctx.lock().unwrap().callbacks.debug(1,"[emote-warmup] disposable desktop players replaced with bounded PSB prefetch",true);}
             if !source.starts_with(b"\x1bLua") {
